@@ -40,7 +40,7 @@ Seven sub-projects. This spec covers P0 and P1.
 | P2 | `--compat-asldro` and the voxelwise benchmark | P1 |
 | P3 | ASL motion, background suppression, inversion-recovery contrast | P1 |
 | P4 | Kinetic model extensions: macrovascular compartment, physiological noise | P1 |
-| P5 | 3D readouts: GRASE, stack-of-spirals, gradient-echo contrast | P0 |
+| P5 | 3D readouts: GRASE, stack-of-spirals, gradient-echo contrast | P0, P1 |
 | P6 | Encoding variety: Hadamard, Look-Locker, velocity-selective, multi-TE | P1 |
 
 P0 and P1 are specced together so that the extracted interface answers to a real second consumer
@@ -198,6 +198,12 @@ would be mathematically equivalent and would still move output bits.
 A positive magnitude paired with a zero direction is therefore handled where it is handled today,
 by the `n < 1e-12` guard, and yields a zero phase rather than an error.
 
+The entry point takes `&[Option<_>]`, not `Option<&[_]>`. A series can have a prep gradient on
+some volumes and not others, which is exactly the b0-interleaved diffusion case, and an outer
+`Option` can only say all or none. `eddy_drive` keeps its outer-`Option` shape because a zero
+vector already encodes "disabled" for it, reproducing the `bval.abs() > 1e-9` branch at
+`kspace.rs:393`.
+
 `eddy_drive` and `prep_drive` stay separate because they are separate physics. Eddy currents
 follow the gradient moment. Motion-induced phase follows the q-vector.
 
@@ -214,13 +220,15 @@ pub fn simulate_acquisition_oversampled(
     t_inhom: Option<&[f32]>,
     acq: &Acquisition,
     eddy_drive: Option<&[[f64; 3]]>,        // one per volume
-    prep_drive: Option<&[(f64, [f64; 3])]>, // one per volume
+    prep_drive: Option<&[Option<(f64, [f64; 3])>]>, // one per volume, individually optional
     phase: &PhaseModel,
     seed: u64,
-    // Per-voxel noise SD on the acquired grid. Length `nvox` applies one map to every volume,
-    // which is the current behavior; length `nvox * n_volumes` gives each volume its own. ASL
-    // needs the latter, because an M0 volume and a label volume differ in signal level by two
-    // orders of magnitude.
+    // Per-voxel noise SD on the ACQUIRED grid, `nvox = acq_dims[0]*acq_dims[1]*acq_dims[2]`.
+    // Length `nvox`: indexed `sigma[vox]`, one map shared by every volume (current behavior).
+    // Length `nvox * n_volumes`: indexed `sigma[vox * n_volumes + v]`, voxel-major, matching the
+    // 4D interleave the writer already uses (`kspace.rs:1296`, `io.rs:356`). Any other length is
+    // rejected before the per-volume loop starts. ASL needs the per-volume form, because an M0
+    // volume and a label volume differ in signal level by two orders of magnitude.
     noise_sigma: Option<&[f32]>,
     eddy_trace: Option<&[[f64; 3]]>,
 ) -> (Vec<f32>, Vec<f32>)
@@ -250,11 +258,28 @@ pub struct SliceInput<'a> {
 
 `Acquisition.t_inhom` stays as the fallback, so TRXScan's call sites pass `None` and keep their
 current behavior. aslscan derives the map from the phantom as `1/T2' = 1/T2star - 1/T2`, per
-voxel, floored at zero where the maps disagree.
+voxel. The derivation is total, and the stored map contains only finite positive values or
+`INFINITY` — never zero, never negative, never `NaN`.
+
+| `T2` | `T2star` | Stored `T2'` |
+|---|---|---|
+| positive | positive, `< T2` | `1 / (1/T2star - 1/T2)`, finite positive |
+| positive | positive, `>= T2` | `INFINITY` (no inhomogeneity decay) |
+| positive | zero | `INFINITY` |
+| zero | any | `INFINITY` (background; the compartment is zero there anyway) |
+| any | any, either `NaN` | rejected at load |
+
+`phantom` validates that every T2 and T2\* voxel is finite and non-negative, and rejects the map
+naming the first offending voxel otherwise. Background voxels are expected to be zero in a
+converted phantom and are not an error. `T2star > T2` is physically impossible but common in
+noisy real maps, so it is tolerated as no inhomogeneity decay rather than rejected.
 
 A floored rate of zero means no inhomogeneity decay, and it must not be stored as `T2' = 0`. The
-decay term at `kspace.rs:649` divides by `t_inhom`, so a stored zero yields a division by zero and
-a NaN at every line.
+decay term at `kspace.rs:649` divides by `t_inhom`. A stored zero gives `x/0`, which is `INFINITY`
+for nonzero `x` — total signal loss rather than no decay, the opposite of what was meant — and
+`NaN` at the echo line where `t == 0`. A `NaN` weight is not masked by a zero-valued background
+compartment, because `0 * NaN` is `NaN`, so one bad voxel contaminates the whole Fourier sum at
+`kspace.rs:677-703`.
 
 The map therefore stores the **time** in milliseconds, as `Acquisition::t_inhom` already does, and
 represents a zero rate as `f32::INFINITY`. Dividing by infinity gives zero, which is exactly the
@@ -387,7 +412,29 @@ contrasts that use them, in P3 and P5.
 Parameters the acquisition stage needs that BIDS does not express come from the same optional TOML
 overlay: `ghost_offset`, `n_spikes`, `spike_amplitude`, `n_coils`, `t_inhom`, `window`,
 `partial_fourier`, `pf_mode`, `eddy_*`, `noise_variance`, and the oversampling factor. The
-overlay maps one-to-one onto `mrsim_acq::Acquisition`. This is also how `mrsim-acq` acquires the
+overlay maps onto `mrsim_acq::Acquisition`, but not one-to-one, and the gaps are where mistakes
+will land.
+
+**Units.** `Acquisition` is in milliseconds throughout: `t_line`, `t_echo`, `t_inhom`, `eddy_tau`
+(`kspace.rs:147-175`), as is `readout.rs`. BIDS and the phantom are in seconds. The conversion
+boundary is `protocol`: everything leaving it is milliseconds, and nothing downstream converts
+again. The same applies to the phantom's T2, T2\*, and the blood T2 default, which are stated in
+seconds in this document and stored in milliseconds once loaded.
+
+**Derived fields.** These have no direct counterpart and must be computed:
+
+| BIDS / overlay | `Acquisition` | Rule |
+|---|---|---|
+| `EchoTime` | `t_echo` | seconds to milliseconds |
+| `TotalReadoutTime` | `t_line` | `t_line = TotalReadoutTime * 1000 / ny`, the inverse of `trxscan.rs:968` |
+| `ParallelReductionFactorInPlane` | `accel` | direct; `acs_lines` comes from the overlay |
+| `PhaseEncodingDirection` | `reverse_phase` | sign of the PE axis |
+| oversampling factor | — | not an `Acquisition` field; it sets the simulation grid passed to the entry point |
+
+The `ny` in the `t_line` rule is the acquired matrix size along the phase-encode axis, matching
+`grid.dims[1]` at `trxscan.rs:968`. It is `ny`, not `ny - 1`. The distinction changes every
+distorted voxel, and the two conventions are both defensible, so this spec fixes the one TRXScan
+already uses rather than inventing a second. This is also how `mrsim-acq` acquires the
 file-driven protocol configuration that TRXScan's README lists as missing.
 
 Precedence is overlay over sidecar over default, and the resolved protocol is written to the
@@ -479,7 +526,22 @@ guarding only the division would give. The two branches also differ in their tes
 `t1_arterial_blood > 0` and CASL/PCASL uses `t1_arterial_blood != 0`. The port reproduces both,
 including the difference.
 
-`signal_time` is `PostLabelingDelay + LabelingDuration`, taken per volume from the protocol.
+`tau` and `t` are defined per label type, because PASL and PCASL do not measure the same
+durations.
+
+| | `tau` (bolus duration) | `t` (signal time) |
+|---|---|---|
+| CASL, PCASL | `LabelingDuration` | `PostLabelingDelay + LabelingDuration` |
+| PASL | `BolusCutOffDelayTime` | `PostLabelingDelay + BolusCutOffDelayTime` |
+
+For PASL, `LabelingDuration` is not defined by BIDS and is not used. The bolus is created by the
+cutoff pulse, so `BolusCutOffDelayTime` is both the bolus duration and the offset from labeling
+onset to the end of the bolus. `BolusCutOffFlag` must be true, as stated in the protocol contract;
+a PASL protocol without it is rejected rather than defaulted, because there is no bolus duration
+to assume.
+
+This is where simasl's single `label_duration` parameter splits in two. simasl has one field
+serving both roles (`gkm_filter.py:109`), which works because its input is not BIDS.
 Multi-delay is therefore a property of the volume list, not of separate runs. That is the change
 that lifts simasl's one-PLD-per-series restriction.
 
@@ -532,7 +594,42 @@ simasl computes the tissue steady state, then adds `mag_enc` to it, then applies
 transverse decay (`mri_signal_filter.py:204`). `delta_m` is already a magnetization difference
 delivered by the kinetic model; running it through an `M0(1-exp(-TR/T1))` recovery term would
 attribute to it a saturation history it does not have. The blood compartment gets the flip-angle
-factor and nothing else.
+factor and nothing else, and in P1 that factor is exactly 1: the only accepted contrast is spin
+echo, whose excitation is 90 degrees. A configurable `sin(flip_angle)` arrives with the contrasts
+that have one, in P3 and P5.
+
+### Row semantics
+
+Each `aslcontext.tsv` row maps to one acquisition pass and one pair of compartment inputs. The
+first revision of this spec deleted this table while rewriting the section above; it is the
+behavioral contract for the whole series and nothing else recovers it.
+
+| Row | `compartments[0]` tissue | `compartments[1]` blood | Notes |
+|---|---|---|---|
+| `control` | tissue signal | 0 | |
+| `label` | tissue signal | `-delta_m` at this row's PLD | |
+| `m0scan` | tissue at the M0 `RepetitionTimePreparation` | 0 | Only when `M0Type` is `Included` |
+| `deltam` | 0 | `+delta_m` at this row's PLD | A pre-subtracted series |
+| `cbf` | rejected in P1 | — | See below |
+
+`control` minus `label` therefore recovers `+delta_m`, which is the sign convention the linearity
+property depends on.
+
+`deltam` rows carry no static tissue, so a `deltam` series is not the subtraction of two simulated
+volumes. That is deliberate: subtracting two simulated volumes would carry twice the noise of a
+real pre-subtracted reconstruction, and P1 has no model of what the scanner did before writing it.
+
+`cbf` rows are rejected in P1 with an error. A CBF map is a quantified output rather than an
+acquired volume, and producing one means choosing a quantification model, which this spec does not.
+
+`M0Type == Separate` forbids an `m0scan` row, so no row generates the separate M0 file. It comes
+from one additional acquisition pass outside the row loop, with the same protocol, the tissue
+compartment at the M0 repetition time, and the blood compartment zero. Execution is one pass per
+row, plus that one extra pass when `M0Type` is `Separate`.
+
+`BackgroundSuppression: true` is rejected in P1 with an error naming P3. The field is read from
+the sidecar, and accepting it while modeling nothing would write an output whose sidecar claims
+suppression the data does not show.
 
 ### P1 supports spin-echo readouts only
 
@@ -690,7 +787,8 @@ max|I_B|`. The absolute floor is required because a pure relative bound is undef
 `delta_m` is zero, which is every not-arrived voxel (`gkm_filter.py:163`).
 
 The identity is not bit-exact and the tolerance is not slack. Run L sums tissue and blood before
-the `f32` rounding at `kspace.rs:1278`, while C and B round separately, so floating-point
+the `f64` to `f32` rounding in the coil combine at `kspace.rs:977`, while C and B round
+separately, so floating-point
 non-distributivity alone breaks equality. The magnitude/phase round trip adds to that: the writer
 stores `sqrt(re^2+im^2)` and `atan2(im, re)` as `f32` (`kspace.rs:1278-1279`, `io.rs:353`), and
 recovering `mag * exp(i*phase)` through `sin` and `cos` is not an exact inverse.
