@@ -70,12 +70,35 @@ rust-trx/
 ## Modules moved
 
 From `TRXScan/src/` into `mrsim-acq/src/`: `mat`, `orient`, `phase`, `readout`, `kspace`,
-`nufft`, `noise`, `motion`, `config`, and the signal-model-independent half of `io`
-(`load_volume`, `Grid`, `hires_grid`, `write_3d`, `write_4d`, `write_3d_i16`, and the complex
-writer).
+`nufft`, `noise`, `motion`, `config`, `analytic`, and the signal-model-independent half of `io`
+(`load_volume`, `hires_grid`, `header_for_grid`, `write_3d`, `write_4d`, `write_3d_i16`, and the
+complex writer).
 
 TRXScan keeps `scheme`, `raster`, `signal`, `compartments`, `sphere`, `mixture`,
-`microstructure`, `truth`, `gnl`, `analytic`, `benchmark`, its streamline I/O, and its binaries.
+`microstructure`, `truth`, `gnl`, `benchmark`, its streamline I/O, `write_benchmark`, and its
+binaries.
+
+Three items ride along because the moved modules do not compile without them. None is visible
+from the module list.
+
+- **`Vec3`** is defined at TRXScan's crate root (`lib.rs:28`) and used by `mat` and `motion`. It
+  moves to `mrsim-acq`'s root, and TRXScan re-exports it (`pub use mrsim_acq::Vec3`) so its own
+  modules keep compiling unchanged.
+- **`Grid`** is defined in `raster` (`raster.rs:18`), which stays, but `io` takes it in every
+  signature and `gnl` imports it. The struct and its affine helpers move to a new ungated
+  `mrsim_acq::grid` module; `raster` re-exports it and keeps the DDA code. It cannot live in `io`,
+  because `io` is feature-gated and `raster` is pure std.
+- **`analytic`** is the oracle for a `kspace` test (`kspace.rs:1936`), so it moves with `kspace`.
+  Nothing else in TRXScan uses it.
+
+`mrsim-acq`'s `io` feature pulls `nifti` and `ndarray` only. TRXScan's `io` today also pulls
+`trx-rs`, which builds HDF5 from source and needs cmake and network; that dependency stays with
+the streamline loaders in TRXScan, so `aslscan` never pays for it.
+
+TRXScan's `kspace`, `par`, and `io` features forward to the same-named `mrsim-acq` features. If
+the forwarding is forgotten the build still succeeds and silently falls back from the NUFFT path
+to the std-only one, which is slower and differs in the last bits, so the forwarding is checked by
+acceptance criterion 3 being run under both feature sets.
 
 Tests live as `#[cfg(test)] mod tests` at the bottom of each module, so they move with their
 modules. That arrangement is preserved in `mrsim-acq`.
@@ -137,8 +160,63 @@ loop that copies compartment and fieldmap slices at `kspace.rs:1223`. `Uniform` 
 unchanged. Without the split the caller would slice per compartment per z, which is the loop the
 entry point exists to own.
 
-TRXScan's call sites wrap their existing scalars in `T2Volume::Uniform`. The decay expression at
-`kspace.rs:649` gains a match on the source rather than an unconditional index.
+TRXScan's call sites wrap their existing scalars in `T2Volume::Uniform`.
+
+This is not a one-line change to the decay expression, and the first draft of this spec was wrong
+to call it one. `kspace.rs:647-653` evaluates the decay **once per compartment per PE line**, into
+a scalar `rel[c]`, outside the voxel loop. The whole forward model is organised around that fact:
+the header comment at `kspace.rs:436` lists relaxation as the "per line" factor, and the NUFFT
+path exists only because "the relaxation is an output-side scalar" (`kspace.rs:535-536`), applied
+to each compartment's transformed row after the transform (`kspace.rs:681-687`). A per-voxel T2
+is not a per-line scalar, so neither structure survives it. The same applies to the per-voxel
+`t_inhom` map of change 6, and the two are handled together.
+
+The decay factors as
+
+```
+exp(-trf/T2(r) - |t|/T2'(r))  with  trf = t_echo + t
+```
+
+and the rule is:
+
+- **All compartments `Uniform` and `t_inhom` absent.** The existing code runs untouched: `rel[c]`
+  scalars, NUFFT path eligible. This is every TRXScan call, and it is what keeps criterion 3.
+- **Any `Map`, or a `t_inhom` map.** The slice takes the rotor path, and the per-compartment weight
+  `w` at `kspace.rs:695-698` becomes `sum_c comp_c[i] * rel_c(i)` with `rel_c(i)` evaluated per
+  voxel per line. `Uniform` compartments in a mixed slice still use their scalar. The NUFFT gate
+  at `kspace.rs:540` gains this condition alongside `!do_eddy`.
+
+The cost is one `exp` per mapped compartment per sim voxel per acquired line, the same order as
+the rotor multiply already in that loop, plus the loss of the NUFFT speed-up (about 5x in
+TRXScan's production timing). aslscan therefore always runs the slower path in P1. That is
+accepted rather than engineered around. The exact alternative that keeps an FFT is a
+time-segmented NUFFT, which approximates `exp(-t*rho(r))` by interpolating between a few static
+weightings; it is a contained later optimisation and is listed under deferred decisions. Binning
+T2 into pseudo-compartments was considered and rejected, because bin boundaries put artificial
+edges into the image, and this simulator's whole point is what k-space does to edges.
+
+The test oracle `reference_coil_kspace` (`kspace.rs:1479`) gets the same per-voxel lookup. Two new
+tests pin the map path: a `Map` filled with one constant reproduces `Uniform` of that constant to
+1e-12 relative on the k-space coefficients (not bit-exact: the summation order differs), and the
+restructured forward with a varying map matches the literal sum at the existing 1e-10.
+
+**Map contract.** Every `T2Slice::Map` value is strictly positive; `f32::INFINITY` is allowed and
+means no decay. Zero is forbidden, for the reason set out under change 6: `-trf/0` is `-inf` when
+`trf > 0`, which is harmless, but `NaN` when `trf == 0`, and `0 * NaN` poisons the Fourier sum.
+The entry point rejects a non-positive or `NaN` map value before the volume loop. aslscan maps
+background `T2 == 0` to `INFINITY`, as it does for `T2'`.
+
+**`trf` must be positive on every acquired line.** `trf = t_echo + t` goes negative for early
+lines whenever `t_echo` is shorter than the time from the first acquired line to the echo. TRXScan
+never hits this at TE 88 ms. ASL will: TE near 12 ms with a 64-line, 0.5 ms/line full-Fourier
+readout puts the first line 16 ms before the echo. A negative `trf` is a readout that starts
+before the excitation, and the code responds with signal *growth*, `exp(+|trf|/T2)`. The entry
+point rejects an `Acquisition` whose earliest acquired line (after the partial-Fourier and GRAPPA
+mask) has `trf <= 0`, naming the minimum feasible `t_echo`. This is a new check, it cannot fire on
+any currently valid TRXScan configuration. It is why a short-TE ASL protocol must declare partial
+Fourier or a `TotalReadoutTime` short enough to fit, as a real one does. Line timing here follows
+the line index, not the sampling mask (`line_times`, `kspace.rs:237`), so GRAPPA shortens the
+readout only through the effective `TotalReadoutTime` the sidecar reports, never through `accel`.
 
 ### 2. Diffusion gradients become a generic eddy drive
 
@@ -159,10 +237,19 @@ TRXScan passes `Some([bvec[0]*bval, bvec[1]*bval, bvec[2]*bval])`, and `None` wh
 within 1e-9 of zero. aslscan passes the crusher moment when vascular crushing is configured, and
 `None` otherwise.
 
+The `None` decision is TRXScan's, made on `bval`, and the library must not re-derive it from the
+vector. The obvious library-side test, "the drive is the zero vector", is not the same predicate.
+FSL-style scheme files routinely carry b0 rows as `bval = 5, bvec = [0, 0, 0]`. Today that row has
+`do_eddy = true` with a zero gradient, which multiplies by identity rotors but still disables the
+NUFFT path (`kspace.rs:540`). A zero-vector test would flip it to `None`, re-enable the NUFFT, and
+move output bits under the `kspace` feature. So `Some([0.0; 3])` and `None` are distinct inputs
+with distinct code paths, and `do_eddy` becomes `acq.eddy_strength != 0.0 && eddy_drive.is_some()`.
+
 ### 3. Readout timing loses the diffusion name
 
-`SingleShotEpi::time_from_last_diffusion_gradient` becomes `time_from_prep_gradient`. The
-computation is unchanged. It measures time from the last large preparation gradient, which is a
+`Readout::time_from_last_diffusion_gradient` becomes `time_from_prep_gradient`. It is a method of
+the `Readout` trait (`readout.rs:14`), not only of `SingleShotEpi`, so the rename is on the trait
+and its one implementation. The computation is unchanged. It measures time from the last large preparation gradient, which is a
 diffusion gradient in one consumer and a crusher or labeling gradient in the other.
 
 ### 4. The diffusion phase component becomes optional, and gets its own drive
@@ -198,11 +285,11 @@ would be mathematically equivalent and would still move output bits.
 A positive magnitude paired with a zero direction is therefore handled where it is handled today,
 by the `n < 1e-12` guard, and yields a zero phase rather than an error.
 
-The entry point takes `&[Option<_>]`, not `Option<&[_]>`. A series can have a prep gradient on
-some volumes and not others, which is exactly the b0-interleaved diffusion case, and an outer
-`Option` can only say all or none. `eddy_drive` keeps its outer-`Option` shape because a zero
-vector already encodes "disabled" for it, reproducing the `bval.abs() > 1e-9` branch at
-`kspace.rs:393`.
+The entry point takes `&[Option<_>]`, not `Option<&[_]>`, for both drives. A series can have a
+prep gradient on some volumes and not others, which is exactly the b0-interleaved diffusion case,
+and an outer `Option` can only say all or none. `eddy_drive` has the same shape for the reason
+given under change 2: a zero vector does not encode "disabled", so the per-volume `Option` is the
+only thing that reproduces the `bval.abs() > 1e-9` branch at `kspace.rs:393`.
 
 `eddy_drive` and `prep_drive` stay separate because they are separate physics. Eddy currents
 follow the gradient moment. Motion-induced phase follows the q-vector.
@@ -219,26 +306,47 @@ pub fn simulate_acquisition_oversampled(
     fmap: &[f32],
     t_inhom: Option<&[f32]>,
     acq: &Acquisition,
-    eddy_drive: Option<&[[f64; 3]]>,        // one per volume
-    prep_drive: Option<&[Option<(f64, [f64; 3])>]>, // one per volume, individually optional
+    eddy_drive: &[Option<[f64; 3]>],           // length n_volumes
+    prep_drive: &[Option<(f64, [f64; 3])>],    // length n_volumes
     phase: &PhaseModel,
     seed: u64,
-    // Per-voxel noise SD on the ACQUIRED grid, `nvox = acq_dims[0]*acq_dims[1]*acq_dims[2]`.
-    // Length `nvox`: indexed `sigma[vox]`, one map shared by every volume (current behavior).
-    // Length `nvox * n_volumes`: indexed `sigma[vox * n_volumes + v]`, voxel-major, matching the
-    // 4D interleave the writer already uses (`kspace.rs:1296`, `io.rs:356`). Any other length is
-    // rejected before the per-volume loop starts. ASL needs the per-volume form, because an M0
-    // volume and a label volume differ in signal level by two orders of magnitude.
-    noise_sigma: Option<&[f32]>,
+    noise_sigma: Option<&[f32]>,               // unchanged: one acquired-grid map, all volumes
     eddy_trace: Option<&[[f64; 3]]>,
 ) -> (Vec<f32>, Vec<f32>)
 ```
 
-`ngrad` becomes `n_volumes`, the `bvals`/`bvecs` pair becomes the single optional `eddy_drive`
-slice, `prep_drive` carries the phase drive from change 4, and `t_inhom` carries the per-voxel map
-from change 6. `noise_sigma` gains a per-volume length option: `kspace.rs:1204` indexes it as
-`ns[vox]` only, so today one map serves the whole series. `simulate_acquisition_legacy` gets
-the same treatment.
+`ngrad` becomes `n_volumes`, the `bvals`/`bvecs` pair becomes the two drive slices, and `t_inhom`
+carries the per-voxel map from change 6, on the simulation grid with the fieldmap's layout. Both
+drive slices must have length `n_volumes`; a mismatch is rejected before the volume loop.
+`do_eddy_phase` (`kspace.rs:394`) takes the same `eddy_drive.is_some()` guard as `do_eddy`.
+
+`noise_sigma` is deliberately left alone. An earlier revision added a per-volume form on the
+argument that an M0 volume and a label volume differ in signal by two orders of magnitude. They
+do not: `delta_m` is about 1% of M0, but a *label volume* is static tissue minus `delta_m`, within
+a few percent of a control volume and the same order as M0. More to the point, thermal noise SD
+does not depend on signal level at all, so differing signal would not justify differing noise. P1
+does not use `noise_sigma` (its noise is `Acquisition::noise_variance`), so the extension had no
+consumer, and it is dropped.
+
+`simulate_acquisition_legacy` gets the same treatment, with one trap. It receives a scaled
+gradient, splits it into `bval = |g|` and `bvec = g/|g|`, and lets the forward model recombine
+them (`kspace.rs:1332-1335`). `(g/|g|)*|g|` is not bit-equal to `g`. The legacy wrapper therefore
+keeps the split and passes `Some([bvec[0]*bval, ...])`, never `Some(g)`, with `None` under the
+same `bval.abs() > 1e-9` test the forward model applies today.
+
+### 5a. One call simulates the whole series, and seeds are the caller's problem across calls
+
+Every random stream in the acquisition stage is keyed on the volume index `g` within a call:
+`slice_seed` (`kspace.rs:1240`), the image-space noise stream (`kspace.rs:1270`), and the shot
+phase (`phase.rs:119`). That is correct for TRXScan, which makes one call per series. It is a trap
+for a consumer that calls once per volume with `n_volumes = 1`: `g` is always 0, so every volume
+draws the **same** k-space noise, and a control-label subtraction cancels it exactly. The output
+looks plausible volume by volume and has infinite perfusion SNR.
+
+The contract is therefore: one call per series, with all volumes in `images`. No interface change
+is needed for that, only the statement. A consumer that must make a second call for the same
+dataset, as aslscan does for a separate M0 scan, passes a different `seed` and documents how it
+was derived.
 
 ### 6. T2\* inhomogeneity becomes a scalar or a map
 
@@ -257,7 +365,9 @@ pub struct SliceInput<'a> {
 ```
 
 `Acquisition.t_inhom` stays as the fallback, so TRXScan's call sites pass `None` and keep their
-current behavior. aslscan derives the map from the phantom as `1/T2' = 1/T2star - 1/T2`, per
+current behavior. A present map makes the decay per-voxel, with the structural consequences set
+out under change 1: the slice leaves the NUFFT path. The entry point validates the map as it does
+T2 maps: strictly positive or `INFINITY`, never zero or `NaN`. aslscan derives the map from the phantom as `1/T2' = 1/T2star - 1/T2`, per
 voxel. The derivation is total, and the stored map contains only finite positive values or
 `INFINITY` — never zero, never negative, never `NaN`.
 
@@ -324,13 +434,25 @@ TRXScan. Writing `_aslcontext.tsv` lives in aslscan.
 1. `cargo test` in `mrsim-acq` passes with the default pure-std build, offline.
 2. `cargo test` in TRXScan passes unchanged, both with no features and with `--features cli`.
 3. `trxscan` run on a fixed small fixture at a fixed seed produces bit-identical NIfTI output
-   before and after the extraction.
+   before and after the extraction, under **both** `--features cli` and
+   `--features cli,kspace,par`. The two builds take different forward paths (twiddle tables and
+   rotors versus `rustfft` and the NUFFT), and the NUFFT gate is one of the things this work
+   edits, so one build does not vouch for the other.
 4. A test asserts that `eddy_drive: Some(bvec * bval)` reproduces the pre-extraction eddy path.
 5. A test asserts that `eddy_drive: None` disables eddy exactly as the `bval.abs() > 1e-9` guard
-   at `kspace.rs:393` did.
-6. `cargo clippy --all-targets` introduces no warnings beyond the roughly six that already exist.
+   at `kspace.rs:393` did, and that `Some([0.0; 3])` does not.
+6. The two map-path tests under change 1 pass, and an `Acquisition` with `trf <= 0` on an
+   acquired line is rejected.
+7. `cargo clippy --all-targets` introduces no warnings beyond the roughly six that already exist.
 
 Criterion 3 is the real gate. The extraction is correct only if the output does not move.
+
+The baseline for criterion 3 is produced **first**, from TRXScan at commit `57858a5`, before any
+file moves, and its checksums are recorded in the P0 plan. A baseline regenerated partway through
+proves nothing. The fixture must exercise the paths at risk: at least one b0 row written the FSL
+way (`bval > 0`, zero `bvec`), a nonzero `--eddy` run as well as an eddy-free one, multiple coils
+with GRAPPA, and the multiband dropout path. TRXScan has no such fixture checked in (`tests/`
+holds only `benchmark_cli.rs`), so building it is the first task of P0, not a by-product.
 
 ---
 
@@ -343,7 +465,8 @@ protocol   asl.json + aslcontext.tsv (+ optional TOML overlay) -> Protocol
 phantom    BIDS-derivatives maps -> Phantom
 kinetic    Buxton general kinetic model -> delta_m
 mrsignal   post-excitation magnetization -> two compartments (spin echo only in P1)
-series     volume list from aslcontext, drives mrsim-acq once per volume
+resample   phantom grid -> simulation grid and acquisition grid
+series     volume list from aslcontext, assembles the 4D compartments, calls mrsim-acq once
 bids       part-mag / part-phase NIfTI, aslcontext.tsv, sidecar, ground-truth maps
 bin/aslscan.rs   clap CLI
 ```
@@ -360,12 +483,18 @@ BIDS phantom maps -----------+
                               |
                        mrsignal      ->  [tissue (T2_tissue), blood (T2_blood)]
                               |
+                       resample      ->  simulation grid
+                              |
              mrsim_acq::simulate_acquisition_oversampled
                               v
    sub-XX_part-mag_asl.nii.gz + part-phase + aslcontext.tsv + asl.json + ground truth
 ```
 
-One pass per row of `aslcontext.tsv`.
+One volume per row of `aslcontext.tsv`, and one call to the acquisition stage for the whole
+series. The rows are volumes of a single call, not separate calls, for the seeding reason given
+under P0 change 5a. The static tissue compartment is identical in every `control` and `label`
+volume and is replicated into the 4D layout the entry point takes. At 128 x 128 x 40 simulation
+voxels and 60 volumes that is about 160 MB per compartment, which is accepted.
 
 ## Protocol contract
 
@@ -377,10 +506,28 @@ One pass per row of `aslcontext.tsv`.
 `SliceTiming`, `PhaseEncodingDirection`, `TotalReadoutTime`, `ParallelReductionFactorInPlane`,
 `MultibandAccelerationFactor`.
 
-`PostLabelingDelay` is a scalar or an array. When it is an array its length must equal the number
-of non-`m0scan` rows in `aslcontext.tsv`, and a mismatch is an error naming both counts.
-`aslcontext.tsv` supplies volume order from the values `m0scan`, `control`, `label`, `deltam`,
-and `cbf`.
+`PostLabelingDelay`, `LabelingDuration`, and `RepetitionTimePreparation` are each a scalar or an
+array. BIDS defines the array form as one value **per volume**, in acquisition order, `m0scan`
+rows included, with `m0scan` entries of `PostLabelingDelay` and `LabelingDuration` set to zero.
+The array length must therefore equal the number of rows in `aslcontext.tsv`, all of them, and a
+mismatch is an error naming both counts. An earlier revision of this spec counted only
+non-`m0scan` rows; that contradicts the standard, would reject valid datasets, and would have
+aslscan write sidecars that `bids-validator` fails. A nonzero `m0scan` entry in either timing
+array is an error. `aslcontext.tsv` supplies volume order from the values `m0scan`, `control`,
+`label`, `deltam`, and `cbf`.
+
+The `RepetitionTimePreparation` array is how an `Included` M0 volume gets its own, usually longer,
+repetition time: row `i` uses entry `i`. With a scalar, every row including `m0scan` uses the same
+value, and that is simulated as written rather than second-guessed.
+
+`SliceTiming` is consumed by the kinetic model, not merely echoed. `PostLabelingDelay` is defined
+to the excitation of the *first slice* of a 2D acquisition, and every later slice is excited later
+and sees a longer delay. That slice-dependent PLD is one of the defining features of 2D ASL data
+and is cheap to get right, so the signal time for slice `z` is the row's `t` plus
+`SliceTiming[z] - min(SliceTiming)`. The array length must equal the acquired slice count. An
+absent `SliceTiming` means no per-slice offset, which is also the 3D case.
+`MultibandAccelerationFactor` is validated for consistency with `SliceTiming` when both are
+present and otherwise only echoed; it has no model behind it until P3 brings motion.
 
 `M0Type` and `aslcontext.tsv` must agree. `Included` requires at least one `m0scan` row, and that
 volume is written into the 4D ASL file. `Separate` forbids `m0scan` rows, and the M0 volume is
@@ -389,7 +536,9 @@ Disagreement is an error naming both the `M0Type` value and the offending row.
 
 `ArterialSpinLabelingType` of `PASL`, `CASL`, or `PCASL` selects the kinetic model. For `PASL`,
 `BolusCutOffFlag` must be true and `BolusCutOffDelayTime` supplies the bolus duration, because
-the kinetic model has no defined bolus length otherwise.
+the kinetic model has no defined bolus length otherwise. `BolusCutOffDelayTime` is a number, or
+for Q2TIPS a two-element array of the first and last saturation pulse times; the bolus duration
+is the first element.
 
 BIDS does not carry the kinetic parameters the model requires. `LabelingEfficiency` is optional
 in the standard and absent from most datasets, and nothing in BIDS expresses the blood-brain
@@ -411,9 +560,14 @@ contrasts that use them, in P3 and P5.
 
 Parameters the acquisition stage needs that BIDS does not express come from the same optional TOML
 overlay: `ghost_offset`, `n_spikes`, `spike_amplitude`, `n_coils`, `t_inhom`, `window`,
-`partial_fourier`, `pf_mode`, `eddy_*`, `noise_variance`, and the oversampling factor. The
-overlay maps onto `mrsim_acq::Acquisition`, but not one-to-one, and the gaps are where mistakes
-will land.
+`partial_fourier`, `pf_mode`, `eddy_*`, `noise_variance`, `matrix`, `m0_repetition_time`, and the
+oversampling factor. The overlay maps onto `mrsim_acq::Acquisition`, but not one-to-one, and the
+gaps are where mistakes will land.
+
+`protocol` checks the resolved timing before anything is simulated: the echo time must leave
+every acquired line after the excitation (P0 change 1). A short-TE full-Fourier protocol fails
+here, with the minimum feasible `EchoTime` and the `partial_fourier` that would fit in the
+message, rather than deep inside the acquisition stage.
 
 **Units.** `Acquisition` is in milliseconds throughout: `t_line`, `t_echo`, `t_inhom`, `eddy_tau`
 (`kspace.rs:147-175`), as is `readout.rs`. BIDS and the phantom are in seconds. The conversion
@@ -428,8 +582,15 @@ seconds in this document and stored in milliseconds once loaded.
 | `EchoTime` | `t_echo` | seconds to milliseconds |
 | `TotalReadoutTime` | `t_line` | `t_line = TotalReadoutTime * 1000 / ny`, the inverse of `trxscan.rs:968` |
 | `ParallelReductionFactorInPlane` | `accel` | direct; `acs_lines` comes from the overlay |
-| `PhaseEncodingDirection` | `reverse_phase` | sign of the PE axis |
+| `PhaseEncodingDirection` | `reverse_phase` | `j-` is `false`, `j` is `true`, in the native (unreoriented) frame |
 | oversampling factor | — | not an `Acquisition` field; it sets the simulation grid passed to the entry point |
+
+The `PhaseEncodingDirection` row reads backwards and is not a typo. The forward readout starts at
+the maximum k-space line (`readout.rs:48`), and `orient` pins the resulting label: the forward
+scan is `j-` in the grid's own frame and becomes `j` only after reorientation to LAS
+(`orient.rs:244-249`). Getting this wrong flips the distortion direction of every output, and
+nothing else in P1 would notice, so a test distorts an off-centre point with a known fieldmap sign
+and asserts which way it moves for each label.
 
 The `ny` in the `t_line` rule is the acquired matrix size along the phase-encode axis, matching
 `grid.dims[1]` at `trxscan.rs:968`. It is `ny`, not `ny - 1`. The distinction changes every
@@ -453,13 +614,65 @@ Separate NIfTI files, each with a JSON sidecar carrying `Units`:
 | `T2starmap.nii.gz` | tissue T2\* | `s` |
 | `M0map.nii.gz` | equilibrium magnetization | arbitrary |
 | `dseg.nii.gz` | tissue segmentation | label indices |
+| `fieldmap.nii.gz` | B0 off-resonance, optional | `Hz` |
 
 All maps must share a grid, and a mismatch is an error naming the offending file. Units are read
 rather than assumed, and an unexpected unit string is an error rather than a silent conversion.
 
+The fieldmap is the one optional file, and it is listed because the acquisition entry point takes
+a fieldmap unconditionally and EPI distortion is the first artifact this project exists to
+reproduce. ASLDRO's ground truth has none. When it is absent, aslscan passes zeros and sets
+`do_distortions = false`, and the output sidecar records that no distortion was simulated. Note
+the phantom's T2\* map and a supplied fieldmap are independent inputs: nothing checks that the
+intravoxel dephasing one implies is consistent with the field gradients of the other.
+
 `tools/hrgt_to_bids.py`, run in the `simasl` micromamba environment, converts ASLDRO's packed 5D
 `hrgt_icbm_2009a_nls_v3` ground truth into this layout. That provides a real phantom from the
 first commit.
+
+## Grids and resampling
+
+Three grids are in play, and the earlier revisions of this spec named only one of them.
+
+- The **phantom grid** is whatever the maps are on. The ASLDRO ground truth is 1 mm isotropic.
+- The **acquisition grid** is axis-aligned with the phantom and covers its field of view. Its
+  voxel size is `AcquisitionVoxelSize`, and its matrix is the phantom extent divided by that size,
+  rounded up, per axis. An overlay `matrix` overrides the in-plane size. The phase-encode axis
+  named by `PhaseEncodingDirection` must be the second data axis, because `mrsim-acq` encodes
+  phase along y; P1 rejects `i` and `k` rather than permuting axes, which is `orient`'s job and is
+  wired up when a dataset needs it.
+- The **simulation grid** is the acquisition grid refined in-plane by the integer oversampling
+  factor `o`, with the same slices. `mrsim-acq` requires exactly this relationship
+  (`kspace.rs:1212-1215`) and never oversamples z. `io::hires_grid` builds its affine.
+
+The rule for getting from the first to the third is: **evaluate the physics on the phantom grid,
+then average magnetization, not parameters.** `kinetic` and `mrsignal` run per phantom voxel. The
+two compartment images are then resampled to the simulation grid by overlap-weighted box
+averaging: each simulation voxel is the volume-weighted mean of the phantom voxels it overlaps,
+with exact fractional weights at the boundaries. In-plane that is a partial-volume average;
+through-plane it is an ideal rectangular slice profile over `slice thickness / phantom dz`
+phantom slices.
+
+This order matters. Magnetization is what physically adds within a voxel, so averaging it gives
+the correct partial-volume signal. Averaging perfusion, transit time, or T1 first and then
+applying a nonlinear kinetic model gives a different and wrong answer at every tissue boundary,
+which for ASL means most of the cortex.
+
+Because `SliceTiming` makes `t` depend on the acquired slice, `kinetic` is evaluated once per
+acquired slice, over the slab of phantom voxels that slice overlaps, at that slice's `t`. A
+phantom voxel straddling two acquired slices contributes to each at that slice's timing.
+
+The relaxation maps cannot follow the same rule, because a voxel has one decay rate per
+compartment in `mrsim-acq`. The T2 and T2' maps on the simulation grid are the
+magnetization-weighted mean of the **rates** `1/T2` and `1/T2'` over the overlapped phantom
+voxels, inverted back to times, with a zero mean rate stored as `INFINITY`. This is the
+first-order-correct single-exponential stand-in for a multi-exponential voxel, and it is an
+approximation: it is exact where the simulation voxel is homogeneous and slightly overstates
+decay where it is not. The fieldmap is volume-weighted averaged.
+
+Ground-truth outputs on the acquisition grid use the same machinery: `delta_m` and the tissue
+signal are box-averaged, and the parameter maps (`perfusion`, `att`, T1, T2) are plain
+volume-weighted means, labelled as such in their sidecars. `dseg` is resampled by majority vote.
 
 ## Kinetic model
 
@@ -477,7 +690,7 @@ M0b      = M0_tissue / lambda
 ```
 
 Three delivery states, selected per voxel. The lower bound on the first is simasl's, not
-decoration: `gkm_filter.py:156` writes the chained comparison `0 < signal_time <= transit_time`,
+decoration: `gkm_filter.py:157` writes the chained comparison `0 < signal_time <= transit_time`,
 which with a scalar `signal_time` and an array `transit_time` degenerates to a scalar `False` when
 `signal_time <= 0`. A faithful port reproduces that, and the Rust states it as an explicit guard
 rather than inheriting a Python chained-comparison artifact.
@@ -513,7 +726,7 @@ Every division guards its denominator and yields zero where the denominator is z
 simasl's `np.divide(..., out=zeros, where=...)` pattern.
 
 `t == dt` does not reach the PASL arriving branch. The arriving mask is strictly `dt < t`
-(`gkm_filter.py:157`), so for positive `t` the equality falls in the not-arrived mask and the
+(`gkm_filter.py:158`), so for positive `t` the equality falls in the not-arrived mask and the
 answer is zero by masking, not by the quotient guard. The guard still matters, because simasl
 evaluates `delta_m_arriving` over the whole array before masking, and an unguarded division would
 produce a NaN in entries that are then discarded. The Rust computes per voxel and branches first,
@@ -521,7 +734,7 @@ so it must reproduce the masked result, not the intermediate.
 
 Zero `t1_arterial_blood` is a separate case and is not covered by the division rule. simasl
 replaces the entire arterial exponential with zero, not the quotient
-(`gkm_filter.py:203`, `gkm_filter.py:250`), so `delta_m` is zero rather than the `exp(0) = 1` that
+(`gkm_filter.py:205`, `gkm_filter.py:252`), so `delta_m` is zero rather than the `exp(0) = 1` that
 guarding only the division would give. The two branches also differ in their test: PASL uses
 `t1_arterial_blood > 0` and CASL/PCASL uses `t1_arterial_blood != 0`. The port reproduces both,
 including the difference.
@@ -532,13 +745,23 @@ durations.
 | | `tau` (bolus duration) | `t` (signal time) |
 |---|---|---|
 | CASL, PCASL | `LabelingDuration` | `PostLabelingDelay + LabelingDuration` |
-| PASL | `BolusCutOffDelayTime` | `PostLabelingDelay + BolusCutOffDelayTime` |
+| PASL | `BolusCutOffDelayTime` (first element) | `PostLabelingDelay` |
 
-For PASL, `LabelingDuration` is not defined by BIDS and is not used. The bolus is created by the
-cutoff pulse, so `BolusCutOffDelayTime` is both the bolus duration and the offset from labeling
-onset to the end of the bolus. `BolusCutOffFlag` must be true, as stated in the protocol contract;
-a PASL protocol without it is rejected rather than defaulted, because there is no bolus duration
-to assume.
+The asymmetry is BIDS's, not an oversight. For CASL and PCASL, `PostLabelingDelay` runs from the
+**end** of labeling, so the GKM's clock, which starts at labeling onset, needs the labeling
+duration added. For PASL, BIDS defines `PostLabelingDelay` from the **middle of the labeling
+pulse** to excitation, which is the inversion time TI and already the GKM's `t`. An earlier
+revision added `BolusCutOffDelayTime` to it, which would have simulated every PASL dataset at
+TI + TI1, typically 0.7 s late. A PASL protocol with `PostLabelingDelay <= BolusCutOffDelayTime`
+is rejected: the cutoff pulse would fall after the readout.
+
+For PASL, `LabelingDuration` is not defined by BIDS and is not used. The bolus is ended by the
+cutoff pulse, so `BolusCutOffDelayTime` is the bolus duration. `BolusCutOffFlag` must be true, as
+stated in the protocol contract; a PASL protocol without it is rejected rather than defaulted,
+because there is no bolus duration to assume.
+
+Both columns are per volume when the sidecar fields are arrays, and `t` further gains the
+per-slice offset from `SliceTiming` described in the protocol contract.
 
 This is where simasl's single `label_duration` parameter splits in two. simasl has one field
 serving both roles (`gkm_filter.py:109`), which works because its input is not BIDS.
@@ -581,8 +804,8 @@ acquisition stage, which applies `exp(-trf/T2 - |t|/T2')` per line with `trf = t
 time_from_max_echo` (`readout.rs:64`, `kspace.rs:649`) — a term that already spans excitation to
 each sampled line.
 
-This is a departure from simasl, and it has to be. `mri_signal_filter.py:213` and
-`mri_signal_filter.py:233` fold `exp(-TE/T2*)` or `exp(-TE/T2)` into the signal equation, because
+This is a departure from simasl, and it has to be. `mri_signal_filter.py:224` and
+`mri_signal_filter.py:246` fold `exp(-TE/T2*)` or `exp(-TE/T2)` into the signal equation, because
 simasl has no readout model and TE decay has nowhere else to live. Porting those equations
 unchanged and then handing the result to `mrsim-acq` would apply transverse relaxation twice. The
 fixture tests in the testing section therefore compare `mrsignal` against simasl's equation with
@@ -591,7 +814,7 @@ tolerance.
 
 `mrsignal` also does not apply the steady-state longitudinal term to the blood compartment.
 simasl computes the tissue steady state, then adds `mag_enc` to it, then applies flip angle and
-transverse decay (`mri_signal_filter.py:204`). `delta_m` is already a magnetization difference
+transverse decay (`mri_signal_filter.py:222`, `:245`). `delta_m` is already a magnetization difference
 delivered by the kinetic model; running it through an `M0(1-exp(-TR/T1))` recovery term would
 attribute to it a saturation history it does not have. The blood compartment gets the flip-angle
 factor and nothing else, and in P1 that factor is exactly 1: the only accepted contrast is spin
@@ -600,15 +823,14 @@ that have one, in P3 and P5.
 
 ### Row semantics
 
-Each `aslcontext.tsv` row maps to one acquisition pass and one pair of compartment inputs. The
-first revision of this spec deleted this table while rewriting the section above; it is the
-behavioral contract for the whole series and nothing else recovers it.
+Each `aslcontext.tsv` row maps to one volume and one pair of compartment inputs. This table is the
+behavioral contract for the whole series.
 
 | Row | `compartments[0]` tissue | `compartments[1]` blood | Notes |
 |---|---|---|---|
 | `control` | tissue signal | 0 | |
 | `label` | tissue signal | `-delta_m` at this row's PLD | |
-| `m0scan` | tissue at the M0 `RepetitionTimePreparation` | 0 | Only when `M0Type` is `Included` |
+| `m0scan` | tissue at this row's `RepetitionTimePreparation` | 0 | Only when `M0Type` is `Included` |
 | `deltam` | 0 | `+delta_m` at this row's PLD | A pre-subtracted series |
 | `cbf` | rejected in P1 | — | See below |
 
@@ -623,9 +845,16 @@ real pre-subtracted reconstruction, and P1 has no model of what the scanner did 
 acquired volume, and producing one means choosing a quantification model, which this spec does not.
 
 `M0Type == Separate` forbids an `m0scan` row, so no row generates the separate M0 file. It comes
-from one additional acquisition pass outside the row loop, with the same protocol, the tissue
-compartment at the M0 repetition time, and the blood compartment zero. Execution is one pass per
-row, plus that one extra pass when `M0Type` is `Separate`.
+from a second, one-volume call to the acquisition stage, with the same protocol, the blood
+compartment zero, and the tissue compartment at the M0 repetition time. That time is the overlay's
+`m0_repetition_time`, which is required when `M0Type` is `Separate`: the ASL sidecar's
+`RepetitionTimePreparation` describes the ASL series, not the M0 scan, and BIDS puts the M0
+scan's own value in the `m0scan.json` this simulator is about to write, not in anything it reads.
+
+Execution is therefore one call for the series plus one for a separate M0. The second call is
+volume 0 of its own call, so under the same seed it would draw exactly the k-space noise of the
+series' volume 0 (P0 change 5a). It is seeded with `seed ^ 0x4D30_5343_414E` ("M0SCAN"), and both
+seeds are written to the output sidecars.
 
 `BackgroundSuppression: true` is rejected in P1 with an error naming P3. The field is read from
 the sidecar, and accepting it while modeling nothing would write an output whose sidecar claims
@@ -682,7 +911,9 @@ overlay values and the random seed.
 4. A protocol requesting a gradient-echo or inversion-recovery contrast is rejected with an error
    naming the P1 spin-echo restriction, rather than simulated with spin-echo physics.
 5. The blood-compartment linearity property below holds.
-6. `cargo test` passes in the pure-std default build.
+6. With noise enabled, the noise in any two volumes of a series is uncorrelated, and so is the
+   noise in a separate M0 scan and the series' first volume.
+7. `cargo test` passes in the pure-std default build.
 
 ---
 
@@ -720,10 +951,22 @@ New code, written test-first.
   (`mri_signal_filter.py:170-173`). A test asserts that a
   protocol requesting `ge` or `ir` is rejected rather than silently simulated.
 - **protocol** — parse tests over real BIDS ASL sidecars. Cases: scalar `PostLabelingDelay`,
-  array `PostLabelingDelay`, an array whose length disagrees with `aslcontext.tsv`, `PASL`
-  without `BolusCutOffFlag`, and overlay precedence over sidecar.
-- **phantom** — unit conversion, an unexpected unit string, a missing map, and a map on a
-  different grid.
+  array `PostLabelingDelay` with a zero `m0scan` entry, an array whose length disagrees with the
+  total row count of `aslcontext.tsv`, a nonzero `m0scan` entry, array
+  `RepetitionTimePreparation`, `PASL` without `BolusCutOffFlag`, PASL signal time equal to
+  `PostLabelingDelay` with nothing added, a Q2TIPS two-element `BolusCutOffDelayTime`, an echo
+  time too short for the readout, both `PhaseEncodingDirection` signs, and overlay precedence
+  over sidecar.
+- **phantom** — unit conversion, an unexpected unit string, a missing map, a map on a
+  different grid, and an absent fieldmap.
+- **resample** — a constant image stays constant; total magnetization is conserved to 1e-6
+  relative when the grids tile the same extent; a two-tissue boundary voxel equals the
+  volume-weighted mean of the two signals and not the signal of the mean parameters; slice `z`
+  of a `SliceTiming` protocol matches a single-slice run at `t + SliceTiming[z]`.
+- **series** — the noise in two volumes of one series is uncorrelated, and the separate M0
+  volume's noise is uncorrelated with series volume 0. This is the test that catches the
+  per-call seeding trap of P0 change 5a, which no other test would: every other property holds
+  just as well when all volumes share one noise realization.
 - **bids** — filename construction and `aslcontext.tsv` ordering.
 
 Fixtures are generated with `micromamba run -n simasl`. That environment pins Python 3.8.20,
@@ -742,7 +985,7 @@ and `|t|` (`kspace.rs:649`), so the operator is a k-space weighting, not a scala
 zeroes whole PE lines (`kspace.rs:336`) and the reconstruction window multiplies k-space before
 inversion (`kspace.rs:934`). Oversampled acquisition is deliberate Fourier-band truncation that
 creates Gibbs ringing (`kspace.rs:911`), so it is not image-space resampling. `signal_scale`
-multiplies every compartment and defaults to 100 (`kspace.rs:211`). Above all the written image is
+multiplies every compartment and defaults to 100 (`kspace.rs:212`). Above all the written image is
 magnitude (`kspace.rs:1278`), and `|T| - |T - B|` is not `|B|`.
 
 The property that is true is **linearity in the blood compartment**. Under the settings listed
@@ -814,6 +1057,10 @@ These are settled as roadmap direction and specified in their own sub-projects, 
 - 3D GRASE and stack-of-spirals readouts, and gradient-echo contrast, all of which need a
   different echo-formation model in `mrsim-acq`: P5.
 - Hadamard time-encoding, Look-Locker, velocity-selective labeling, and multi-TE: P6.
+- A time-segmented NUFFT that keeps the O(N log N) forward path under per-voxel T2 and T2' maps.
+  Unscheduled; taken up only if P1's measured run time demands it.
+- Phase encoding along a data axis other than the second, by permuting through `orient`.
+  Unscheduled; taken up when a target dataset needs it.
 - The `--compat-asldro` path and the voxelwise benchmark: P2. It requires porting numpy's
   MT19937 and its legacy Gaussian polar method to Rust, or running the diff with noise disabled
   on both sides and comparing noise statistically. Note that simasl is configured by `desired_snr`
@@ -832,5 +1079,15 @@ map derived from `delta_m` rather than as a volume fraction, so this does not bl
 revisits it when the arterial compartment arrives.
 
 **BIDS ASL sidecars in the wild are incomplete.** Real datasets omit fields that the simulator
-needs. The TOML overlay covers the acquisition parameters, and missing kinetic parameters are an
-error that names the field rather than a silent default.
+needs. The TOML overlay covers the acquisition parameters. The three kinetic parameters with
+literature-standard values (label efficiency, lambda, arterial blood T1) take the documented
+defaults in the protocol contract, and every default that was applied is recorded in the output
+sidecar so it is never silent. Parameters with no defensible default, namely the PASL bolus
+duration and the separate M0 scan's repetition time, are an error that names the field.
+
+**aslscan cannot use the fast forward path.** Per-voxel T2 and T2' maps take every slice off the
+NUFFT path (P0 change 1), so aslscan runs at roughly the speed of TRXScan's std-only build
+whatever features are enabled. ASL matrices are typically much smaller than diffusion ones, and
+the rotor path is cubic in the linear matrix dimension, so this is expected to be tolerable; it
+is measured on the first end-to-end run rather than assumed. If it is not tolerable, the remedy is
+the time-segmented NUFFT under deferred decisions, not a T2 approximation in aslscan.
