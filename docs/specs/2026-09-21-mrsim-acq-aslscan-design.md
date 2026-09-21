@@ -91,7 +91,9 @@ from the module list.
 - **`analytic`** is the oracle for a `kspace` test (`kspace.rs:1936`), so it moves with `kspace`.
   Nothing else in TRXScan uses it.
 
-`mrsim-acq`'s `io` feature pulls `nifti` and `ndarray` only. TRXScan's `io` today also pulls
+`mrsim-acq`'s `io` feature pulls `nifti`, `ndarray`, and `nalgebra`. The last is needed because
+`header_for_grid` builds a `Matrix4` to set the qform and sform (`io.rs:247-254`) and moves with
+the writers. TRXScan's `io` today also pulls
 `trx-rs`, which builds HDF5 from source and needs cmake and network; that dependency stays with
 the streamline loaders in TRXScan, so `aslscan` never pays for it.
 
@@ -179,12 +181,16 @@ exp(-trf/T2(r) - |t|/T2'(r))  with  trf = t_echo + t
 
 and the rule is:
 
-- **All compartments `Uniform` and `t_inhom` absent.** The existing code runs untouched: `rel[c]`
-  scalars, NUFFT path eligible. This is every TRXScan call, and it is what keeps criterion 3.
-- **Any `Map`, or a `t_inhom` map.** The slice takes the rotor path, and the per-compartment weight
-  `w` at `kspace.rs:695-698` becomes `sum_c comp_c[i] * rel_c(i)` with `rel_c(i)` evaluated per
-  voxel per line. `Uniform` compartments in a mixed slice still use their scalar. The NUFFT gate
-  at `kspace.rs:540` gains this condition alongside `!do_eddy`.
+- **Every `t2` and every `t_inhom` entry `Uniform`.** The existing code runs untouched: `rel[c]`
+  scalars, NUFFT path eligible. This is every TRXScan call, and it is also every aslscan call in
+  `class` mode. It is what keeps criterion 3.
+- **Any `Map` in either.** The slice takes the rotor path, and the per-compartment weight `w` at
+  `kspace.rs:695-698` becomes `sum_c comp_c[i] * rel_c(i)` with `rel_c(i)` evaluated per voxel per
+  line. `Uniform` compartments in a mixed slice still use their scalar. The NUFFT gate at
+  `kspace.rs:540` gains this condition alongside `!do_eddy`.
+
+Both terms of `exp(-trf/t2[c] - |t|*1000/t_inhom)` must be scalar for the factoring to work. A
+uniform T2 beside a mapped T2' is still the rotor path.
 
 The cost is one `exp` per mapped compartment per sim voxel per acquired line, the same order as
 the rotor multiply already in that loop, plus the loss of the NUFFT speed-up. The size of that
@@ -210,23 +216,72 @@ adds nothing that was not there.
 
 | Mode | Behavior |
 |---|---|
-| `auto` | Test whether T2, T2\*, and T1 are constant within every `dseg` label. If so, decompose tissue into one compartment per label with `Uniform` values. Otherwise use a single tissue compartment with `Map`. |
-| `class` | Force the decomposition. Error, naming the first offending label and voxel, if the maps are not constant within a label. |
+| `auto` | Run the constancy test below. If it passes, decompose. Otherwise use a single tissue compartment with `Map`. |
+| `class` | Force the decomposition. Error, naming the first offending label and voxel, if the test fails. |
 | `voxel` | Force the single-compartment `Map` form, whatever the phantom looks like. |
+
+The constancy test is exact bitwise equality of `T1`, `T2`, and the **derived** `T2'` within each
+foreground `dseg` label. Testing derived T2' rather than raw T2\* matters, because the derivation
+collapses several raw cases to `INFINITY`: a label whose T2\* varies only among values that all
+exceed its T2 is constant in T2' even though it is not constant in T2\*. Bitwise rather than
+tolerant, because a converted phantom is painted from a table of constants and any spread in it
+means the phantom is not what `class` mode assumes.
+
+`dseg` label 0 is background. Its magnetization must be zero, `phantom` checks that it is, and it
+gets no compartment. Foreground labels require strictly positive T1, T2, and T2\*; a zero there is
+an error naming the label and voxel, not a silently infinite relaxation. `dseg` is mandatory, so
+its absence is already an error.
 
 `auto` on the converted ASLDRO phantom yields `class`, so the ordinary ASL run keeps the NUFFT
 path and the extra compartments cost only the per-compartment work the stage already does. A
 future run with a fitted T2 map from a scanner falls to `voxel` on its own, and pays the rotor
 cost then, which is the case the cost actually belongs to.
 
-The mode chosen is recorded in the output sidecar, because it changes the compartment count and
-therefore the meaning of a per-compartment debug dump.
+### Compartment ordering
 
-**The two representations are cross-checked, not trusted.** An acceptance test runs the same
-piecewise-constant phantom twice, once as `class` and once as `voxel`, and asserts the written
-output agrees to `1e-5` relative. They are the same physics by construction, so any disagreement
-is a bug in the mapped path or in the decomposition, and this is the only test that would find it.
-It also measures both, which is where the missing speed-up number comes from.
+The compartment count is no longer fixed at two, so the order is pinned. For `K` foreground `dseg`
+labels sorted ascending:
+
+```
+compartments[0 .. K)   tissue, one per foreground label, in sorted label order
+compartments[K]        labeled blood
+compartments[K + 1]    arterial blood            (P4, not P1)
+```
+
+`voxel` mode is the `K = 1` case of this, with the single tissue compartment carrying maps instead
+of scalars. Everywhere this document says "the tissue compartment" it means `0..K`, and "the blood
+compartment" means index `K`. The row semantics table, `mrsignal`, and the linearity property all
+read in those terms: `mrsignal` applies the tissue signal equation to each of `0..K` with that
+label's constants, and the linearity property varies only index `K`.
+
+The mode and the resolved label ordering are recorded in the output sidecar, because together they
+determine what a per-compartment debug dump means.
+
+**The two representations are cross-checked, and they are not equivalent.** `class` mode keeps
+each tissue's decay separate, so a mixed voxel contributes a sum of exponentials. `voxel` mode
+collapses that voxel to one exponential whose rate is the magnetization-weighted mean. Those agree
+only where a simulation voxel is homogeneous, because in general
+
+```
+  sum_i w_i * exp(-t / T2_i)   !=   exp(-t * sum_i w_i / T2_i)
+```
+
+`class` is therefore the reference, and `voxel` is a documented approximation at partial-volume
+boundaries, not an equal alternative. That is a second reason to prefer `class` where the phantom
+allows it, beyond the NUFFT path.
+
+Two tests follow from that, not one:
+
+- **Equivalence on a homogeneous grid.** With the acquisition grid equal to the phantom grid and
+  `o = 1`, every simulation voxel carries exactly one label, the weighted-rate collapse is exact,
+  and the two modes must agree to `1e-5` relative. A disagreement here is a bug in the mapped path
+  or in the decomposition, and nothing else would find it.
+- **Characterization at boundaries.** On the ordinary oversampled grid, the two modes are compared
+  and the maximum discrepancy is recorded as a tracked number rather than asserted to be zero. It
+  quantifies the `voxel`-mode approximation, and a regression that moves it is worth seeing.
+
+The first of these also measures both paths, which is where the missing speed-up number comes
+from.
 
 The exact alternative that keeps an FFT under a genuinely smooth map is a time-segmented NUFFT,
 which approximates `exp(-t*rho(r))` by interpolating between a few static weightings. It is a
@@ -234,7 +289,9 @@ contained later optimisation and is listed under deferred decisions.
 
 The test oracle `reference_coil_kspace` (`kspace.rs:1479`) gets the same per-voxel lookup. Two new
 tests pin the map path: a `Map` filled with one constant reproduces `Uniform` of that constant to
-1e-12 relative on the k-space coefficients (not bit-exact: the summation order differs), and the
+`1e-12` in L2 relative norm over the k-space coefficients, not coefficient-wise relative, which is
+unstable wherever a coefficient is near zero (not bit-exact either: the summation order differs),
+and the
 restructured forward with a varying map matches the literal sum at the existing 1e-10.
 
 **Map contract.** Every `T2Slice::Map` value is strictly positive; `f32::INFINITY` is allowed and
@@ -259,11 +316,14 @@ readout only through the effective `TotalReadoutTime` the sidecar reports, never
 
 `SliceInput.bvec` and `SliceInput.bval` (`kspace.rs:269-272`) are read only by the eddy model, at
 `kspace.rs:391-393`, `kspace.rs:484`, and `kspace.rs:663`. In every one of those places they
-appear as the product `bvec * bval`, a gradient first moment.
+appear as the product `bvec * bval`. That product is the drive the legacy eddy model takes, in
+its own model units. It is not the physical gradient first moment, and this spec does not call it
+one: `phase.rs:93-99` is explicit that TRXScan has no waveform timing and that its q-vector is an
+effective one absorbing those constants.
 
 ```rust
 pub struct SliceInput<'a> {
-    /// Per-volume gradient first moment driving the eddy-current model.
+    /// Per-volume eddy drive in the legacy model's units, `bvec * bval` for diffusion.
     /// `None` disables eddy for this volume, reproducing the old `bval ~= 0` branch.
     pub eddy_drive: Option<[f64; 3]>,
     ...
@@ -354,7 +414,10 @@ pub fn simulate_acquisition_oversampled(
 
 `ngrad` becomes `n_volumes`, the `bvals`/`bvecs` pair becomes the two drive slices, and `t_inhom`
 carries the per-voxel map from change 6, on the simulation grid with the fieldmap's layout. Both
-drive slices must have length `n_volumes`; a mismatch is rejected before the volume loop.
+drive slices must have length `n_volumes`; a mismatch is rejected before the volume loop. So must
+`eddy_trace` when present: it is indexed `tr[g]` inside the loop (`kspace.rs:1257`), and today
+only TRXScan's CLI checks its length (`trxscan.rs:868-885`). An extracted public entry point
+cannot rely on one particular caller having done that.
 `do_eddy_phase` (`kspace.rs:394`) takes the same `eddy_drive.is_some()` guard as `do_eddy`.
 
 `noise_sigma` is deliberately left alone. An earlier revision added a per-volume form on the
@@ -394,18 +457,26 @@ would discard susceptibility dropout, which is one of the artifacts ASL most nee
 
 ```rust
 pub struct SliceInput<'a> {
-    /// Per-voxel T2' inhomogeneity time (ms) on the simulation grid, overriding
-    /// `Acquisition::t_inhom` where present. `f32::INFINITY` means no inhomogeneity decay.
-    pub t_inhom: Option<&'a [f32]>,
+    /// Per-compartment T2' inhomogeneity time (ms). Same shape as `t2`, because T2' is a tissue
+    /// property exactly as T2 is. `f32::INFINITY` means no inhomogeneity decay.
+    pub t_inhom: Option<&'a [T2Slice<'a>]>,
     ...
 }
 ```
 
-`Acquisition.t_inhom` stays as the fallback, so TRXScan's call sites pass `None` and keep their
-current behavior. A present map makes the decay per-voxel, with the structural consequences set
-out under change 1: the slice leaves the NUFFT path. The entry point validates the map as it does
-T2 maps: strictly positive or `INFINITY`, never zero or `NaN`. aslscan derives the map from the phantom as `1/T2' = 1/T2star - 1/T2`, per
-voxel. The derivation is total, and the stored map contains only finite positive values or
+`t_inhom` is per compartment, not one shared map. That mirrors `t2` deliberately: T2' is derived
+from T2 and T2\*, both of which are tissue properties, so wherever T2 is uniform per compartment
+T2' is too. A single shared map would make it impossible to say so, and the consequence is not
+cosmetic — the NUFFT gate requires relaxation to be an output-side scalar for *every* term, so a
+shared T2' map would take the fast path away even when every compartment's T2 is uniform. With
+`t_inhom` per compartment, class mode passes `Uniform` for both and stays on the fast path, which
+is the whole point of having class mode.
+
+`Acquisition.t_inhom` stays as the scalar fallback, so TRXScan's call sites pass `None` and keep
+their current behavior. The entry point validates each map as it does T2 maps: strictly positive
+or `INFINITY`, never zero or `NaN`. aslscan derives T2' from the phantom as
+`1/T2' = 1/T2star - 1/T2`, per voxel in `voxel` mode and per label in
+`class` mode. The derivation is total, and the stored map contains only finite positive values or
 `INFINITY` — never zero, never negative, never `NaN`.
 
 | `T2` | `T2star` | Stored `T2'` |
@@ -561,8 +632,18 @@ value, and that is simulated as written rather than second-guessed.
 to the excitation of the *first slice* of a 2D acquisition, and every later slice is excited later
 and sees a longer delay. That slice-dependent PLD is one of the defining features of 2D ASL data
 and is cheap to get right, so the signal time for slice `z` is the row's `t` plus
-`SliceTiming[z] - min(SliceTiming)`. The array length must equal the acquired slice count. An
-absent `SliceTiming` means no per-slice offset, which is also the 3D case.
+`SliceTiming[z] - min(SliceTiming)`. The array length must equal the acquired slice count.
+
+`MRAcquisitionType` is consumed rather than echoed, and P1 accepts `2D` only. `3D` is rejected
+with an error naming P5, which is where the 3D readouts live; `mrsim-acq`'s readout is in-plane
+EPI and has no through-plane encoding to offer a 3D protocol. `SliceTiming` is therefore required
+in P1 rather than optional, since a 2D acquisition always has one, and an absent one is an error
+rather than a silent no-offset.
+
+`SliceEncodingDirection` is consumed too. Indexing `SliceTiming[z]` by the data's own z index
+assumes the slice axis runs in the same direction as the data axis; BIDS uses a trailing `-` to
+say it does not, and `protocol` reverses the mapping when it sees one. Ignoring the field would
+put the slice timings on the wrong slices in exactly the datasets that bothered to record it.
 `MultibandAccelerationFactor` is validated for consistency with `SliceTiming` when both are
 present and otherwise only echoed; it has no model behind it until P3 brings motion.
 
@@ -574,7 +655,8 @@ Disagreement is an error naming both the `M0Type` value and the offending row.
 `ArterialSpinLabelingType` of `PASL`, `CASL`, or `PCASL` selects the kinetic model. For `PASL`,
 `BolusCutOffFlag` must be true and `BolusCutOffDelayTime` supplies the bolus duration, because
 the kinetic model has no defined bolus length otherwise. `BolusCutOffDelayTime` is a number, or
-for Q2TIPS a two-element array of the first and last saturation pulse times; the bolus duration
+for Q2TIPS a two-element array of the first and last saturation pulse times, which BIDS requires
+to satisfy `0 <= first <= last` and which `protocol` validates; the bolus duration
 is the first element.
 
 BIDS does not carry the kinetic parameters the model requires. `LabelingEfficiency` is optional
@@ -616,7 +698,7 @@ seconds in this document and stored in milliseconds once loaded.
 
 | BIDS / overlay | `Acquisition` | Rule |
 |---|---|---|
-| `EchoTime` | `t_echo` | seconds to milliseconds |
+| `EchoTime` | `t_echo` | seconds to milliseconds; scalar or all-equal array only, see below |
 | `TotalReadoutTime` | `t_line` | `t_line = TotalReadoutTime * 1000 / ny`, the inverse of `trxscan.rs:968` |
 | `ParallelReductionFactorInPlane` | `accel` | direct; `acs_lines` comes from the overlay |
 | `PhaseEncodingDirection` | `reverse_phase` | `j-` is `false`, `j` is `true`, in the native (unreoriented) frame |
@@ -628,6 +710,14 @@ scan is `j-` in the grid's own frame and becomes `j` only after reorientation to
 (`orient.rs:244-249`). Getting this wrong flips the distortion direction of every output, and
 nothing else in P1 would notice, so a test distorts an off-centre point with a known fieldmap sign
 and asserts which way it moves for each label.
+
+`EchoTime` needs its own rule, because `Acquisition` holds one scalar `t_echo` for the whole call
+(`kspace.rs:149`) and the series is now one call. BIDS permits an array, and simasl carries a
+per-volume echo-time list (`user_parameter_input.py:243`, `examples.py:199`). P1 accepts a scalar,
+or an array whose entries are all equal, which it collapses to that value after checking every
+entry. An array with unequal entries is rejected with an error naming P6, which is where multi-TE
+ASL lives. Making `t_echo` per-volume is the alternative and is a larger interface change than P0
+should carry.
 
 The `ny` in the `t_line` rule is the acquired matrix size along the phase-encode axis, matching
 `grid.dims[1]` at `trxscan.rs:968`. It is `ny`, not `ny - 1`. The distinction changes every
@@ -689,6 +779,22 @@ averaging: each simulation voxel is the volume-weighted mean of the phantom voxe
 with exact fractional weights at the boundaries. In-plane that is a partial-volume average;
 through-plane it is an ideal rectangular slice profile over `slice thickness / phantom dz`
 phantom slices.
+
+**Class decomposition happens before resampling, never after.** In `class` mode, `kinetic` and
+`mrsignal` run per phantom voxel as usual, and the result is split into one magnetization image
+per foreground label on the phantom grid, each zero outside its label. Each of those images is
+then box-averaged to the simulation grid independently. A boundary simulation voxel therefore
+holds a fractional contribution in each of the labels it straddles, every one of which still
+carries its own label's uniform T1, T2, and T2'. Nothing is averaged that is not magnetization.
+
+Averaging the T2 map first and then splitting would defeat the whole decomposition: a boundary
+voxel would acquire an intermediate T2 belonging to no tissue, the constancy test would fail on
+the resampled grid, and the run would silently fall back to `voxel` mode. The order is not an
+implementation detail.
+
+In `voxel` mode there is one tissue image, box-averaged the same way, and the relaxation maps are
+resampled as **rates**, magnetization-weighted. That is an approximation and is labeled as one
+below.
 
 This order matters. Magnetization is what physically adds within a voxel, so averaging it gives
 the correct partial-volume signal. Averaging perfusion, transit time, or T1 first and then
@@ -811,8 +917,13 @@ The output of `kinetic` is labeled blood magnetization. It is carried as its own
 rather than folded into tissue M0.
 
 ```
-compartments[0] = static tissue   T2 = T2map,      T2' = from T2starmap and T2map
-compartments[1] = labeled blood   T2 = T2_blood,   T2' = same map as tissue
+class mode, K foreground labels:
+  compartments[0..K)  static tissue, one per label   T2, T2' uniform per label
+  compartments[K]     labeled blood                  T2 = T2_blood, T2' uniform
+
+voxel mode (K = 1):
+  compartments[0]     static tissue                  T2 = T2map, T2' = derived map
+  compartments[1]     labeled blood                  T2 = T2_blood, T2' = tissue map
 ```
 
 simasl instead adds `delta_m` to `M0` as `mag_enc` before relaxation
