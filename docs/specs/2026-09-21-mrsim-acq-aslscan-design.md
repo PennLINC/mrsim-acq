@@ -38,9 +38,9 @@ Seven sub-projects. This spec covers P0 and P1.
 | P0 | `mrsim-acq` extraction | — |
 | P1 | `aslscan` core: BIDS in, GKM, k-space, BIDS out | P0 |
 | P2 | `--compat-asldro` and the voxelwise benchmark | P1 |
-| P3 | ASL motion: spin and saturation history, motion during labeling | P1 |
+| P3 | ASL motion, background suppression, inversion-recovery contrast | P1 |
 | P4 | Kinetic model extensions: macrovascular compartment, physiological noise | P1 |
-| P5 | 3D readouts: GRASE, stack-of-spirals | P0 |
+| P5 | 3D readouts: GRASE, stack-of-spirals, gradient-echo contrast | P0 |
 | P6 | Encoding variety: Hadamard, Look-Locker, velocity-selective, multi-TE | P1 |
 
 P0 and P1 are specced together so that the extracted interface answers to a real second consumer
@@ -108,26 +108,36 @@ stage changes.
 `kspace.rs:1479`. Each compartment decays at its own T2 across the readout. TRXScan supplies one
 scalar per compartment. ASLDRO's phantom has per-voxel T2 maps.
 
+Two types, not one. A single enum used at both levels leaves the z stride undefined and the
+slicing responsibility unstated, so the dimensionality is carried in the type.
+
 ```rust
-pub enum T2Source<'a> {
+/// Per-compartment T2 for ONE slice. Goes in `SliceInput`.
+pub enum T2Slice<'a> {
     Uniform(f32),
-    /// One slice of the simulation grid, layout `x + snx*y`. Same convention as
-    /// `SliceInput::fmap`.
+    /// `snx * sny`, layout `x + snx*y`. Same convention as `SliceInput::fmap`.
+    Map(&'a [f32]),
+}
+
+/// Per-compartment T2 for the WHOLE volume. Goes to the entry point.
+pub enum T2Volume<'a> {
+    Uniform(f32),
+    /// `snx * sny * nz`, layout `x + snx*(y + sny*z)`.
     Map(&'a [f32]),
 }
 
 pub struct SliceInput<'a> {
-    pub t2: &'a [T2Source<'a>],   // one entry per compartment
+    pub t2: &'a [T2Slice<'a>],   // one entry per compartment
     ...
 }
 ```
 
-Dimensionality is split the way `fmap` already splits it. `SliceInput` takes a 2D slice. The
-entry point takes the full 3D map per compartment and cuts the z slice itself, in the same loop
-that copies compartment and fieldmap slices at `kspace.rs:1223`. Without that split the caller
-would have to slice per compartment per z, which is the loop the entry point exists to own.
+The entry point takes `&[T2Volume]` and cuts each z slice into a `T2Slice` itself, in the same
+loop that copies compartment and fieldmap slices at `kspace.rs:1223`. `Uniform` passes through
+unchanged. Without the split the caller would slice per compartment per z, which is the loop the
+entry point exists to own.
 
-TRXScan's call sites wrap their existing scalars in `T2Source::Uniform`. The decay expression at
+TRXScan's call sites wrap their existing scalars in `T2Volume::Uniform`. The decay expression at
 `kspace.rs:649` gains a match on the source rather than an unconditional index.
 
 ### 2. Diffusion gradients become a generic eddy drive
@@ -170,12 +180,23 @@ that breaks on the first non-normalized scheme file.
 
 ```rust
 pub struct SliceInput<'a> {
-    /// Per-volume preparation-gradient drive for the phase model: `(magnitude, unit direction)`.
-    /// Diffusion passes `(bval, bvec_unit)`. `None` disables the prep phase term.
+    /// Per-volume preparation-gradient drive for the phase model: `(magnitude, direction)`.
+    /// The direction is NOT required to be normalized. Diffusion passes `(bval, bvec)` exactly
+    /// as it reads them. `None` disables the prep phase term for this volume.
     pub prep_drive: Option<(f64, [f64; 3])>,
     ...
 }
 ```
+
+`PrepPhase::shot` keeps the normalization and both early returns that `DiffusionPhase::shot` has
+today: the `n < 1e-12` degenerate-direction guard and the non-positive-magnitude return
+(`phase.rs:110-118`). The caller does not pre-normalize. That matters for more than tidiness: the
+division by `n` happens inside the same expression it does now, so the floating-point operation
+order is unchanged and P0's bit-identical criterion survives. Pre-normalizing at the call site
+would be mathematically equivalent and would still move output bits.
+
+A positive magnitude paired with a zero direction is therefore handled where it is handled today,
+by the `n < 1e-12` guard, and yields a zero phase rather than an error.
 
 `eddy_drive` and `prep_drive` stay separate because they are separate physics. Eddy currents
 follow the gradient moment. Motion-induced phase follows the q-vector.
@@ -188,7 +209,7 @@ pub fn simulate_acquisition_oversampled(
     acq_dims: [usize; 3],
     n_volumes: usize,
     images: &[Vec<f32>],
-    t2: &[T2Source],
+    t2: &[T2Volume],
     fmap: &[f32],
     t_inhom: Option<&[f32]>,
     acq: &Acquisition,
@@ -196,14 +217,19 @@ pub fn simulate_acquisition_oversampled(
     prep_drive: Option<&[(f64, [f64; 3])]>, // one per volume
     phase: &PhaseModel,
     seed: u64,
+    // Per-voxel noise SD on the acquired grid. Length `nvox` applies one map to every volume,
+    // which is the current behavior; length `nvox * n_volumes` gives each volume its own. ASL
+    // needs the latter, because an M0 volume and a label volume differ in signal level by two
+    // orders of magnitude.
     noise_sigma: Option<&[f32]>,
     eddy_trace: Option<&[[f64; 3]]>,
 ) -> (Vec<f32>, Vec<f32>)
 ```
 
 `ngrad` becomes `n_volumes`, the `bvals`/`bvecs` pair becomes the single optional `eddy_drive`
-slice, `prep_drive` carries the phase drive from change 4, and `t_inhom` carries the per-voxel
-map from change 6. `simulate_acquisition_legacy` gets
+slice, `prep_drive` carries the phase drive from change 4, and `t_inhom` carries the per-voxel map
+from change 6. `noise_sigma` gains a per-volume length option: `kspace.rs:1204` indexes it as
+`ns[vox]` only, so today one map serves the whole series. `simulate_acquisition_legacy` gets
 the same treatment.
 
 ### 6. T2\* inhomogeneity becomes a scalar or a map
@@ -216,7 +242,7 @@ would discard susceptibility dropout, which is one of the artifacts ASL most nee
 ```rust
 pub struct SliceInput<'a> {
     /// Per-voxel T2' inhomogeneity time (ms) on the simulation grid, overriding
-    /// `Acquisition::t_inhom` where present.
+    /// `Acquisition::t_inhom` where present. `f32::INFINITY` means no inhomogeneity decay.
     pub t_inhom: Option<&'a [f32]>,
     ...
 }
@@ -227,10 +253,18 @@ current behavior. aslscan derives the map from the phantom as `1/T2' = 1/T2star 
 voxel, floored at zero where the maps disagree.
 
 A floored rate of zero means no inhomogeneity decay, and it must not be stored as `T2' = 0`. The
-decay term at `kspace.rs:649` divides by `t_inhom`, so a stored zero yields a division by zero
-and a NaN at every line. The map therefore stores the **rate** `1/T2'` in inverse milliseconds,
-not the time, and `kspace.rs:649` multiplies where it currently divides. `Acquisition::t_inhom`
-keeps its units and is converted to a rate at the call site.
+decay term at `kspace.rs:649` divides by `t_inhom`, so a stored zero yields a division by zero and
+a NaN at every line.
+
+The map therefore stores the **time** in milliseconds, as `Acquisition::t_inhom` already does, and
+represents a zero rate as `f32::INFINITY`. Dividing by infinity gives zero, which is exactly the
+no-decay result, with no branch and no NaN.
+
+Storing the reciprocal instead would be the obvious alternative and it is the wrong one. It would
+turn `t.abs() * 1000.0 / t_inhom` into `t.abs() * 1000.0 * rate`, and IEEE rounding makes
+`x / t` and `x * (1/t)` different in the last bit. That difference propagates through `exp` and
+can move an output `f32`, which would break P0 acceptance criterion 3. Keeping the division keeps
+TRXScan's arithmetic character for character when `t_inhom` is `None`.
 
 ### 7. Multiband dropout stops being b-value-scaled
 
@@ -340,9 +374,15 @@ efficiency 0.85 for PCASL and 0.98 for PASL, lambda 0.9 ml/g, and arterial blood
 strength, 1.65 s at 3 T and 1.35 s at 1.5 T. The sidecar's `LabelingEfficiency` wins when present.
 
 The same applies to the signal equation. BIDS has no field selecting gradient echo, spin echo, or
-inversion recovery, and none for excitation flip angle, inversion time, or inversion flip angle,
-all of which `mri_signal_filter.py:190` and `mri_signal_filter.py:252` require. Those also come
-from the overlay. See the signal model section for the P1 restriction on contrast.
+inversion recovery, so the overlay carries `acq_contrast`, defaulting to `"se"`, which is also
+simasl's default. P1 accepts that value and rejects the other two, for the reasons in the signal
+model section.
+
+Excitation flip angle, inversion time, and inversion flip angle are deliberately **not** in the
+P1 overlay. simasl needs them only for the gradient-echo and inversion-recovery branches
+(`mri_signal_filter.py:190`, `mri_signal_filter.py:252`); its spin-echo branch assumes a 90
+degree excitation and consumes none of them (`mri_signal_filter.py:235-248`). They arrive with the
+contrasts that use them, in P3 and P5.
 
 Parameters the acquisition stage needs that BIDS does not express come from the same optional TOML
 overlay: `ghost_offset`, `n_spikes`, `spike_amplitude`, `n_coils`, `t_inhom`, `window`,
@@ -506,8 +546,14 @@ A gradient-echo readout refocuses neither. It needs monotonic `T2*` decay from e
 unrefocused `2*pi*fmap*TE` phase term, which is a change to the acquisition physics rather than to
 an interface. P1 therefore accepts `se` only, which is also simasl's default
 (`user_parameter_input.py` sets `acq_contrast` to `"se"`). A protocol requesting `ge` or `ir` is
-rejected with an error naming this restriction. Gradient echo and inversion recovery move to P5,
-alongside the other readout work, because they share the same echo-formation model.
+rejected with an error naming this restriction.
+
+The two are deferred for different reasons, and it is worth not conflating them. Gradient echo
+goes to P5 because it needs a different echo-formation model, which is the same work the 3D
+readouts need. Inversion recovery does not: simasl's IR branch applies `exp(-TE/T2)`, the same
+transverse factor as its spin echo (`mri_signal_filter.py:283`), and differs only in longitudinal
+preparation. IR goes to P3 instead, alongside background suppression, because both are inversion
+preparation applied before an otherwise unchanged readout.
 
 Background suppression is out of scope for P1 and arrives with P3.
 
@@ -549,14 +595,18 @@ overlay values and the random seed.
 
 The moved tests must pass unchanged. Output identity on a fixed seed is the gate, as stated in
 the P0 acceptance criteria. The `eddy_drive` generalization gets the two targeted tests listed
-there, because it is the only change that could alter numbers.
+there. It is not the only change that could alter numbers, which is why criterion 3 is a
+whole-output comparison rather than a spot check: the T2' sentinel (change 6) and the prep-drive
+split (change 4) both touch arithmetic that runs on every line, and both are specified to keep
+the existing operation order for exactly that reason.
 
 ## P1
 
 New code, written test-first.
 
 - **kinetic** — hand-computed closed forms at the boundaries: `PLD < ATT`, `PLD > ATT + tau`,
-  `tau` approaching zero, `f = 0`, and `t == dt` in the PASL arriving branch. Then checked-in
+  `tau` approaching zero, `f = 0`, and `t == dt`, which falls in the not-arrived state and must
+  return zero by masking rather than through the PASL quotient guard. Then checked-in
   fixtures generated from simasl's `GkmFilter` on a small array, diffed at 1e-9 relative.
   That threshold holds only if the oracle runs in f64, and it does not by default: simasl
   preserves the NIfTI storage dtype rather than promoting through `get_fdata`, so a float32
@@ -566,7 +616,11 @@ New code, written test-first.
   This follows the pattern of `TRXScan/tests/fixtures/force_moments.txt` and
   `TRXScan/tools/gen_force_fixtures.py`.
 - **mrsignal** — the spin-echo closed form, plus fixtures from simasl's `MriSignalFilter` with
-  its transverse factor divided out, per the division of labor above. A test asserts that a
+  its transverse factor divided out, per the division of labor above. The generator asserts that
+  `exp(-TE/T2)` is finite and non-zero for every fixture voxel before dividing; a small enough
+  positive T2 underflows the exponential to zero and makes the division undefined. Exact
+  `T2 == 0` is not the failure case, because simasl's guard yields `exp(0) = 1` there
+  (`mri_signal_filter.py:170-173`). A test asserts that a
   protocol requesting `ge` or `ir` is rejected rather than silently simulated.
 - **protocol** — parse tests over real BIDS ASL sidecars. Cases: scalar `PostLabelingDelay`,
   array `PostLabelingDelay`, an array whose length disagrees with `aslcontext.tsv`, `PASL`
@@ -594,9 +648,10 @@ creates Gibbs ringing (`kspace.rs:911`), so it is not image-space resampling. `s
 multiplies every compartment and defaults to 100 (`kspace.rs:211`). Above all the written image is
 magnitude (`kspace.rs:1278`), and `|T| - |T - B|` is not `|B|`.
 
-The property that is true is **linearity in the blood compartment**. The forward model is linear
-in the compartment images all the way to the magnitude/phase split, so three runs that differ only
-in their compartment inputs satisfy an exact identity.
+The property that is true is **linearity in the blood compartment**. Under the settings listed
+below, the forward model is linear in the compartment images up to the magnitude/phase split, so
+three runs that differ only in their compartment inputs satisfy the identity below in exact
+arithmetic, and satisfy it to the stated tolerance in `f32`.
 
 ```
 run C:  tissue = S_tissue,  blood = 0           ->  complex image  I_C
@@ -607,14 +662,38 @@ assert:  I_C - I_L == I_B
 ```
 
 The complex images are reconstructed from the written `part-mag` and `part-phase` files, so the
-assertion runs on the output, not on an internal buffer. Every acquisition effect cancels because
-all three runs share it, which is why this holds with partial Fourier, windowing, ghosting, and
-the default `signal_scale` all left on. The only settings the test fixes are those that break
-linearity or determinism: `noise_variance = 0`, `noise_sigma = None`, no motion, and a fixed seed.
+assertion runs on the output, not on an internal buffer.
+
+Most acquisition effects cancel because all three runs share them. Per-compartment relaxation and
+the coherent sum (`kspace.rs:647`, `kspace.rs:695`), Fourier encoding, partial Fourier, the
+reconstruction window, ghosting, fixed distortion, and `signal_scale` are all linear in the
+compartment images and may stay enabled. So may multiple coils: the Roemer denominator is built
+from `coil_sensitivity` alone (`kspace.rs:967-977`), so it does not depend on the data.
+
+Two effects are not linear and must be disabled.
+
+**GRAPPA.** The weights are calibrated from each run's own ACS lines. `AᴴA` and `Aᴴb` accumulate
+from the current k-space (`kspace.rs:1126-1142`) and are solved per run (`kspace.rs:1149`), so
+runs C, L, and B apply three different operators. The fixed `1e-4` Tikhonov term (`kspace.rs:1147`)
+means even a pure amplitude change moves the weights. The test requires `accel = 1`.
+
+**Spikes.** A spike is not additive. The code finds the peak sample of the current run, scales it,
+and overwrites the chosen k-space locations with that value (`kspace.rs:729-745`). A fixed seed
+fixes which locations are hit, not what value lands there, and an overwrite destroys the
+contribution it replaces. The test requires `n_spikes = 0`.
+
+Required settings: `noise_variance = 0`, `noise_sigma = None`, `accel = 1`, `n_spikes = 0`, no
+motion, a fixed seed, and identical acquisition parameters across the three runs.
 
 Tolerance is `|I_C - I_L - I_B| <= atol + rtol * |I_B|` with `rtol = 1e-5` and `atol = 1e-6 *
 max|I_B|`. The absolute floor is required because a pure relative bound is undefined wherever
 `delta_m` is zero, which is every not-arrived voxel (`gkm_filter.py:163`).
+
+The identity is not bit-exact and the tolerance is not slack. Run L sums tissue and blood before
+the `f32` rounding at `kspace.rs:1278`, while C and B round separately, so floating-point
+non-distributivity alone breaks equality. The magnitude/phase round trip adds to that: the writer
+stores `sqrt(re^2+im^2)` and `atan2(im, re)` as `f32` (`kspace.rs:1278-1279`, `io.rs:353`), and
+recovering `mag * exp(i*phase)` through `sin` and `cos` is not an exact inverse.
 
 This still catches what the property was for. A sign error in the label mapping flips `I_C - I_L`
 and fails. A control-label swap fails. A blood compartment wired to the wrong index fails. What it
@@ -631,15 +710,17 @@ TRXScan has no CI, and this spec does not add any. The `trxscan` output-identity
 
 These are settled as roadmap direction and specified in their own sub-projects, not here.
 
-- Background suppression, spin and saturation history, and motion during the labeling period: P3.
+- Background suppression, inversion-recovery contrast, spin and saturation history, and motion
+  during the labeling period: P3. Background suppression and IR share the inversion machinery.
 - Macrovascular compartment, vascular crushing, and physiological noise: P4.
-- 3D GRASE and stack-of-spirals readouts, which need a trajectory abstraction in `mrsim-acq`: P5.
+- 3D GRASE and stack-of-spirals readouts, and gradient-echo contrast, all of which need a
+  different echo-formation model in `mrsim-acq`: P5.
 - Hadamard time-encoding, Look-Locker, velocity-selective labeling, and multi-TE: P6.
 - The `--compat-asldro` path and the voxelwise benchmark: P2. It requires porting numpy's
   MT19937 and its legacy Gaussian polar method to Rust, or running the diff with noise disabled
   on both sides and comparing noise statistically. Note that simasl is configured by `desired_snr`
   while `mrsim-acq` takes `noise_variance` (`kspace.rs:154`), so P2 also has to define the
-  conversion between them and which one wins. P2 chooses between those.
+  conversion between them and which one wins.
 
 # Risks
 
