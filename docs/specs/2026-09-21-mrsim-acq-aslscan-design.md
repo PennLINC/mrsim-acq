@@ -187,13 +187,50 @@ and the rule is:
   at `kspace.rs:540` gains this condition alongside `!do_eddy`.
 
 The cost is one `exp` per mapped compartment per sim voxel per acquired line, the same order as
-the rotor multiply already in that loop, plus the loss of the NUFFT speed-up (about 5x in
-TRXScan's production timing). aslscan therefore always runs the slower path in P1. That is
-accepted rather than engineered around. The exact alternative that keeps an FFT is a
-time-segmented NUFFT, which approximates `exp(-t*rho(r))` by interpolating between a few static
-weightings; it is a contained later optimisation and is listed under deferred decisions. Binning
-T2 into pseudo-compartments was considered and rejected, because bin boundaries put artificial
-edges into the image, and this simulator's whole point is what k-space does to edges.
+the rotor multiply already in that loop, plus the loss of the NUFFT speed-up. The size of that
+speed-up is not recorded anywhere in TRXScan, and no one has measured it; the NUFFT accelerates
+the y-stage of the sum only (`kspace.rs:536`), not the whole forward model, so it should be
+measured before it is traded away.
+
+**aslscan does not have to take the slow path, and by default it does not.** Both T2
+representations are supported, and which one a run uses is a property of the phantom.
+
+The ASLDRO phantom assigns one tissue type per voxel, and T2 is a property of that type. Its
+`T2map.nii.gz` is therefore not a smooth field; it is a handful of scalars painted onto `dseg`.
+Decomposing that tissue compartment into one compartment per segmentation label gives every
+compartment a `Uniform` T2, restores the factoring, and approximates nothing, because the only
+edges introduced are the ones the segmentation already has.
+
+This is not the binning that was rejected. Binning a genuinely smooth map into quantiles puts bin
+boundaries where the anatomy has none, and in a simulator whose subject is what k-space does to
+edges that is a real artifact. Splitting a piecewise-constant map along its own discontinuities
+adds nothing that was not there.
+
+`phantom` therefore takes `--t2-mode`, defaulting to `auto`:
+
+| Mode | Behavior |
+|---|---|
+| `auto` | Test whether T2, T2\*, and T1 are constant within every `dseg` label. If so, decompose tissue into one compartment per label with `Uniform` values. Otherwise use a single tissue compartment with `Map`. |
+| `class` | Force the decomposition. Error, naming the first offending label and voxel, if the maps are not constant within a label. |
+| `voxel` | Force the single-compartment `Map` form, whatever the phantom looks like. |
+
+`auto` on the converted ASLDRO phantom yields `class`, so the ordinary ASL run keeps the NUFFT
+path and the extra compartments cost only the per-compartment work the stage already does. A
+future run with a fitted T2 map from a scanner falls to `voxel` on its own, and pays the rotor
+cost then, which is the case the cost actually belongs to.
+
+The mode chosen is recorded in the output sidecar, because it changes the compartment count and
+therefore the meaning of a per-compartment debug dump.
+
+**The two representations are cross-checked, not trusted.** An acceptance test runs the same
+piecewise-constant phantom twice, once as `class` and once as `voxel`, and asserts the written
+output agrees to `1e-5` relative. They are the same physics by construction, so any disagreement
+is a bug in the mapped path or in the decomposition, and this is the only test that would find it.
+It also measures both, which is where the missing speed-up number comes from.
+
+The exact alternative that keeps an FFT under a genuinely smooth map is a time-segmented NUFFT,
+which approximates `exp(-t*rho(r))` by interpolating between a few static weightings. It is a
+contained later optimisation and is listed under deferred decisions.
 
 The test oracle `reference_coil_kspace` (`kspace.rs:1479`) gets the same per-voxel lookup. Two new
 tests pin the map path: a `Map` filled with one constant reproduces `Uniform` of that constant to
@@ -1058,6 +1095,9 @@ These are settled as roadmap direction and specified in their own sub-projects, 
   different echo-formation model in `mrsim-acq`: P5.
 - Hadamard time-encoding, Look-Locker, velocity-selective labeling, and multi-TE: P6.
 - A time-segmented NUFFT that keeps the O(N log N) forward path under per-voxel T2 and T2' maps.
+- Per-compartment NUFFT eligibility, so a `Uniform` compartment keeps the fast path alongside a
+  `Map` one. The data structures at `kspace.rs:554-561` are already per compartment; only the gate
+  at `kspace.rs:680` is not.
   Unscheduled; taken up only if P1's measured run time demands it.
 - Phase encoding along a data axis other than the second, by permuting through `orient`.
   Unscheduled; taken up when a target dataset needs it.
@@ -1085,9 +1125,18 @@ defaults in the protocol contract, and every default that was applied is recorde
 sidecar so it is never silent. Parameters with no defensible default, namely the PASL bolus
 duration and the separate M0 scan's repetition time, are an error that names the field.
 
-**aslscan cannot use the fast forward path.** Per-voxel T2 and T2' maps take every slice off the
-NUFFT path (P0 change 1), so aslscan runs at roughly the speed of TRXScan's std-only build
-whatever features are enabled. ASL matrices are typically much smaller than diffusion ones, and
-the rotor path is cubic in the linear matrix dimension, so this is expected to be tolerable; it
-is measured on the first end-to-end run rather than assumed. If it is not tolerable, the remedy is
-the time-segmented NUFFT under deferred decisions, not a T2 approximation in aslscan.
+**aslscan loses the fast forward path only under a voxelwise T2 map.** In `class` mode, which is
+what `auto` selects for the ASLDRO phantom, every compartment carries a `Uniform` T2 and the NUFFT
+path is eligible exactly as it is for TRXScan. In `voxel` mode every slice takes the rotor path.
+ASL matrices are typically much smaller than diffusion ones and the rotor path is cubic in the
+linear matrix dimension, so the voxelwise case is expected to be tolerable; the cross-check test
+measures both rather than assuming either. If it is not tolerable, the remedy is the
+time-segmented NUFFT under deferred decisions, not a T2 approximation in aslscan.
+
+Two things narrow this further. `do_eddy` already disables the NUFFT gate on its own
+(`kspace.rs:540`), so P4's vascular crushing gives up the fast path regardless of T2 mode. And the
+NUFFT y-sum is already computed per compartment — `rows[c]`, with weight buffers sized
+`2 * ncomp` (`kspace.rs:554-561`) — so only the *decision* at `kspace.rs:680` is all-or-nothing.
+Making it per-compartment, so a `Uniform` blood compartment keeps the fast path beside a `Map`
+tissue compartment, is a contained change. It is deferred rather than specified here, because P0
+is a refactor and this would be the one place it changed behavior.
