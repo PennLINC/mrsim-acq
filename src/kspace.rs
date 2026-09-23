@@ -1303,7 +1303,7 @@ fn grappa_reconstruct(coil: &mut [Vec<C>], nx: usize, ny: usize, ys: usize, acce
 }
 
 /// Run the k-space acquisition over a whole 4D clean-signal volume: every (volume, slice) through
-/// [`simulate_slice`]. `clean` is the clean signal in `(x+nx*(y+ny*z))*ngrad + g` layout; `fmap`
+/// [`simulate_slice`]. `clean` is the clean signal in `(x+nx*(y+ny*z))*n_volumes + g` layout; `fmap`
 /// is the off-resonance field (Hz) on the same grid. v1 treats the mixed signal as one compartment
 /// with an effective T2 (`t2_eff`, ms) — per-tissue T2 for realistic b0 contrast is a refinement.
 /// Returns `(magnitude, phase)` 4D arrays (phase in radians, atan2), same layout — the complex pair
@@ -1315,11 +1315,19 @@ fn grappa_reconstruct(coil: &mut [Vec<C>], nx: usize, ny: usize, ys: usize, acce
 /// on `acq_dims = [nx, ny, nz]`. `o` is derived and must divide both in-plane axes.
 ///
 /// This is the path that makes ringing intrinsic. [`simulate_acquisition_legacy`] does not.
+///
+/// **Simulate a whole series in ONE call.** Every random stream here is keyed on the volume
+/// index `g` *within this call*: `slice_seed` (k-space noise and spikes), the image-space noise
+/// stream, and the per-shot phase realization. Calling this once per volume gives every volume
+/// the same `g = 0` and the same noise, which for ASL would make control minus label cancel the
+/// noise exactly and produce impossibly clean perfusion maps. A caller that must make more than
+/// one call — an ASL series plus a separate M0 scan, say — passes a different `seed` to each,
+/// because `seed` is the only thing distinguishing them.
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_acquisition_oversampled(
     sim_dims: [usize; 3],
     acq_dims: [usize; 3],
-    ngrad: usize,
+    n_volumes: usize,
     images: &[Vec<f32>],
     // Per-compartment T2 (ms), scalar or a map on the simulation grid.
     t2: &[T2Volume],
@@ -1353,7 +1361,7 @@ pub fn simulate_acquisition_oversampled(
     let (nvox_sim, nvox_acq) = (snx * sny * nz, nx * ny * nz);
     let ncomp = images.len();
     for im in images {
-        assert_eq!(im.len(), nvox_sim * ngrad, "compartment image is not on the simulation grid");
+        assert_eq!(im.len(), nvox_sim * n_volumes, "compartment image is not on the simulation grid");
     }
     assert_eq!(fmap.len(), nvox_sim, "fieldmap is not on the simulation grid");
     assert_eq!(t2.len(), ncomp, "t2 has {} entries for {ncomp} compartments", t2.len());
@@ -1363,10 +1371,14 @@ pub fn simulate_acquisition_oversampled(
         validate_t2_volumes("T2'", ti, nvox_sim);
     }
     validate_acquisition_timing(acq, nx, ny).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(eddy_drive.len(), ngrad,
-               "eddy_drive has {} entries for {} volumes", eddy_drive.len(), ngrad);
-    assert_eq!(prep_drive.len(), ngrad,
-               "prep_drive has {} entries for {} volumes", prep_drive.len(), ngrad);
+    assert_eq!(eddy_drive.len(), n_volumes,
+               "eddy_drive has {} entries for {} volumes", eddy_drive.len(), n_volumes);
+    assert_eq!(prep_drive.len(), n_volumes,
+               "prep_drive has {} entries for {} volumes", prep_drive.len(), n_volumes);
+    if let Some(tr) = eddy_trace {
+        assert_eq!(tr.len(), n_volumes,
+                   "eddy_trace has {} entries for {} volumes", tr.len(), n_volumes);
+    }
 
     let per_vol = |g: usize| -> (Vec<f32>, Vec<f32>) {
         let (mut mag, mut ph) = (vec![0.0f32; nvox_acq], vec![0.0f32; nvox_acq]);
@@ -1377,7 +1389,7 @@ pub fn simulate_acquisition_oversampled(
                 for x in 0..snx {
                     let vox = x + snx * (y + sny * z);
                     for (c, img) in images.iter().enumerate() {
-                        cslices[c][x + snx * y] = img[vox * ngrad + g];
+                        cslices[c][x + snx * y] = img[vox * n_volumes + g];
                     }
                     fslice[x + snx * y] = fmap[vox];
                 }
@@ -1440,16 +1452,16 @@ pub fn simulate_acquisition_oversampled(
     #[cfg(feature = "par")]
     let vols: Vec<(Vec<f32>, Vec<f32>)> = {
         use rayon::prelude::*;
-        (0..ngrad).into_par_iter().map(per_vol).collect()
+        (0..n_volumes).into_par_iter().map(per_vol).collect()
     };
     #[cfg(not(feature = "par"))]
-    let vols: Vec<(Vec<f32>, Vec<f32>)> = (0..ngrad).map(per_vol).collect();
+    let vols: Vec<(Vec<f32>, Vec<f32>)> = (0..n_volumes).map(per_vol).collect();
 
-    let (mut magd, mut phased) = (vec![0.0f32; nvox_acq * ngrad], vec![0.0f32; nvox_acq * ngrad]);
+    let (mut magd, mut phased) = (vec![0.0f32; nvox_acq * n_volumes], vec![0.0f32; nvox_acq * n_volumes]);
     for (g, (m, p)) in vols.iter().enumerate() {
         for vox in 0..nvox_acq {
-            magd[vox * ngrad + g] = m[vox];
-            phased[vox * ngrad + g] = p[vox];
+            magd[vox * n_volumes + g] = m[vox];
+            phased[vox * n_volumes + g] = p[vox];
         }
     }
     (magd, phased)
@@ -1466,7 +1478,7 @@ pub fn simulate_acquisition_oversampled(
 /// and a genuinely complex object.
 pub fn simulate_acquisition_legacy(
     dims: [usize; 3],
-    ngrad: usize,
+    n_volumes: usize,
     images: &[Vec<f32>],
     t2: &[T2Volume],
     fmap: &[f32],
@@ -1506,7 +1518,7 @@ pub fn simulate_acquisition_legacy(
                 for x in 0..nx {
                     let vox = x + nx * (y + ny * z);
                     for (c, img) in images.iter().enumerate() {
-                        cslices[c][x + nx * y] = img[vox * ngrad + g];
+                        cslices[c][x + nx * y] = img[vox * n_volumes + g];
                     }
                     fslice[x + nx * y] = fmap[vox];
                 }
@@ -1548,16 +1560,16 @@ pub fn simulate_acquisition_legacy(
     #[cfg(feature = "par")]
     let vols: Vec<(Vec<f32>, Vec<f32>)> = {
         use rayon::prelude::*;
-        (0..ngrad).into_par_iter().map(per_vol).collect()
+        (0..n_volumes).into_par_iter().map(per_vol).collect()
     };
     #[cfg(not(feature = "par"))]
-    let vols: Vec<(Vec<f32>, Vec<f32>)> = (0..ngrad).map(per_vol).collect();
+    let vols: Vec<(Vec<f32>, Vec<f32>)> = (0..n_volumes).map(per_vol).collect();
 
-    let (mut magd, mut phased) = (vec![0.0f32; nvox * ngrad], vec![0.0f32; nvox * ngrad]);
+    let (mut magd, mut phased) = (vec![0.0f32; nvox * n_volumes], vec![0.0f32; nvox * n_volumes]);
     for (g, (m, p)) in vols.iter().enumerate() {
         for vox in 0..nvox {
-            magd[vox * ngrad + g] = m[vox];
-            phased[vox * ngrad + g] = p[vox];
+            magd[vox * n_volumes + g] = m[vox];
+            phased[vox * n_volumes + g] = p[vox];
         }
     }
     (magd, phased)
@@ -2976,5 +2988,44 @@ mod tests {
             assert_eq!(p.0.to_bits(), q.0.to_bits());
             assert_eq!(p.1.to_bits(), q.1.to_bits());
         }
+    }
+
+    #[test]
+    fn per_volume_slice_lengths_are_validated_before_the_loop() {
+        let dims = [4usize, 4, 1];
+        let images = vec![vec![0.0f32; 16 * 2]];
+        let t2 = [T2Volume::Uniform(100.0)];
+        let fmap = vec![0.0f32; 16];
+        let acq = Acquisition::default();
+        let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
+        // The panic MESSAGE is asserted, not the panic: an out-of-bounds `tr[g]` already
+        // panicked before any validation existed, so `is_err()` would prove nothing.
+        fn message(r: std::thread::Result<(Vec<f32>, Vec<f32>)>) -> String {
+            let e = r.expect_err("must panic");
+            e.downcast_ref::<String>().cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        }
+        // Two volumes, but only one drive entry.
+        let r = std::panic::catch_unwind(|| {
+            simulate_acquisition_oversampled(
+                dims, dims, 2, &images, &t2, &fmap, None, &acq,
+                &[None], &[None, None], &phase, 1, None, None)
+        });
+        assert!(message(r).contains("eddy_drive has 1 entries for 2 volumes"));
+
+        let r = std::panic::catch_unwind(|| {
+            simulate_acquisition_oversampled(
+                dims, dims, 2, &images, &t2, &fmap, None, &acq,
+                &[None, None], &[None], &phase, 1, None, None)
+        });
+        assert!(message(r).contains("prep_drive has 1 entries for 2 volumes"));
+
+        let r = std::panic::catch_unwind(|| {
+            simulate_acquisition_oversampled(
+                dims, dims, 2, &images, &t2, &fmap, None, &acq,
+                &[None, None], &[None, None], &phase, 1, None, Some(&[[0.0; 3]]))
+        });
+        assert!(message(r).contains("eddy_trace has 1 entries for 2 volumes"));
     }
 }
