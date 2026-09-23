@@ -1095,12 +1095,17 @@ Background suppression is out of scope for P1 and arrives with P3.
 ## Output contract
 
 ```
-sub-XX[_ses-YY]_part-mag_asl.nii.gz
-sub-XX[_ses-YY]_part-phase_asl.nii.gz
-sub-XX[_ses-YY]_asl.json
+sub-XX[_ses-YY]_part-mag_asl.nii.gz + .json
+sub-XX[_ses-YY]_part-phase_asl.nii.gz + .json
 sub-XX[_ses-YY]_aslcontext.tsv
 sub-XX[_ses-YY]_m0scan.nii.gz + .json     when M0Type is Separate
 ```
+
+Each part carries a complete sidecar (the phase part's with `Units: "rad"`), and there is no
+inheritance-level `sub-XX_asl.json`. An earlier revision listed one; bids-validator 3.0.2 rejects
+it as `SIDECAR_WITHOUT_DATAFILE`, since with `part-` entities no `_asl.nii.gz` exists, and it
+also checks each part's required keys without merging a less specific sidecar in, so a
+`Units`-only phase sidecar fails. Both were found on the first validator run (2026-09-23).
 
 Ground-truth maps resampled to the acquisition grid are written alongside, under a
 `ground-truth/` subdirectory: `delta_m`, `perfusion`, `att`, and the tissue maps. They come from
@@ -1257,8 +1262,14 @@ stores `sqrt(re^2+im^2)` and `atan2(im, re)` as `f32` (`kspace.rs:1278-1279`, `i
 recovering `mag * exp(i*phase)` through `sin` and `cos` is not an exact inverse.
 
 This still catches what the property was for. A sign error in the label mapping flips `I_C - I_L`
-and fails. A control-label swap fails. A blood compartment wired to the wrong index fails. What it
-does not check is whether `delta_m` itself is right, which is what the GKM fixtures are for.
+and fails. A control-label swap fails. A blood compartment wired to the wrong index **in some rows
+but not others** fails, because the mis-wired rows relax at the wrong T2. A mis-wiring applied to
+every row alike does not fail, and it is worth being exact about why: `I_L` and `I_B` then carry
+the same mis-wired term, and the identity is linear in whichever compartment that term sits in. An
+earlier revision claimed the consistent case fails; the first implementation's negative control
+proved it does not (residual 0.11 of the tolerance). Consistent mis-wiring is what the
+`class`/`voxel` cross-check and the ground-truth `delta_m` are for. What the identity does not
+check either is whether `delta_m` itself is right, which is what the GKM fixtures are for.
 
 ## Gates that are not automated
 
