@@ -34,6 +34,10 @@ pub mod readout;
 pub mod noise;
 /// Rigid poses, multiband slice schedules, within-volume dropout.
 pub mod motion;
+/// Per-slice k-space forward model and reconstruction.
+pub mod kspace;
+/// Type-1 NUFFT (feature `kspace`): the fieldmap y-sum of the forward model as one gridded FFT.
+pub mod nufft;
 /// Simulation config (feature `config`). `load` is a `todo!()` stub.
 #[cfg(feature = "config")]
 pub mod config;
