@@ -306,12 +306,38 @@ pub struct DroppedShot {
     pub attenuation: f32,
 }
 
+/// How a dropped shot's signal is attenuated. Diffusion scales with b-value and exempts b0;
+/// a sequence without a diffusion weighting has nothing to scale with.
+#[derive(Debug, Clone)]
+pub enum DropoutLaw {
+    /// `1 - severity * (drive / drive_max)`, with `drive < floor` exempt. Diffusion passes
+    /// b-values and a floor of 50.0, reproducing the previous b0-exempt behavior exactly
+    /// (`drive_max` is the same `fold(0, max)` the scheme's `b_max` was).
+    Scaled { drive: Vec<f64>, floor: f64 },
+    /// `1 - severity`, applied to every volume alike.
+    Uniform,
+}
+
+impl DropoutLaw {
+    /// Multiplier applied to volume `volume`'s dropped shot for an event of `severity`.
+    pub fn attenuation(&self, volume: usize, severity: f32) -> f32 {
+        match self {
+            DropoutLaw::Uniform => 1.0 - severity,
+            DropoutLaw::Scaled { drive, floor } => {
+                let d = drive.get(volume).copied().unwrap_or(0.0);
+                let d_max = drive.iter().cloned().fold(0.0f64, f64::max);
+                if d < *floor || d_max <= 0.0 { 1.0 } else { 1.0 - severity * (d / d_max) as f32 }
+            }
+        }
+    }
+}
+
 /// Apply multiband within-volume motion + slice dropout to the per-compartment signal in place.
 /// For each event: (1) the head jumps for that shot and the ones after it within the volume (a
 /// per-shot 3D resample of the affected slices — the within-volume wobble), and (2) the shot's
-/// slices' diffusion signal is attenuated `1 − severity·(b/b_max)` (b0 exempt; higher b drops
-/// harder) — the phenomenological dropout `eddy --repol` targets. Returns the dropped-shot ground
-/// truth. Runs after volume-level motion, before k-space.
+/// slices' signal is attenuated by `law` (for diffusion, `1 − severity·(b/b_max)`, b0 exempt;
+/// higher b drops harder) — the phenomenological dropout `eddy --repol` targets. Returns the
+/// dropped-shot ground truth. Runs after volume-level motion, before k-space.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_multiband_motion(
     images: &mut [Vec<f32>],
@@ -320,8 +346,7 @@ pub fn apply_multiband_motion(
     v2w: [[f64; 4]; 4],
     mb: usize,
     interleaved: bool,
-    bvals: &[f64],
-    b_max: f64,
+    law: &DropoutLaw,
     events: &[MotionEvent],
 ) -> Vec<DroppedShot> {
     let [nx, ny, nz] = dims;
@@ -369,14 +394,9 @@ pub fn apply_multiband_motion(
                 }
             }
         }
-        // dropout: attenuate each event shot's slices (DWI only, b-scaled)
-        let is_b0 = bvals.get(g).copied().unwrap_or(0.0) < 50.0;
+        // dropout: attenuate each event shot's slices per the law
         for e in &evs {
-            let atten = if is_b0 || b_max <= 0.0 {
-                1.0
-            } else {
-                1.0 - e.severity * (bvals[g] / b_max) as f32
-            };
+            let atten = law.attenuation(g, e.severity);
             for img in images.iter_mut() {
                 for &z in &schedule[e.shot] {
                     for y in 0..ny {
@@ -506,9 +526,9 @@ mod tests {
         let (ngrad, nvox) = (2usize, nx * ny * nz);
         let id = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
         let mut images = vec![vec![1.0f32; nvox * ngrad]]; // one compartment, uniform
-        let bvals = [0.0, 1000.0]; // vol 0 = b0, vol 1 = DWI
+        let law = DropoutLaw::Scaled { drive: vec![0.0, 1000.0], floor: 50.0 }; // vol 0 = b0, vol 1 = DWI
         let ev = MotionEvent { volume: 1, shot: 0, severity: 1.0, jump_mm: [0.0; 3], jump_deg: [0.0; 3] };
-        let gt = apply_multiband_motion(&mut images, dims, ngrad, id, 2, false, &bvals, 1000.0, &[ev]);
+        let gt = apply_multiband_motion(&mut images, dims, ngrad, id, 2, false, &law, &[ev]);
         let at = |x: usize, y: usize, z: usize, g: usize| (x + nx * (y + ny * z)) * ngrad + g;
         // mb=2, nz=4 → shot 0 = slices {0, 2}: both drop in the DWI volume
         assert!(images[0][at(1, 1, 0, 1)] < 0.01, "DWI shot slice should drop");
@@ -517,5 +537,24 @@ mod tests {
         assert!((images[0][at(1, 1, 0, 0)] - 1.0).abs() < 1e-6, "b0 exempt from dropout");
         assert_eq!(gt.len(), 1);
         assert_eq!(gt[0].slices, vec![0, 2]);
+    }
+
+    #[test]
+    fn scaled_law_reproduces_the_b_value_attenuation_and_uniform_does_not() {
+        let law = DropoutLaw::Scaled { drive: vec![5.0, 1000.0, 2000.0], floor: 50.0 };
+        // b0 row (below the floor) is exempt: attenuation 1.0.
+        assert!((law.attenuation(0, 0.5) - 1.0).abs() < 1e-12);
+        // b = 2000 is b_max, so the full severity applies.
+        assert!((law.attenuation(2, 0.5) - 0.5).abs() < 1e-12);
+        // b = 1000 is half of b_max, so half the severity.
+        assert!((law.attenuation(1, 0.5) - 0.75).abs() < 1e-12);
+        // An index past the drive list reads as 0, i.e. exempt (the old `bvals.get(g)` behavior).
+        assert!((law.attenuation(7, 0.5) - 1.0).abs() < 1e-12);
+
+        let u = DropoutLaw::Uniform;
+        for g in 0..3 {
+            assert!((u.attenuation(g, 0.5) - 0.5).abs() < 1e-12,
+                    "Uniform must not vary with the volume index");
+        }
     }
 }
