@@ -1783,7 +1783,18 @@ cd /mnt/c/Users/tsalo/Documents/rust-trx/mrsim-acq && cargo clippy --all-targets
 cd /mnt/c/Users/tsalo/Documents/rust-trx/TRXScan && cargo clippy --all-targets 2>&1 | grep -c "^warning"
 ```
 
-Expected: every test green; `CRITERION 3: PASS`; clippy warning count in TRXScan no higher than the ~6 that pre-existed. Criteria 4, 5 and 6 are the tests added in Tasks 8 and 10 and are covered by the suites above.
+Expected: every test green; `CRITERION 3: PASS`. Criteria 4, 5 and 6 are the tests added in Tasks 8 and 10 and are covered by the suites above.
+
+The clippy comparison is **by warning kind against the same clippy at `57858a5`**, not against the README's "~6". Clippy 1.98 reports 28 lib warnings (59 with tests) at the baseline commit; older clippies reported far fewer, so a raw count against the README is meaningless. Measure the baseline in a sibling worktree, which keeps the path deps resolvable and shares the compiled dependencies:
+
+```bash
+cd /mnt/c/Users/tsalo/Documents/rust-trx/TRXScan
+git worktree add --detach ../TRXScan-base 57858a5
+cd ../TRXScan-base && CARGO_TARGET_DIR=../TRXScan/target cargo clippy --all-targets --features cli,kspace,par 2>&1 | grep -E '^warning' | sort | uniq -c
+cd ../TRXScan && git worktree remove --force ../TRXScan-base
+```
+
+and compare the per-kind counts with the sum over the two crates today. Anything new is from this work: at the end of P0 that was five `useless use of vec!` in new tests, three `doc list item without indentation` from a doc line beginning with `+`, one `map_or` simplification, and `simulate_acquisition_legacy` crossing the argument limit, all fixed before tagging.
 
 - [ ] **Step 6: Commit and tag**
 

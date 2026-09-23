@@ -624,7 +624,7 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
     // therefore the NUFFT path — to survive. One Map anywhere takes the whole slice to the rotor
     // path with per-voxel relaxation; Uniform compartments in a mixed slice keep their scalar.
     let uniform = t2.iter().all(|s| matches!(s, T2Slice::Uniform(_)))
-        && inp.t_inhom.map_or(true, |ti| ti.iter().all(|s| matches!(s, T2Slice::Uniform(_))));
+        && inp.t_inhom.is_none_or(|ti| ti.iter().all(|s| matches!(s, T2Slice::Uniform(_))));
     // Compartment relaxation weights for this line (uniform case only).
     let mut rel = vec![1.0f64; compartments.len()];
     // Separable gradient-model eddy factors.
@@ -1476,6 +1476,7 @@ pub fn simulate_acquisition_oversampled(
 /// Retained only for backward comparison. Production callers must use
 /// [`simulate_acquisition_oversampled`], which is what gives ringing intrinsic to the acquisition
 /// and a genuinely complex object.
+#[allow(clippy::too_many_arguments)]
 pub fn simulate_acquisition_legacy(
     dims: [usize; 3],
     n_volumes: usize,
@@ -2830,7 +2831,7 @@ mod tests {
         const EXPECTED_BITS_FFT: [(u64, u64); 8] = [(0xbf85ec1cb1daa8b8, 0x3fa5ffff06e41c36), (0xbf3ac84a01a68879, 0x3f817f28896f61c4), (0xbf83c1e81433403f, 0xbfb080ac7ad7ff64), (0xbf75484546405882, 0xbf8d9e9dd3358a91), (0x3fb6e06347299108, 0x3fc30724fd363630), (0x3fc9ee837d7455c7, 0x3fcc89859a43e2ba), (0x3fc5f2c7a85a66e4, 0x3fc03bf44552eb91), (0x3f8f6e71db6b4c24, 0x3f7da1ff8d60105a)];
         let expected = if cfg!(feature = "kspace") { EXPECTED_BITS_FFT } else { EXPECTED_BITS_STD };
         let (nx, ny) = (16, 16);
-        let comps = vec![box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
+        let comps = [box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
         let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
         let fmap = vec![0.0f32; nx * ny];
         let acq = Acquisition { eddy_strength: 0.05, ..Default::default() };
@@ -2853,7 +2854,7 @@ mod tests {
         // (bval=5, bvec=[0,0,0]) is Some([0,0,0]) and must keep eddy "on" with a zero gradient,
         // because that is what disables the NUFFT path today.
         let (nx, ny) = (16, 16);
-        let comps = vec![box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
+        let comps = [box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
         let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
         let fmap = vec![3.0f32; nx * ny];
         let acq = Acquisition { eddy_strength: 0.05, ..Default::default() };
@@ -2898,7 +2899,7 @@ mod tests {
     #[test]
     fn constant_map_reproduces_uniform() {
         let (nx, ny) = (16, 16);
-        let comps = vec![box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
+        let comps = [box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
         let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
         let fmap = vec![0.0f32; nx * ny];
         let acq = Acquisition::default();
@@ -2924,7 +2925,7 @@ mod tests {
     #[test]
     fn varying_t2_map_matches_the_literal_sum() {
         let (nx, ny) = (12, 12);
-        let comps = vec![box_hires(nx, ny, 3.0, 9.0, 3.0, 9.0)];
+        let comps = [box_hires(nx, ny, 3.0, 9.0, 3.0, 9.0)];
         let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
         let fmap: Vec<f32> = (0..nx * ny).map(|i| 3.0 * ((i % 5) as f32 - 2.0)).collect();
         let map: Vec<f32> = (0..nx * ny).map(|i| 60.0 + (i % 7) as f32 * 10.0).collect();
@@ -2973,7 +2974,7 @@ mod tests {
     #[test]
     fn uniform_t_inhom_overrides_the_acquisition_scalar() {
         let (nx, ny) = (16, 16);
-        let comps = vec![box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
+        let comps = [box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
         let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
         let fmap = vec![0.0f32; nx * ny];
         let t2 = [T2Slice::Uniform(100.0)];

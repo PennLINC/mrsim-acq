@@ -4,7 +4,8 @@
 //!
 //! - **Volumes in**: `nifti` 0.17 → f32 volume + voxel→world affine (sform, else qform
 //!   quaternion, mirroring `TRXViz/trxviz-core/src/data/nifti_data.rs`).
-//! - **Volumes out**: NIfTI-1 3D / 4D with the acquisition affine.
+//! - **Volumes out**: NIfTI-1 3D / 4D with the acquisition affine, and the complex
+//!   `part-mag`/`part-phase` pair with its BIDS sidecars (`write_complex_4d`).
 
 use crate::grid::Grid;
 
@@ -13,7 +14,7 @@ use ndarray::{Array4, Ix3};
 use nifti::writer::WriterOptions;
 use nifti::{IntoNdArray, NiftiHeader, NiftiObject, ReaderOptions, XForm};
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 type R<T> = Result<T, Box<dyn Error>>;
 
@@ -146,6 +147,67 @@ pub fn write_3d_i16(path: &Path, dims: [usize; 3], data: &[i16], grid: &Grid) ->
         ndarray::Array3::from_shape_fn((nx, ny, nz), |(x, y, z)| data[x + nx * (y + ny * z)]);
     let hdr = header_for_grid(grid.voxel_to_world);
     WriterOptions::new(path).reference_header(&hdr).write_nifti(&arr)?;
+    Ok(())
+}
+
+/// Acquisition facts the BIDS JSON sidecars record. A plain struct (not
+/// `kspace::Acquisition`) so `io` stays usable without the `kspace` feature. Every field is
+/// modality-independent; anything diffusion- or ASL-specific belongs beside the consumer's own
+/// writer (TRXScan's `write_dwi_scheme`, aslscan's `_aslcontext.tsv`).
+pub struct SidecarInfo {
+    /// BIDS PhaseEncodingDirection ("j", "j-", …) already resolved for the *written* voxel frame
+    /// (see `orient` + the caller): a +off-resonance field displaces signal toward +this-axis.
+    pub phase_encoding_direction: String,
+    pub total_readout_time: f64, // s
+    pub echo_time: f64,          // s
+    pub partial_fourier: f64,
+    pub accel: usize,
+    pub mb: usize,
+    /// Modern BIDS B0 linkage: when a fieldmap is written for this DWI, its
+    /// `B0FieldIdentifier` label is recorded here so the DWI carries the matching
+    /// `B0FieldSource` (the replacement for the deprecated `IntendedFor`).
+    pub b0_field_source: Option<String>,
+}
+
+/// Write a **complex** 4D series as BIDS `part-mag` / `part-phase` NIfTIs (phase in radians)
+/// plus JSON sidecars — the layout `dwidenoise`/`dwidenoise2` consume for complex denoising.
+/// `out_prefix` is a BIDS stem, e.g. `.../sub-01_ses-V02_dir-AP_run-01`; `suffix` is the BIDS
+/// modality suffix without the leading underscore: `"dwi"`, `"asl"`. Modality-specific
+/// companions (`.bval`/`.bvec`, `_aslcontext.tsv`) are the consumer's to write.
+#[allow(clippy::too_many_arguments)]
+pub fn write_complex_4d(
+    out_prefix: &str,
+    suffix: &str,
+    dims: [usize; 3],
+    n_volumes: usize,
+    mag: &[f32],
+    phase: &[f32],
+    grid: &Grid,
+    info: &SidecarInfo,
+) -> R<()> {
+    let p = |s: &str| PathBuf::from(format!("{out_prefix}{s}"));
+    write_4d(&p(&format!("_part-mag_{suffix}.nii.gz")), dims, n_volumes, mag, grid)?;
+    write_4d(&p(&format!("_part-phase_{suffix}.nii.gz")), dims, n_volumes, phase, grid)?;
+    // PED is resolved by the caller for the written frame (native grid, or reoriented to LAS with
+    // --fsl-orientation). EffectiveEchoSpacing is per the PE axis the code names, not a fixed axis.
+    let ped = info.phase_encoding_direction.as_str();
+    let pe_axis = match ped.as_bytes().first() { Some(b'i') => 0, Some(b'k') => 2, _ => 1 };
+    let ees = info.total_readout_time / dims[pe_axis].saturating_sub(1).max(1) as f64;
+    let b0src = match &info.b0_field_source {
+        Some(id) => format!(",\n  \"B0FieldSource\": \"{id}\""),
+        None => String::new(),
+    };
+    let common = format!(
+        "  \"Manufacturer\": \"TRXScan\",\n  \"PhaseEncodingDirection\": \"{ped}\",\n  \
+         \"TotalReadoutTime\": {:.6},\n  \"EffectiveEchoSpacing\": {:.8},\n  \
+         \"EchoTime\": {:.4},\n  \"PartialFourier\": {},\n  \
+         \"ParallelReductionFactorInPlane\": {},\n  \"MultibandAccelerationFactor\": {}{b0src}",
+        info.total_readout_time, ees, info.echo_time, info.partial_fourier, info.accel, info.mb,
+    );
+    std::fs::write(p(&format!("_part-mag_{suffix}.json")),
+        format!("{{\n{common},\n  \"ImageComparison\": \"magnitude\"\n}}\n"))?;
+    std::fs::write(p(&format!("_part-phase_{suffix}.json")),
+        format!("{{\n{common},\n  \"ImageComparison\": \"phase\",\n  \"Units\": \"rad\"\n}}\n"))?;
     Ok(())
 }
 
