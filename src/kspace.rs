@@ -271,6 +271,12 @@ pub struct SliceInput<'a> {
     /// `Some([0.0; 3])` does NOT: an FSL b0 row (`bval = 5`, zero `bvec`) is `Some`, keeps
     /// `do_eddy` true with identity rotors, and keeps the NUFFT path disabled.
     pub eddy_drive: Option<[f64; 3]>,
+    /// Per-volume preparation-gradient drive for the phase model: `(magnitude, direction)`. The
+    /// direction is NOT required to be normalized — `PrepPhase::shot` normalizes, and moving that
+    /// division to the caller changes floating-point operation order and breaks bit-identity.
+    /// `None` disables the prep phase term for this volume. Informational at slice level: the
+    /// shot is realised at the entry point and arrives here through `phase0`.
+    pub prep_drive: Option<(f64, [f64; 3])>,
     pub slice_seed: u64,
     /// Optional per-volume linear eddy shear `[a_x, a_y, a_z]` (dimensionless: PE shift in acquired
     /// voxels per acquired voxel of position). Replays a real DIFFPREP/TORTOISE eddy estimate
@@ -1201,10 +1207,11 @@ pub fn simulate_acquisition_oversampled(
     t2: &[f32],
     fmap: &[f32],
     acq: &Acquisition,
-    bvals: &[f64],
-    bvecs: &[[f64; 3]],
     // Per-volume eddy drive (`SliceInput::eddy_drive`); `None` disables eddy for that volume.
     eddy_drive: &[Option<[f64; 3]>],
+    // Per-volume prep-gradient drive for `phase.prep` (`SliceInput::prep_drive`), individually
+    // optional so a series can carry a prep gradient on some volumes and not others.
+    prep_drive: &[Option<(f64, [f64; 3])>],
     phase: &PhaseModel,
     seed: u64,
     // Optional per-voxel per-component noise SD on the ACQUIRED grid (`x + nx*(y + ny*z)`). When
@@ -1231,6 +1238,8 @@ pub fn simulate_acquisition_oversampled(
     assert_eq!(fmap.len(), nvox_sim, "fieldmap is not on the simulation grid");
     assert_eq!(eddy_drive.len(), ngrad,
                "eddy_drive has {} entries for {} volumes", eddy_drive.len(), ngrad);
+    assert_eq!(prep_drive.len(), ngrad,
+               "prep_drive has {} entries for {} volumes", prep_drive.len(), ngrad);
 
     let per_vol = |g: usize| -> (Vec<f32>, Vec<f32>) {
         let (mut mag, mut ph) = (vec![0.0f32; nvox_acq], vec![0.0f32; nvox_acq]);
@@ -1247,7 +1256,10 @@ pub fn simulate_acquisition_oversampled(
                 }
             }
             let refs: Vec<&[f32]> = cslices.iter().map(|v| v.as_slice()).collect();
-            let shot = phase.diffusion.shot(bvals[g], bvecs[g], g, z, seed);
+            let shot = match (&phase.prep, prep_drive[g]) {
+                (Some(p), Some((mag, dir))) => p.shot(mag, dir, g, z, seed),
+                _ => ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] },
+            };
             let phi = phase_slice(phase, &shot, snx, sny, o, z, nz);
             let slice_seed = (g as u64)
                 .wrapping_mul(0x100_0001)
@@ -1265,6 +1277,7 @@ pub fn simulate_acquisition_oversampled(
                     z,
                     nz,
                     eddy_drive: eddy_drive[g],
+                    prep_drive: prep_drive[g],
                     slice_seed,
                     eddy_lin: eddy_trace.map(|tr| tr[g]),
                 },
@@ -1374,6 +1387,7 @@ pub fn simulate_acquisition_legacy(
                 z,
                 nz,
                 eddy_drive,
+                prep_drive: None,
                 slice_seed: seed,
                 eddy_lin: None,
             };
@@ -1624,6 +1638,7 @@ mod tests {
                 z,
                 nz,
                 eddy_drive,
+                prep_drive: None,
                 slice_seed,
                 eddy_lin: None,
             },
@@ -1982,7 +1997,7 @@ mod tests {
         SliceInput {
             compartments: comps, t2: &[100.0], fmap, phase0,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            eddy_drive: None, slice_seed: 0, eddy_lin: None
+            eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
         }
     }
 
@@ -2001,7 +2016,7 @@ mod tests {
             &SliceInput {
                 compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                 sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                eddy_drive: None, slice_seed: 9, eddy_lin: None
+                eddy_drive: None, prep_drive: None, slice_seed: 9, eddy_lin: None
             },
             &acq,
         );
@@ -2027,7 +2042,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    eddy_drive: None, slice_seed: 3, eddy_lin: None
+                    eddy_drive: None, prep_drive: None, slice_seed: 3, eddy_lin: None
                 },
                 &acq,
             );
@@ -2069,7 +2084,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    eddy_drive: None, slice_seed: 1000 + t as u64, eddy_lin: None
+                    eddy_drive: None, prep_drive: None, slice_seed: 1000 + t as u64, eddy_lin: None
                 },
                 &acq,
             );
@@ -2137,7 +2152,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    eddy_drive: None, slice_seed: 0, eddy_lin: None
+                    eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
                 },
                 &Acquisition { partial_fourier: pf, ..clean() },
             )
@@ -2200,7 +2215,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    eddy_drive: None, slice_seed: 5, eddy_lin: None
+                    eddy_drive: None, prep_drive: None, slice_seed: 5, eddy_lin: None
                 },
                 &Acquisition { noise_variance: 1.0, window: w, ..clean() },
             );
@@ -2223,7 +2238,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    eddy_drive: None, slice_seed: 0, eddy_lin: None
+                    eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
                 },
                 &Acquisition { window: w, ..clean() },
             );
@@ -2315,6 +2330,7 @@ mod tests {
                 z: 0,
                 nz: 1,
                 eddy_drive: None,
+                prep_drive: None,
                 slice_seed: 0,
                 eddy_lin: None,
             };
@@ -2340,7 +2356,7 @@ mod tests {
         let inp = SliceInput {
             compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            eddy_drive: None, slice_seed: 0, eddy_lin: None
+            eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
         };
         let out = simulate_slice(&inp, &clean());
         let row = ny / 2;
@@ -2363,7 +2379,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    eddy_drive: None, slice_seed: 0, eddy_lin: None
+                    eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
                 },
                 &acq,
             )
@@ -2400,7 +2416,7 @@ mod tests {
         let model = PhaseModel::hbcd_like();
         let (mag, ph) = simulate_acquisition_oversampled(
             [snx, sny, nz], [nx, ny, nz], 1, &[img], &[100.0], &fmap, &acq,
-            &[1000.0], &[[1.0, 0.0, 0.0]], &[Some([1000.0, 0.0, 0.0])], &model, 7,
+            &[Some([1000.0, 0.0, 0.0])], &[Some((1000.0, [1.0, 0.0, 0.0]))], &model, 7,
             None,
             None,
         );
@@ -2474,7 +2490,7 @@ mod tests {
             &SliceInput {
                 compartments: &comps, t2: &[100.0], fmap: &vec![0.0f32; nx * ny], phase0: None,
                 sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                eddy_drive: None, slice_seed: 5, eddy_lin: None
+                eddy_drive: None, prep_drive: None, slice_seed: 5, eddy_lin: None
             },
             &acq,
         );
@@ -2585,7 +2601,7 @@ mod tests {
             for (name, acq, eddy_drive, eddy_lin, coil, ncoils) in cases {
                 let inp = SliceInput {
                     compartments: &comp_refs, t2: &t2, fmap: &fmap, phase0: Some(&phase0),
-                    sim: [snx, sny], acq_matrix: [nx, ny], z: 3, nz: 9, eddy_drive, slice_seed: 0, eddy_lin,
+                    sim: [snx, sny], acq_matrix: [nx, ny], z: 3, nz: 9, eddy_drive, prep_drive: None, slice_seed: 0, eddy_lin,
                 };
                 let a = build_coil_kspace(&inp, &acq, coil, ncoils);
                 let b = reference_coil_kspace(&inp, &acq, coil, ncoils);
@@ -2659,7 +2675,7 @@ mod tests {
             compartments: &comp_refs, t2: &[100.0], fmap: &fmap, phase0: None,
             sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
             eddy_drive: Some([bvec[0] * bval, bvec[1] * bval, bvec[2] * bval]),
-            slice_seed: 7, eddy_lin: None,
+            prep_drive: None, slice_seed: 7, eddy_lin: None,
         };
         let got = simulate_slice_kspace(&inp, &acq);
         for (i, (re, im)) in got.iter().take(8).enumerate() {
@@ -2681,7 +2697,7 @@ mod tests {
         let make = |drive| SliceInput {
             compartments: &comp_refs, t2: &[100.0], fmap: &fmap, phase0: None,
             sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            eddy_drive: drive, slice_seed: 7, eddy_lin: None,
+            eddy_drive: drive, prep_drive: None, slice_seed: 7, eddy_lin: None,
         };
         let none = simulate_slice(&make(None), &acq);
         let zero = simulate_slice(&make(Some([0.0; 3])), &acq);

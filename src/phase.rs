@@ -69,7 +69,7 @@ impl BackgroundPhase {
 /// One shot's realised motion and effective q-vector.
 #[derive(Debug, Clone, Copy)]
 pub struct ShotPhase {
-    /// Effective q-vector `c_q * sqrt(b) * bvec_unit`. See [`DiffusionPhase`] on why "effective".
+    /// Effective q-vector `c_q * sqrt(b) * bvec_unit`. See [`PrepPhase`] on why "effective".
     pub q_eff: [f64; 3],
     /// Translation drawn for this shot (voxel units).
     pub dx: [f64; 3],
@@ -90,15 +90,16 @@ impl ShotPhase {
     }
 }
 
-/// Motion-induced diffusion phase, `phi = q_eff . u(r)`.
+/// Motion-induced preparation-gradient phase, `phi = q_eff . u(r)`. The gradient is a diffusion
+/// gradient in one consumer and a crusher or labeling gradient in another; the model is the same.
 ///
-/// `q_eff = c_q * sqrt(b) * bvec_unit` is an **effective** q-vector, not the physical one: in PGSE
-/// `b ~ q^2 (Delta - delta/3)`, so `sqrt(b) * bvec` is proportional to `q` only under fixed, known
-/// timing, and TRXScan has no `delta`, `Delta` or waveform parameters. `c_q` absorbs the timing and
-/// the radian/cycle convention, and is calibrated. If waveform parameters are added later this
-/// becomes a physical q-vector without changing this interface.
+/// `q_eff = c_q * sqrt(magnitude) * direction_unit` is an **effective** q-vector, not the physical
+/// one: in PGSE `b ~ q^2 (Delta - delta/3)`, so `sqrt(b) * bvec` is proportional to `q` only under
+/// fixed, known timing, and TRXScan has no `delta`, `Delta` or waveform parameters. `c_q` absorbs
+/// the timing and the radian/cycle convention, and is calibrated. If waveform parameters are added
+/// later this becomes a physical q-vector without changing this interface.
 #[derive(Debug, Clone, Copy)]
-pub struct DiffusionPhase {
+pub struct PrepPhase {
     pub c_q: f64,
     /// SD of the per-shot translation (voxel units).
     pub sigma_dx: f64,
@@ -106,16 +107,20 @@ pub struct DiffusionPhase {
     pub sigma_rot: f64,
 }
 
-impl DiffusionPhase {
-    pub fn shot(&self, bval: f64, bvec: [f64; 3], volume: usize, slice_group: usize, seed: u64) -> ShotPhase {
-        let n = (bvec[0] * bvec[0] + bvec[1] * bvec[1] + bvec[2] * bvec[2]).sqrt();
-        // b = 0 has no diffusion encoding, so no motion-induced phase. Also avoids a degenerate
-        // unit vector when bvec is the zero vector.
-        if bval <= 0.0 || n < 1e-12 {
+impl PrepPhase {
+    /// One shot's phase for a prep gradient of `(magnitude, direction)`. `direction` is NOT
+    /// required to be unit length: the normalization happens here, in the same expression it
+    /// always has, so a caller must not pre-normalize (it would move bits). Diffusion passes
+    /// `(bval, bvec)` exactly as read from the scheme.
+    pub fn shot(&self, magnitude: f64, direction: [f64; 3], volume: usize, slice_group: usize, seed: u64) -> ShotPhase {
+        let n = (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2]).sqrt();
+        // magnitude 0 (b = 0) has no encoding, so no motion-induced phase. Also avoids a degenerate
+        // unit vector when the direction is the zero vector.
+        if magnitude <= 0.0 || n < 1e-12 {
             return ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] };
         }
-        let s = self.c_q * bval.sqrt() / n;
-        let q_eff = [bvec[0] * s, bvec[1] * s, bvec[2] * s];
+        let s = self.c_q * magnitude.sqrt() / n;
+        let q_eff = [direction[0] * s, direction[1] * s, direction[2] * s];
         let mut rng = Rng(
             seed ^ (volume as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
                 ^ (slice_group as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9),
@@ -133,7 +138,9 @@ pub struct PhaseModel {
     /// Global phase. A gauge choice and test control, never calibrated.
     pub global: f64,
     pub background: BackgroundPhase,
-    pub diffusion: DiffusionPhase,
+    /// Preparation-gradient phase. `None` for a sequence with no large prep gradient (ASL until
+    /// vascular crushing arrives); diffusion always constructs it.
+    pub prep: Option<PrepPhase>,
 }
 
 impl PhaseModel {
@@ -152,7 +159,7 @@ impl PhaseModel {
     /// conventions and possibly reconstruction filtering, and only some of that precedes Fourier
     /// encoding, so this is an effective benchmark parameter, never a recovered physical field.
     ///
-    /// **The b-exponent is NOT a calibrated parameter.** [`DiffusionPhase::shot`] forms
+    /// **The b-exponent is NOT a calibrated parameter.** [`PrepPhase::shot`] forms
     /// `q_eff = c_q * sqrt(b) * bvec`, so `p = 0.5` is fixed by construction -- it follows from
     /// modelling phase as `q . dx` with `b ~ q^2` at fixed timing. Fitting `p` is therefore a
     /// *validation* of that modelling choice, not a way to set it. Those fits bracket 0.5 without
@@ -192,7 +199,7 @@ impl PhaseModel {
                 coeffs: [0.0, 0.13, 0.10, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                 ..Default::default()
             },
-            diffusion: DiffusionPhase { c_q: 0.0425, sigma_dx: 1.0, sigma_rot: 2.0e-3 },
+            prep: Some(PrepPhase { c_q: 0.0425, sigma_dx: 1.0, sigma_rot: 2.0e-3 }),
         }
     }
 
@@ -201,7 +208,10 @@ impl PhaseModel {
         PhaseModel {
             global: 0.0,
             background: BackgroundPhase { coeffs: [0.0; 10], ..Default::default() },
-            diffusion: DiffusionPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 },
+            // `Some` with zero amplitudes, not `None`: this preset has always run the shot
+            // arithmetic with c_q = 0, and a synthesized all-zero shot could differ from that in
+            // the sign of zero. `None` is for consumers that never had the term.
+            prep: Some(PrepPhase { c_q: 0.0, sigma_dx: 0.0, sigma_rot: 0.0 }),
         }
     }
 }
@@ -210,8 +220,26 @@ impl PhaseModel {
 mod tests {
     use super::*;
 
-    fn dp() -> DiffusionPhase {
-        DiffusionPhase { c_q: 1e-3, sigma_dx: 0.5, sigma_rot: 0.0 }
+    fn dp() -> PrepPhase {
+        PrepPhase { c_q: 1e-3, sigma_dx: 0.5, sigma_rot: 0.0 }
+    }
+
+    #[test]
+    fn prep_shot_keeps_its_guards_and_does_not_require_unit_input() {
+        let p = PrepPhase { c_q: 1.0, sigma_dx: 0.0, sigma_rot: 0.0 };
+        // Non-unit direction: shot normalizes internally.
+        let a = p.shot(1000.0, [0.0, 0.0, 3.0], 0, 0, 1);
+        let b = p.shot(1000.0, [0.0, 0.0, 1.0], 0, 0, 1);
+        for i in 0..3 {
+            assert!((a.q_eff[i] - b.q_eff[i]).abs() < 1e-12,
+                    "a non-unit direction must give the same q_eff as its unit form");
+        }
+        // Degenerate direction: the n < 1e-12 guard yields zero phase, not NaN.
+        let z = p.shot(1000.0, [0.0, 0.0, 0.0], 0, 0, 1);
+        assert_eq!(z.q_eff, [0.0; 3], "zero direction must yield zero q_eff");
+        // Non-positive magnitude: early return.
+        let m = p.shot(0.0, [0.0, 0.0, 1.0], 0, 0, 1);
+        assert_eq!(m.q_eff, [0.0; 3], "zero magnitude must yield zero q_eff");
     }
 
     #[test]
@@ -241,7 +269,7 @@ mod tests {
 
     #[test]
     fn rotation_makes_phase_linear_in_position() {
-        let d = DiffusionPhase { c_q: 1e-3, sigma_dx: 0.0, sigma_rot: 1e-3 };
+        let d = PrepPhase { c_q: 1e-3, sigma_dx: 0.0, sigma_rot: 1e-3 };
         let s = d.shot(2000.0, [1.0, 0.0, 0.0], 1, 0, 7);
         // linear field => midpoint value equals the mean of the endpoints
         let (p, q) = ([0.0, -8.0, 0.0], [0.0, 8.0, 0.0]);
@@ -268,11 +296,12 @@ mod tests {
     fn hbcd_like_preset_is_nondegenerate_and_sqrt_b_dependent() {
         let m = PhaseModel::hbcd_like();
         // b = 0 must still be phase-free.
-        let s0 = m.diffusion.shot(0.0, [1.0, 0.0, 0.0], 1, 0, 5);
+        let prep = m.prep.expect("hbcd_like has a prep term");
+        let s0 = prep.shot(0.0, [1.0, 0.0, 0.0], 1, 0, 5);
         assert_eq!(s0.at([3.0, 1.0, 0.0]), 0.0);
         // a real shell gives non-trivial phase, scaling as sqrt(b)
-        let a = m.diffusion.shot(1000.0, [1.0, 0.0, 0.0], 1, 0, 5);
-        let b = m.diffusion.shot(4000.0, [1.0, 0.0, 0.0], 1, 0, 5);
+        let a = prep.shot(1000.0, [1.0, 0.0, 0.0], 1, 0, 5);
+        let b = prep.shot(4000.0, [1.0, 0.0, 0.0], 1, 0, 5);
         let r = [2.0, -1.0, 0.0];
         assert!(a.at(r).abs() > 1e-6, "calibrated model should give real phase");
         assert!((b.at(r) / a.at(r) - 2.0).abs() < 1e-9, "sqrt(b) scaling");
@@ -282,7 +311,7 @@ mod tests {
         // the calibrated amplitude must reproduce the MEASURED phase SD at real b-values.
         // sigma_phi(b) = c_q * sqrt(b) * sigma_dx, with the fitted product 0.0425.
         for (bval, measured) in [(1000.0_f64, 1.348_f64), (3000.0, 2.311)] {
-            let pred = m.diffusion.c_q * bval.sqrt() * m.diffusion.sigma_dx;
+            let pred = prep.c_q * bval.sqrt() * prep.sigma_dx;
             assert!(
                 (pred - measured).abs() / measured < 0.05,
                 "b={bval}: predicted sigma_phi {pred:.3} vs measured {measured:.3}"
