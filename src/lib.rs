@@ -24,3 +24,16 @@ pub mod orient;
 pub mod grid;
 /// Analytic Fourier references used as test oracles.
 pub mod analytic;
+
+/// Object phase model.
+pub mod phase;
+/// EPI readout trajectory and line timing.
+pub mod readout;
+/// Noise models. `add_complex_gaussian` is a `todo!()` stub; the noise that runs lives in
+/// `kspace` and is reached through `Acquisition::noise_variance`.
+pub mod noise;
+/// Rigid poses, multiband slice schedules, within-volume dropout.
+pub mod motion;
+/// Simulation config (feature `config`). `load` is a `todo!()` stub.
+#[cfg(feature = "config")]
+pub mod config;
