@@ -249,13 +249,100 @@ fn line_times(epi: &SingleShotEpi) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     (t, trf, tread)
 }
 
+/// Per-compartment T2 (or T2') for ONE slice. Goes in [`SliceInput`].
+#[derive(Debug, Clone, Copy)]
+pub enum T2Slice<'a> {
+    Uniform(f32),
+    /// `snx * sny`, layout `x + snx*y`. Same convention as [`SliceInput::fmap`].
+    Map(&'a [f32]),
+}
+
+/// Per-compartment T2 (or T2') for the WHOLE volume. Goes to the entry points, which cut each
+/// z slice themselves.
+#[derive(Debug, Clone, Copy)]
+pub enum T2Volume<'a> {
+    Uniform(f32),
+    /// `snx * sny * nz`, layout `x + snx*(y + sny*z)`.
+    Map(&'a [f32]),
+}
+
+/// Every map value must be strictly positive; `f32::INFINITY` is allowed and means no decay.
+/// Zero is forbidden: `-trf/0` is `-inf` when `trf > 0` (harmless) but `NaN` when `trf == 0`,
+/// and `0 * NaN` poisons the whole Fourier sum.
+pub fn validate_t2_map(m: &[f32]) -> Result<(), String> {
+    for (i, &v) in m.iter().enumerate() {
+        if v.is_nan() || v <= 0.0 {
+            return Err(format!("T2 map value {v} at index {i} is not strictly positive"));
+        }
+    }
+    Ok(())
+}
+
+/// `trf = t_echo + t` must be positive on every acquired line. A negative `trf` is a readout
+/// that begins before the excitation, and the forward model answers it with signal growth.
+/// Partial Fourier does not help: it drops low-ky lines, which this trajectory reads LAST.
+pub fn validate_acquisition_timing(acq: &Acquisition, nx: usize, ny: usize) -> Result<(), String> {
+    // Build the literal exactly as `build_coil_kspace` does, or the timing this validates is not
+    // the timing that runs.
+    let epi = SingleShotEpi {
+        kx_max: nx,
+        ky_max: ny,
+        t_line: acq.t_line,
+        t_echo: acq.t_echo,
+        reverse_phase: acq.reverse_phase,
+    };
+    let (_t_ms, trf_ms, _) = line_times(&epi);
+    let mask = sampling_mask(nx, ny, acq);
+    let mut worst = f64::INFINITY;
+    for ky in 0..ny {
+        if mask[ky * nx] && trf_ms[ky] < worst {
+            worst = trf_ms[ky];
+        }
+    }
+    if worst <= 0.0 {
+        let need = acq.t_echo - worst;
+        return Err(format!(
+            "trf = {worst:.3} ms <= 0 on an acquired line: the readout starts before the \
+             excitation. Raise t_echo above {need:.3} ms or shorten t_line. Partial Fourier \
+             does not help: it drops low-ky lines, which this trajectory reads last."));
+    }
+    Ok(())
+}
+
+/// Check every `Map` in a per-compartment volume list: right length, strictly positive values.
+fn validate_t2_volumes(what: &str, vols: &[T2Volume], nvox: usize) {
+    for (c, v) in vols.iter().enumerate() {
+        if let T2Volume::Map(m) = v {
+            assert_eq!(m.len(), nvox, "{what} map for compartment {c} is not on the simulation grid");
+            if let Err(e) = validate_t2_map(m) {
+                panic!("{what} map for compartment {c}: {e}");
+            }
+        }
+    }
+}
+
+/// Cut one z slice out of each per-compartment volume.
+fn t2_slices<'a>(vols: &'a [T2Volume<'a>], z: usize, nplane: usize) -> Vec<T2Slice<'a>> {
+    vols.iter()
+        .map(|v| match v {
+            T2Volume::Uniform(s) => T2Slice::Uniform(*s),
+            T2Volume::Map(m) => T2Slice::Map(&m[z * nplane..(z + 1) * nplane]),
+        })
+        .collect()
+}
+
 /// Everything one slice's forward model needs. The simulation grid (`sim`) and the acquired
 /// matrix (`acq_matrix`) are distinct: the object lives on the finer grid, and only the central
 /// `acq_matrix` block of its k-space is evaluated (spec 3.1).
 pub struct SliceInput<'a> {
     /// Per-compartment images on the SIM grid, layout `x + snx*y`.
     pub compartments: &'a [&'a [f32]],
-    pub t2: &'a [f32],
+    /// Per-compartment T2 (ms): one scalar, or one map on the SIM grid. Any `Map` here or in
+    /// `t_inhom` takes the slice off the per-line-scalar (NUFFT) path.
+    pub t2: &'a [T2Slice<'a>],
+    /// Per-compartment T2' inhomogeneity time (ms), same shape as `t2`; `None` falls back to
+    /// `Acquisition::t_inhom` for every compartment. `f32::INFINITY` means no inhomogeneity decay.
+    pub t_inhom: Option<&'a [T2Slice<'a>]>,
     /// Off-resonance field (Hz) on the SIM grid.
     pub fmap: &'a [f32],
     /// Pre-readout object phase (radians) on the SIM grid. Ignored until Task 6.
@@ -533,7 +620,12 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
     struct Rotor { key: (usize, usize), dt: f64, dkyn: f64, re: Vec<f64>, im: Vec<f64> }
     let mut rotors: Vec<Rotor> = Vec::new();
 
-    // Compartment relaxation weights for this line.
+    // Both terms of exp(-trf/T2 - |t|/T2') must be per-line scalars for the factoring — and
+    // therefore the NUFFT path — to survive. One Map anywhere takes the whole slice to the rotor
+    // path with per-voxel relaxation; Uniform compartments in a mixed slice keep their scalar.
+    let uniform = t2.iter().all(|s| matches!(s, T2Slice::Uniform(_)))
+        && inp.t_inhom.map_or(true, |ti| ti.iter().all(|s| matches!(s, T2Slice::Uniform(_))));
+    // Compartment relaxation weights for this line (uniform case only).
     let mut rel = vec![1.0f64; compartments.len()];
     // Separable gradient-model eddy factors.
     let (mut ex_re, mut ex_im) = (vec![1.0f64; snx], vec![0.0f64; snx]);
@@ -551,7 +643,7 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
     // lines). The gradient-model eddy polynomial has a non-affine time profile and keeps the
     // rotor path. The timing model is checked, not assumed.
     #[cfg(feature = "kspace")]
-    let nufft_rows: Option<Vec<(Vec<f64>, Vec<f64>)>> = (!do_eddy && ny >= 3).then(|| {
+    let nufft_rows: Option<Vec<(Vec<f64>, Vec<f64>)>> = (!do_eddy && ny >= 3 && uniform).then(|| {
         let tau = (t_ms[2] - t_ms[0]) / 2.0;
         let t0 = t_ms[0];
         let delta = t_ms[1] - (tau + t0);
@@ -658,12 +750,20 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
         }
         prev = Some(kyi); }
 
-        for (c, w) in rel.iter_mut().enumerate() {
-            *w = if acq.do_relaxation {
-                (-trf / t2[c] as f64 - t.abs() * 1000.0 / acq.t_inhom).exp()
-            } else {
-                1.0
-            };
+        if uniform {
+            for (c, w) in rel.iter_mut().enumerate() {
+                *w = if acq.do_relaxation {
+                    let T2Slice::Uniform(t2c) = t2[c] else { unreachable!("uniform branch") };
+                    let tic = match inp.t_inhom.map(|ti| ti[c]) {
+                        None => acq.t_inhom,
+                        Some(T2Slice::Uniform(v)) => v as f64,
+                        Some(T2Slice::Map(_)) => unreachable!("uniform branch"),
+                    };
+                    (-trf / t2c as f64 - t.abs() * 1000.0 / tic).exp()
+                } else {
+                    1.0
+                };
+            }
         }
         // Gradient-model eddy field growing through the readout: linear (g·pos) plus a
         // quadratic (g·pos²) term — the polynomial eddy/TORTOISE fit — times
@@ -708,7 +808,23 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
                 let i = row + x;
                 let mut w = 0.0f64;
                 for (c, comp) in compartments.iter().enumerate() {
-                    w += rel[c] * comp[i] as f64;
+                    let r = if uniform {
+                        rel[c]
+                    } else if acq.do_relaxation {
+                        let t2c = match t2[c] {
+                            T2Slice::Uniform(v) => v as f64,
+                            T2Slice::Map(m) => m[i] as f64,
+                        };
+                        let tic = match inp.t_inhom.map(|ti| ti[c]) {
+                            None => acq.t_inhom,
+                            Some(T2Slice::Uniform(v)) => v as f64,
+                            Some(T2Slice::Map(m)) => m[i] as f64,
+                        };
+                        (-trf / t2c - t.abs() * 1000.0 / tic).exp()
+                    } else {
+                        1.0
+                    };
+                    w += r * comp[i] as f64;
                 }
                 let (sr, si) = (st_re[i], st_im[i]);
                 let (mr, mi) = if do_eddy { (sr * eyr - si * eyi, sr * eyi + si * eyr) } else { (sr, si) };
@@ -923,7 +1039,8 @@ pub fn phase_slice(
 }
 
 /// Simulate one slice: compartment images on the SIM grid (each `snx*sny`, layout `x + snx*y`) →
-/// complex image on the ACQUIRED matrix (`nx*ny`). `t2` is the per-compartment T2 (ms); `fmap` is
+/// complex image on the ACQUIRED matrix (`nx*ny`). `t2` is the per-compartment T2 (ms), scalar
+/// or map, as is the optional `t_inhom`; `fmap` is
 /// the off-resonance field (Hz), same sim-grid layout. Only the central `nx*ny` block of the sim
 /// grid's k-space is evaluated, so truncation to the nominal band happens during the forward
 /// transform rather than by discarding a computed k-space (spec 3.1).
@@ -1204,8 +1321,11 @@ pub fn simulate_acquisition_oversampled(
     acq_dims: [usize; 3],
     ngrad: usize,
     images: &[Vec<f32>],
-    t2: &[f32],
+    // Per-compartment T2 (ms), scalar or a map on the simulation grid.
+    t2: &[T2Volume],
     fmap: &[f32],
+    // Per-compartment T2' (ms), scalar or map; `None` uses `Acquisition::t_inhom` throughout.
+    t_inhom: Option<&[T2Volume]>,
     acq: &Acquisition,
     // Per-volume eddy drive (`SliceInput::eddy_drive`); `None` disables eddy for that volume.
     eddy_drive: &[Option<[f64; 3]>],
@@ -1236,6 +1356,13 @@ pub fn simulate_acquisition_oversampled(
         assert_eq!(im.len(), nvox_sim * ngrad, "compartment image is not on the simulation grid");
     }
     assert_eq!(fmap.len(), nvox_sim, "fieldmap is not on the simulation grid");
+    assert_eq!(t2.len(), ncomp, "t2 has {} entries for {ncomp} compartments", t2.len());
+    validate_t2_volumes("T2", t2, nvox_sim);
+    if let Some(ti) = t_inhom {
+        assert_eq!(ti.len(), ncomp, "t_inhom has {} entries for {ncomp} compartments", ti.len());
+        validate_t2_volumes("T2'", ti, nvox_sim);
+    }
+    validate_acquisition_timing(acq, nx, ny).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(eddy_drive.len(), ngrad,
                "eddy_drive has {} entries for {} volumes", eddy_drive.len(), ngrad);
     assert_eq!(prep_drive.len(), ngrad,
@@ -1256,6 +1383,8 @@ pub fn simulate_acquisition_oversampled(
                 }
             }
             let refs: Vec<&[f32]> = cslices.iter().map(|v| v.as_slice()).collect();
+            let t2_slice = t2_slices(t2, z, snx * sny);
+            let ti_slice = t_inhom.map(|ti| t2_slices(ti, z, snx * sny));
             let shot = match (&phase.prep, prep_drive[g]) {
                 (Some(p), Some((mag, dir))) => p.shot(mag, dir, g, z, seed),
                 _ => ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] },
@@ -1269,7 +1398,8 @@ pub fn simulate_acquisition_oversampled(
             let out = simulate_slice(
                 &SliceInput {
                     compartments: &refs,
-                    t2,
+                    t2: &t2_slice,
+                    t_inhom: ti_slice.as_deref(),
                     fmap: &fslice,
                     phase0: Some(&phi),
                     sim: [snx, sny],
@@ -1338,14 +1468,22 @@ pub fn simulate_acquisition_legacy(
     dims: [usize; 3],
     ngrad: usize,
     images: &[Vec<f32>],
-    t2: &[f32],
+    t2: &[T2Volume],
     fmap: &[f32],
+    t_inhom: Option<&[T2Volume]>,
     acq: &Acquisition,
     gradients: &[[f64; 3]],
 ) -> (Vec<f32>, Vec<f32>) {
     let [nx, ny, nz] = dims;
     let nvox = nx * ny * nz;
     let ncomp = images.len();
+    assert_eq!(t2.len(), ncomp, "t2 has {} entries for {ncomp} compartments", t2.len());
+    validate_t2_volumes("T2", t2, nvox);
+    if let Some(ti) = t_inhom {
+        assert_eq!(ti.len(), ncomp, "t_inhom has {} entries for {ncomp} compartments", ti.len());
+        validate_t2_volumes("T2'", ti, nvox);
+    }
+    validate_acquisition_timing(acq, nx, ny).unwrap_or_else(|e| panic!("{e}"));
     // returns (magnitude, phase) for one volume
     let per_vol = |g: usize| -> (Vec<f32>, Vec<f32>) {
         let (mut mag, mut phase) = (vec![0.0f32; nvox], vec![0.0f32; nvox]);
@@ -1374,11 +1512,14 @@ pub fn simulate_acquisition_legacy(
                 }
             }
             let refs: Vec<&[f32]> = cslices.iter().map(|v| v.as_slice()).collect();
+            let t2_slice = t2_slices(t2, z, nx * ny);
+            let ti_slice = t_inhom.map(|ti| t2_slices(ti, z, nx * ny));
             let seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37)
                 .wrapping_add(acq.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let inp = SliceInput {
                 compartments: &refs,
-                t2,
+                t2: &t2_slice,
+                t_inhom: ti_slice.as_deref(),
                 fmap: &fslice,
                 phase0: None,
                 // v1 acquisition path: the object is already on the acquired matrix (o = 1).
@@ -1506,7 +1647,16 @@ mod tests {
                     for (c, comp) in compartments.iter().enumerate() {
                         let mut v = comp[at(x, y)] as f64;
                         if acq.do_relaxation {
-                            v *= (-(trf as f64) / t2[c] as f64 - t.abs() * 1000.0 / acq.t_inhom).exp();
+                            let t2c = match t2[c] {
+                                T2Slice::Uniform(u) => u as f64,
+                                T2Slice::Map(m) => m[at(x, y)] as f64,
+                            };
+                            let tic = match inp.t_inhom.map(|ti| ti[c]) {
+                                None => acq.t_inhom,
+                                Some(T2Slice::Uniform(u)) => u as f64,
+                                Some(T2Slice::Map(m)) => m[at(x, y)] as f64,
+                            };
+                            v *= (-(trf as f64) / t2c - t.abs() * 1000.0 / tic).exp();
                         }
                         f_real += v;
                     }
@@ -1605,7 +1755,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn slice1(
         img: &[f32],
-        t2: &[f32],
+        t2: &[T2Slice],
         fmap: &[f32],
         nx: usize,
         ny: usize,
@@ -1631,6 +1781,7 @@ mod tests {
             &SliceInput {
                 compartments: &comps,
                 t2,
+                t_inhom: None,
                 fmap,
                 phase0: None,
                 sim: [nx, ny],
@@ -1668,7 +1819,7 @@ mod tests {
             do_relaxation: false,
             ..Default::default()
         };
-        let out = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &acq, [0.0, 0.0, 0.0], 0));
+        let out = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &acq, [0.0, 0.0, 0.0], 0));
         let err: f32 = img.iter().zip(&out).map(|(a, b)| (a - b).abs()).sum::<f32>() / (nx * ny) as f32;
         assert!(err < 1e-4, "roundtrip mean abs err {err}");
     }
@@ -1689,7 +1840,7 @@ mod tests {
             reverse_phase: false,
             ..Default::default()
         };
-        let out = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &acq, [0.0, 0.0, 0.0], 0));
+        let out = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &acq, [0.0, 0.0, 0.0], 0));
         // centroid of the bright region should move in y vs the undistorted image
         let cy = |v: &[f32]| {
             let (mut sw, mut sy) = (0.0f64, 0.0f64);
@@ -1703,12 +1854,12 @@ mod tests {
             sy / sw.max(1e-9)
         };
         let acq0 = Acquisition { do_distortions: false, ..acq.clone() };
-        let base = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &acq0, [0.0, 0.0, 0.0], 0));
+        let base = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &acq0, [0.0, 0.0, 0.0], 0));
         let shift = cy(&out) - cy(&base);
         assert!(shift.abs() > 1.5, "expected a clear PE shift (~4px), got {shift}");
         // reverse phase-encode flips the distortion direction
         let acq_rev = Acquisition { reverse_phase: true, ..acq.clone() };
-        let rev = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &acq_rev, [0.0, 0.0, 0.0], 0));
+        let rev = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &acq_rev, [0.0, 0.0, 0.0], 0));
         let shift_rev = cy(&rev) - cy(&base);
         assert!(shift * shift_rev < 0.0, "AP/PA should distort oppositely: {shift} vs {shift_rev}");
     }
@@ -1720,8 +1871,8 @@ mod tests {
         let fmap = vec![0.0f32; nx * ny];
         let full = Acquisition { signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default() };
         let pf = Acquisition { partial_fourier: 0.6, ..full.clone() };
-        let a = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &full, [0.0, 0.0, 0.0], 0));
-        let b = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &pf, [0.0, 0.0, 0.0], 0));
+        let a = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &full, [0.0, 0.0, 0.0], 0));
+        let b = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &pf, [0.0, 0.0, 0.0], 0));
         let diff: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / (nx * ny) as f32;
         assert!(diff > 1e-3, "partial Fourier should alter the image, diff {diff}");
         // most of the signal energy is still there (PF keeps the central k-space)
@@ -1742,8 +1893,8 @@ mod tests {
         let fmap = vec![0.0f32; nx * ny];
         let base = Acquisition { signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default() };
         let ghost = Acquisition { ghost_offset: 0.5, ..base.clone() };
-        let a = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &base, [0.0, 0.0, 0.0], 0));
-        let b = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &ghost, [0.0, 0.0, 0.0], 0));
+        let a = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &base, [0.0, 0.0, 0.0], 0));
+        let b = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &ghost, [0.0, 0.0, 0.0], 0));
         // background region ~half-FOV away in the PE(y) direction from the source
         let bg = |v: &[f32]| {
             let mut s = 0.0f32;
@@ -1766,14 +1917,14 @@ mod tests {
         let eddy = Acquisition { eddy_strength: 5.0, ..base.clone() };
         // DWI volume (gradient along x): eddy shears the image
         let grad = [1.0, 0.0, 0.0];
-        let a = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &base, grad, 0));
-        let b = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &eddy, grad, 0));
+        let a = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &base, grad, 0));
+        let b = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &eddy, grad, 0));
         let diff: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum::<f32>() / (nx * ny) as f32;
         assert!(diff > 1e-3, "eddy should shear the DWI, diff {diff}");
         // b0 (zero gradient): eddy must have no effect
         let z0 = [0.0, 0.0, 0.0];
-        let a0 = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &base, z0, 0));
-        let b0 = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &eddy, z0, 0));
+        let a0 = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &base, z0, 0));
+        let b0 = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &eddy, z0, 0));
         let diff0: f32 = a0.iter().zip(&b0).map(|(x, y)| (x - y).abs()).sum();
         assert!(diff0 < 1e-6, "eddy must not touch b0, diff {diff0}");
     }
@@ -1785,8 +1936,8 @@ mod tests {
         let fmap = vec![0.0f32; nx * ny];
         let base = Acquisition { signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default() };
         let spiky = Acquisition { n_spikes: 3, spike_amplitude: 1.0, ..base.clone() };
-        let a = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &base, [0.0, 0.0, 0.0], 0));
-        let b = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &spiky, [0.0, 0.0, 0.0], 0));
+        let a = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &base, [0.0, 0.0, 0.0], 0));
+        let b = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &spiky, [0.0, 0.0, 0.0], 0));
         let corner = |v: &[f32]| {
             let mut s = 0.0f32;
             for y in 0..3 {
@@ -1806,7 +1957,7 @@ mod tests {
         let img = phantom(nx, ny);
         let fmap = vec![0.0f32; nx * ny];
         let acq = Acquisition { n_coils: 4, signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default() };
-        let out = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &acq, [0.0, 0.0, 0.0], 0));
+        let out = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &acq, [0.0, 0.0, 0.0], 0));
         let center = out[12 + nx * 12];
         let corner = out[1 + nx * 1];
         assert!(center > 0.1 && center > corner, "RSS should recover the brain: center {center} corner {corner}");
@@ -1960,8 +2111,8 @@ mod tests {
         let fmap = vec![0.0f32; nx * ny];
         let full = Acquisition { n_coils: 8, signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default() };
         let accel = Acquisition { accel: 2, acs_lines: 16, ..full.clone() };
-        let a = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &full, [0.0, 0.0, 0.0], 0));
-        let g = mag(&slice1(&img, &[100.0], &fmap, nx, ny, 0, 1, &accel, [0.0, 0.0, 0.0], 0));
+        let a = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &full, [0.0, 0.0, 0.0], 0));
+        let g = mag(&slice1(&img, &[T2Slice::Uniform(100.0)], &fmap, nx, ny, 0, 1, &accel, [0.0, 0.0, 0.0], 0));
         // noise-free: GRAPPA should recover the fully-sampled image closely (aliasing unfolded)
         let num: f32 = a.iter().zip(&g).map(|(x, y)| (x - y).abs()).sum();
         let den: f32 = a.iter().sum::<f32>().max(1e-6);
@@ -1995,7 +2146,7 @@ mod tests {
         snx: usize, sny: usize, nx: usize, ny: usize,
     ) -> SliceInput<'a> {
         SliceInput {
-            compartments: comps, t2: &[100.0], fmap, phase0,
+            compartments: comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap, phase0,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
             eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
         }
@@ -2014,7 +2165,7 @@ mod tests {
         let comps: [&[f32]; 1] = [&empty];
         let k = simulate_slice_kspace(
             &SliceInput {
-                compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                 sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
                 eddy_drive: None, prep_drive: None, slice_seed: 9, eddy_lin: None
             },
@@ -2040,7 +2191,7 @@ mod tests {
             let comps: [&[f32]; 1] = [&empty];
             let out = simulate_slice(
                 &SliceInput {
-                    compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                    compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
                     eddy_drive: None, prep_drive: None, slice_seed: 3, eddy_lin: None
                 },
@@ -2082,7 +2233,7 @@ mod tests {
             let comps: [&[f32]; 1] = [&empty];
             let out = simulate_slice(
                 &SliceInput {
-                    compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                    compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
                     eddy_drive: None, prep_drive: None, slice_seed: 1000 + t as u64, eddy_lin: None
                 },
@@ -2150,7 +2301,7 @@ mod tests {
         let run = |pf: f64| {
             simulate_slice(
                 &SliceInput {
-                    compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                    compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
                     eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
                 },
@@ -2213,7 +2364,7 @@ mod tests {
             let comps: [&[f32]; 1] = [&empty];
             let out = simulate_slice(
                 &SliceInput {
-                    compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                    compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
                     eddy_drive: None, prep_drive: None, slice_seed: 5, eddy_lin: None
                 },
@@ -2236,7 +2387,7 @@ mod tests {
         let peak = |w: KspaceWindow| {
             let out = simulate_slice(
                 &SliceInput {
-                    compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                    compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
                     eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
                 },
@@ -2322,7 +2473,8 @@ mod tests {
             let comps: [&[f32]; 1] = [&img];
             let inp = SliceInput {
                 compartments: &comps,
-                t2: &[100.0],
+                t2: &[T2Slice::Uniform(100.0)],
+                t_inhom: None,
                 fmap: &fmap,
                 phase0: None,
                 sim: [snx, sny],
@@ -2354,7 +2506,7 @@ mod tests {
         let img = step_hires(snx, sny, (nx as f64 / 2.0 + 0.5) * o as f64);
         let comps: [&[f32]; 1] = [&img];
         let inp = SliceInput {
-            compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+            compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
             eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
         };
@@ -2377,7 +2529,7 @@ mod tests {
             let comps: [&[f32]; 1] = [&img];
             simulate_slice_kspace(
                 &SliceInput {
-                    compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
+                    compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
                     eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
                 },
@@ -2415,7 +2567,7 @@ mod tests {
         };
         let model = PhaseModel::hbcd_like();
         let (mag, ph) = simulate_acquisition_oversampled(
-            [snx, sny, nz], [nx, ny, nz], 1, &[img], &[100.0], &fmap, &acq,
+            [snx, sny, nz], [nx, ny, nz], 1, &[img], &[T2Volume::Uniform(100.0)], &fmap, None, &acq,
             &[Some([1000.0, 0.0, 0.0])], &[Some((1000.0, [1.0, 0.0, 0.0]))], &model, 7,
             None,
             None,
@@ -2447,7 +2599,7 @@ mod tests {
             signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default()
         };
         let (mag, _) = simulate_acquisition_legacy(
-            [nx, ny, nz], 1, &[img], &[100.0], &vec![0.0f32; nx * ny * nz], &acq,
+            [nx, ny, nz], 1, &[img], &[T2Volume::Uniform(100.0)], &vec![0.0f32; nx * ny * nz], None, &acq,
             &[[0.0, 0.0, 0.0]],
         );
         let over = (nx / 2 + 1..nx)
@@ -2488,7 +2640,7 @@ mod tests {
         let comps: [&[f32]; 1] = [&img];
         let k = simulate_slice_kspace(
             &SliceInput {
-                compartments: &comps, t2: &[100.0], fmap: &vec![0.0f32; nx * ny], phase0: None,
+                compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &vec![0.0f32; nx * ny], phase0: None,
                 sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
                 eddy_drive: None, prep_drive: None, slice_seed: 5, eddy_lin: None
             },
@@ -2568,7 +2720,7 @@ mod tests {
                 }).collect());
             }
             let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
-            let t2 = [70.0f32, 100.0, 2000.0];
+            let t2 = [T2Slice::Uniform(70.0f32), T2Slice::Uniform(100.0), T2Slice::Uniform(2000.0)];
             // fieldmap with a large range (±300 Hz over a 40–70 ms readout: ±20 cycles at the edge)
             let fmap: Vec<f32> = (0..n).map(|i| {
                 let (x, y) = ((i % snx) as f64 / snx as f64, (i / snx) as f64 / sny as f64);
@@ -2600,7 +2752,7 @@ mod tests {
             ];
             for (name, acq, eddy_drive, eddy_lin, coil, ncoils) in cases {
                 let inp = SliceInput {
-                    compartments: &comp_refs, t2: &t2, fmap: &fmap, phase0: Some(&phase0),
+                    compartments: &comp_refs, t2: &t2, t_inhom: None, fmap: &fmap, phase0: Some(&phase0),
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 3, nz: 9, eddy_drive, prep_drive: None, slice_seed: 0, eddy_lin,
                 };
                 let a = build_coil_kspace(&inp, &acq, coil, ncoils);
@@ -2672,7 +2824,7 @@ mod tests {
         let acq = Acquisition { eddy_strength: 0.05, ..Default::default() };
         let (bval, bvec) = (1000.0f64, [0.6f64, 0.8, 0.0]);
         let inp = SliceInput {
-            compartments: &comp_refs, t2: &[100.0], fmap: &fmap, phase0: None,
+            compartments: &comp_refs, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
             sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
             eddy_drive: Some([bvec[0] * bval, bvec[1] * bval, bvec[2] * bval]),
             prep_drive: None, slice_seed: 7, eddy_lin: None,
@@ -2695,7 +2847,7 @@ mod tests {
         let acq = Acquisition { eddy_strength: 0.05, ..Default::default() };
 
         let make = |drive| SliceInput {
-            compartments: &comp_refs, t2: &[100.0], fmap: &fmap, phase0: None,
+            compartments: &comp_refs, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
             sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
             eddy_drive: drive, prep_drive: None, slice_seed: 7, eddy_lin: None,
         };
@@ -2712,5 +2864,117 @@ mod tests {
         assert!(eddy_enabled(&acq, Some([0.0; 3])), "a zero-vector drive must keep eddy enabled");
         assert!(!eddy_enabled(&acq, None), "None must disable eddy");
         assert!(!eddy_enabled(&Acquisition::default(), Some([1.0; 3])), "eddy_strength 0 disables");
+    }
+
+    /// Change 1's first map test: a Map filled with one constant reproduces Uniform of that
+    /// constant. L2 relative over the coefficients, not coefficient-wise: a near-zero coefficient
+    /// makes a relative bound meaningless. Not bit-exact either: under `kspace` the Uniform run
+    /// takes the NUFFT path and the Map run the rotor path.
+    /// A single-slice `SliceInput` for the map-path tests. A closure cannot return a struct that
+    /// borrows its own argument, so this is a fn with the lifetime spelled out.
+    fn mk_slice<'a>(
+        comps: &'a [&'a [f32]], t2: &'a [T2Slice<'a>], t_inhom: Option<&'a [T2Slice<'a>]>,
+        fmap: &'a [f32], nx: usize, ny: usize, seed: u64,
+    ) -> SliceInput<'a> {
+        SliceInput {
+            compartments: comps, t2, t_inhom, fmap, phase0: None,
+            sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
+            eddy_drive: None, prep_drive: None, slice_seed: seed, eddy_lin: None,
+        }
+    }
+
+    #[test]
+    fn constant_map_reproduces_uniform() {
+        let (nx, ny) = (16, 16);
+        let comps = vec![box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
+        let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
+        let fmap = vec![0.0f32; nx * ny];
+        let acq = Acquisition::default();
+        let constant = 100.0f32;
+        let map = vec![constant; nx * ny];
+
+        let t2u = [T2Slice::Uniform(constant)];
+        let t2m = [T2Slice::Map(&map)];
+        let u = simulate_slice_kspace(&mk_slice(&comp_refs, &t2u, None, &fmap, nx, ny, 3), &acq);
+        let m = simulate_slice_kspace(&mk_slice(&comp_refs, &t2m, None, &fmap, nx, ny, 3), &acq);
+
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for ((ur, ui), (mr, mi)) in u.iter().zip(m.iter()) {
+            num += (ur - mr).powi(2) + (ui - mi).powi(2);
+            den += ur.powi(2) + ui.powi(2);
+        }
+        let l2_rel = (num / den.max(1e-300)).sqrt();
+        assert!(l2_rel < 1e-12, "constant map vs uniform: L2 relative {l2_rel:e}");
+    }
+
+    /// Change 1's second map test: the restructured forward against the literal per-line sum
+    /// with a varying T2 map and a varying T2' map.
+    #[test]
+    fn varying_t2_map_matches_the_literal_sum() {
+        let (nx, ny) = (12, 12);
+        let comps = vec![box_hires(nx, ny, 3.0, 9.0, 3.0, 9.0)];
+        let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
+        let fmap: Vec<f32> = (0..nx * ny).map(|i| 3.0 * ((i % 5) as f32 - 2.0)).collect();
+        let map: Vec<f32> = (0..nx * ny).map(|i| 60.0 + (i % 7) as f32 * 10.0).collect();
+        let tmap: Vec<f32> = (0..nx * ny).map(|i| 30.0 + (i % 4) as f32 * 15.0).collect();
+        let acq = Acquisition::default();
+        let inp = SliceInput {
+            compartments: &comp_refs, t2: &[T2Slice::Map(&map)], t_inhom: Some(&[T2Slice::Map(&tmap)]),
+            fmap: &fmap, phase0: None, sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
+            eddy_drive: None, prep_drive: None, slice_seed: 5, eddy_lin: None,
+        };
+        let got = simulate_slice_kspace(&inp, &acq);
+        // (inp, acq, coil, ncoils) -> Vec<C>; single coil here.
+        let want = reference_coil_kspace(&inp, &acq, 0, 1);
+        let peak = want.iter().map(|k| k.abs()).fold(0.0, f64::max);
+        assert!(peak > 0.0);
+        for ((gr, gi), w) in got.iter().zip(want.iter()) {
+            assert!((gr - w.re).abs() < 1e-10 * peak && (gi - w.im).abs() < 1e-10 * peak,
+                    "restructured forward diverged from the literal sum");
+        }
+    }
+
+    /// A readout that starts before the excitation. TRXScan never hits this at TE 88 ms; ASL
+    /// will, at TE near 12 ms with a 64-line readout.
+    #[test]
+    fn negative_trf_on_an_acquired_line_is_rejected() {
+        let acq = Acquisition { t_echo: 2.0, t_line: 1.0, partial_fourier: 1.0, ..Default::default() };
+        let err = validate_acquisition_timing(&acq, 64, 64).unwrap_err();
+        assert!(err.contains("t_echo"), "the error must name t_echo: {err}");
+        // Partial Fourier removes the LATE lines, so it cannot rescue this.
+        let pf = Acquisition { partial_fourier: 0.5, ..acq.clone() };
+        assert!(validate_acquisition_timing(&pf, 64, 64).is_err());
+        // The default (TE 90 ms, 1 ms/line) is fine at 64 lines.
+        assert!(validate_acquisition_timing(&Acquisition::default(), 64, 64).is_ok());
+    }
+
+    #[test]
+    fn zero_in_a_t2_map_is_rejected() {
+        assert!(validate_t2_map(&[100.0, 0.0, 50.0]).is_err());
+        assert!(validate_t2_map(&[100.0, f32::INFINITY, 50.0]).is_ok());
+        assert!(validate_t2_map(&[100.0, f32::NAN, 50.0]).is_err());
+        assert!(validate_t2_map(&[100.0, -1.0, 50.0]).is_err());
+    }
+
+    /// A per-compartment Uniform T2' must be honoured on the fast (uniform) path, not only in the
+    /// map branch: class mode passes Uniform per label and TRXScan's gate cannot see this.
+    #[test]
+    fn uniform_t_inhom_overrides_the_acquisition_scalar() {
+        let (nx, ny) = (16, 16);
+        let comps = vec![box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
+        let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
+        let fmap = vec![0.0f32; nx * ny];
+        let t2 = [T2Slice::Uniform(100.0)];
+        let ti = [T2Slice::Uniform(20.0)];
+        let a50 = Acquisition { t_inhom: 50.0, ..Default::default() };
+        let a20 = Acquisition { t_inhom: 20.0, ..Default::default() };
+        let base = simulate_slice_kspace(&mk_slice(&comp_refs, &t2, None, &fmap, nx, ny, 3), &a50);
+        let over = simulate_slice_kspace(&mk_slice(&comp_refs, &t2, Some(&ti), &fmap, nx, ny, 3), &a50);
+        let direct = simulate_slice_kspace(&mk_slice(&comp_refs, &t2, None, &fmap, nx, ny, 3), &a20);
+        assert!(base.iter().zip(&over).any(|(p, q)| p != q), "the override must change the output");
+        for (p, q) in over.iter().zip(&direct) {
+            assert_eq!(p.0.to_bits(), q.0.to_bits());
+            assert_eq!(p.1.to_bits(), q.1.to_bits());
+        }
     }
 }
