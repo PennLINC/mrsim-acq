@@ -54,7 +54,8 @@
 | `src/raster.rs` | `Grid` definition removed, re-exported from `mrsim_acq::grid` |
 | `src/io.rs` | Keeps streamline loaders, `write_benchmark`, `write_dwi`; bval/bvec writing |
 | `src/bin/trxscan.rs` | Call-site updates for every interface change |
-| `src/bin/trxscan_microstructure.rs`, `trxscan_benchmark.rs`, `trxscan_gnl.rs` | Import path updates |
+| `src/bin/trxscan_microstructure.rs`, `trxscan_benchmark.rs`, `trxscan_gnl.rs` | Import path updates; `trxscan_benchmark.rs` also follows `produce_slice`'s signature |
+| `src/benchmark.rs` | Stays, but builds `SliceInput` and `DiffusionPhase` literals (`:85-95`, `:234`, `:265`), so Tasks 8, 9 and 10 each touch it |
 | `tests/fixtures/p0_baseline/` | **New.** Baseline inputs + checksums (Task 1) |
 | `tools/gen_p0_fixture.py` | **New.** Fixture generator (Task 1) |
 
@@ -66,7 +67,7 @@ Nothing moves in this task. Its only output is a fixture and a set of checksums 
 
 `57858a5` is current `HEAD` of branch `gnl`, so no checkout is needed — but verify that before generating, because the whole gate depends on it.
 
-The fixture must exercise the paths the eight changes put at risk: an FSL-style b0 row (`bval > 0`, zero `bvec`) for change 2, a nonzero `--eddy` run and an eddy-free run for changes 2 and 5, multiple coils with GRAPPA for the reconstruction path, and multiband dropout for change 7.
+The fixture must exercise the paths the eight changes put at risk: an FSL-style b0 row (`bval > 0`, zero `bvec`) for change 2, a nonzero `--eddy` run and an eddy-free run for changes 2 and 5, multiple coils with GRAPPA for the reconstruction path, multiband dropout for change 7, and **both entry points**: `--oversample 2` (the default, `simulate_acquisition_oversampled`) and `--oversample 1` (`simulate_acquisition_legacy`, which changes 1, 2, 4 and 5 also edit). Two things about the binary shape this. The oversampled path *requires* `--sim-wm/--sim-gm/--sim-csf/--sim-mask/--sim-fmap` on a grid exactly `o` times finer in-plane (`src/bin/trxscan.rs:372-405`) and errors without them, so the fixture carries two grids. And `acs_lines` is hard-coded to 24 (`src/bin/trxscan.rs:854`), so the PE axis must be long enough for lines to exist outside the ACS band or GRAPPA never synthesizes anything.
 
 **Files:**
 - Create: `TRXScan/tools/gen_p0_fixture.py`
@@ -92,9 +93,21 @@ Expected: `OK: HEAD is the baseline commit` and a clean working tree. If HEAD is
 Create `TRXScan/tools/gen_p0_fixture.py`. It writes a deliberately tiny phantom so the O(N^3) direct DFT stays fast.
 
 ```python
-"""Generate the P0 bit-identity fixture: tiny tissue maps, a fieldmap, an FSL
-scheme with a b0 row written the FSL way (bval>0, zero bvec), and a few
-streamlines. Run inside the simasl micromamba env for nibabel/numpy.
+"""Generate the P0 bit-identity fixture on TWO grids.
+
+trxscan's production path is `--oversample 2` (the default), which reads the object from a
+finer SIMULATION grid via `--sim-wm/--sim-gm/--sim-csf/--sim-mask/--sim-fmap` and reads the
+ACQUISITION grid via `--wm/--gm/--csf/--mask` only for the output matrix
+(`src/bin/trxscan.rs:372-405`). Without the `--sim-*` files the binary exits with an error,
+and with `--oversample 1` it takes the legacy entry point instead, so a fixture on one grid
+cannot gate `simulate_acquisition_oversampled` at all. This writes both grids, plus an FSL
+scheme with a b0 row written the FSL way (bval > 0, zero bvec), and a few streamlines.
+
+The phase-encode axis (y) is 32 lines, not 8. `acs_lines` is hard-coded to 24
+(`src/bin/trxscan.rs:854`); on an 8-line axis every line is inside the ACS band and GRAPPA
+calibrates but synthesizes nothing. On 32 lines it synthesizes lines 1, 3 and 29.
+
+Run inside the simasl micromamba env for nibabel/numpy.
 """
 import os
 import numpy as np
@@ -102,41 +115,60 @@ import nibabel as nib
 from nibabel.streamlines import Tractogram, TckFile
 
 OUT = os.path.join(os.path.dirname(__file__), "..", "tests", "fixtures", "p0_baseline")
-DIMS = (8, 8, 4)
-AFFINE = np.diag([2.0, 2.0, 3.0, 1.0])
+O = 2                                   # in-plane oversampling, trxscan's default
+ACQ_DIMS = (8, 32, 4)
+SIM_DIMS = (ACQ_DIMS[0] * O, ACQ_DIMS[1] * O, ACQ_DIMS[2])
+ACQ_AFFINE = np.diag([2.0, 2.0, 3.0, 1.0])
+# Sim cells 2X and 2X+1 tile acquired voxel X, whose centre is at 2X mm, so the sim cell
+# centres sit at 2X-0.5 and 2X+0.5 mm. z is never oversampled.
+SIM_AFFINE = np.array(
+    [[1.0, 0.0, 0.0, -0.5], [0.0, 1.0, 0.0, -0.5], [0.0, 0.0, 3.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+)
 
 
-def write_volume(name, data):
-    nib.Nifti1Image(data.astype(np.float32), AFFINE).to_filename(
-        os.path.join(OUT, name)
-    )
+def write_volume(name, data, affine):
+    img = nib.Nifti1Image(np.ascontiguousarray(data, dtype=np.float32), affine)
+    img.to_filename(os.path.join(OUT, name))
+
+
+def block_mean(v):
+    """Simulation grid -> acquisition grid: mean over each O x O in-plane block."""
+    x, y, z = v.shape
+    return v.reshape(x // O, O, y // O, O, z).mean(axis=(1, 3))
+
+
+def fieldmap(dims, affine):
+    """A smooth, nonzero off-resonance field (Hz), evaluated in WORLD mm so the two grids
+    describe the same field rather than two differently-stretched copies of one pattern."""
+    ijk = np.indices(dims).reshape(3, -1).astype(float)
+    xyz = affine[:3, :3] @ ijk + affine[:3, 3:4]
+    f = 12.0 * np.sin(xyz[0] / 6.0) + 7.0 * np.cos(xyz[1] / 5.0)
+    return f.reshape(dims)
 
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    rng = np.random.RandomState(20260921)
 
-    # Tissue fractions that sum to <= 1, with a mask that excludes the rim so
-    # the boundary behaviour is exercised rather than the whole grid being live.
-    wm = np.zeros(DIMS, dtype=np.float32)
-    gm = np.zeros(DIMS, dtype=np.float32)
-    csf = np.zeros(DIMS, dtype=np.float32)
-    wm[2:6, 2:6, 1:3] = 0.6
-    gm[2:6, 2:6, 1:3] = 0.3
-    csf[2:6, 2:6, 1:3] = 0.1
+    # Tissue fractions on the SIM grid. The block starts at sim cell 5, halfway through
+    # acquired voxel 2, so the acquisition grid carries a genuine partial-volume edge and
+    # the rim of the FOV stays empty.
+    wm = np.zeros(SIM_DIMS, dtype=np.float32)
+    gm = np.zeros(SIM_DIMS, dtype=np.float32)
+    csf = np.zeros(SIM_DIMS, dtype=np.float32)
+    wm[5:12, 8:56, 1:3] = 0.6
+    gm[5:12, 8:56, 1:3] = 0.3
+    csf[5:12, 8:56, 1:3] = 0.1
     mask = (wm + gm + csf > 0).astype(np.float32)
 
-    write_volume("wm.nii.gz", wm)
-    write_volume("gm.nii.gz", gm)
-    write_volume("csf.nii.gz", csf)
-    write_volume("mask.nii.gz", mask)
+    for name, v in [("wm", wm), ("gm", gm), ("csf", csf), ("mask", mask)]:
+        write_volume(f"sim_{name}.nii.gz", v, SIM_AFFINE)
+        acq = block_mean(v)
+        if name == "mask":
+            acq = (acq > 0).astype(np.float32)
+        write_volume(f"{name}.nii.gz", acq, ACQ_AFFINE)
 
-    # A smooth, nonzero fieldmap in Hz so the distortion path is live.
-    zz, yy, xx = np.meshgrid(
-        np.arange(DIMS[2]), np.arange(DIMS[1]), np.arange(DIMS[0]), indexing="ij"
-    )
-    fmap = (12.0 * np.sin(xx / 3.0) + 7.0 * np.cos(yy / 2.5)).transpose(2, 1, 0)
-    write_volume("fmap.nii.gz", fmap)
+    write_volume("sim_fmap.nii.gz", fieldmap(SIM_DIMS, SIM_AFFINE), SIM_AFFINE)
+    write_volume("fmap.nii.gz", fieldmap(ACQ_DIMS, ACQ_AFFINE), ACQ_AFFINE)
 
     # Scheme: one FSL-style b0 row (bval>0, zero bvec) plus three DWI rows.
     # The b0 row is the change-2 regression case and must not be bval=0.
@@ -153,13 +185,13 @@ def main():
         for axis in range(3):
             f.write(" ".join(f"{v[axis]:.16g}" for v in bvecs) + "\n")
 
-    # Streamlines in RAS mm, crossing the live block along two directions so the
-    # rasteriser sees more than one orientation per voxel.
+    # Streamlines in RAS mm, crossing the live block (x 4.5-11.5, y 7.5-55.5, slices 1-2)
+    # along two directions so the rasteriser sees more than one orientation per voxel.
     lines = []
-    for y in np.linspace(5.0, 11.0, 4):
+    for y in np.linspace(12.0, 50.0, 6):
         lines.append(np.array([[4.0, y, 4.5], [12.0, y, 4.5]], dtype=np.float32))
-    for x in np.linspace(5.0, 11.0, 4):
-        lines.append(np.array([[x, 4.0, 4.5], [x, 12.0, 4.5]], dtype=np.float32))
+    for x in np.linspace(5.5, 10.5, 4):
+        lines.append(np.array([[x, 6.0, 4.5], [x, 56.0, 4.5]], dtype=np.float32))
     tractogram = Tractogram(lines, affine_to_rasmm=np.eye(4))
     TckFile(tractogram).save(os.path.join(OUT, "streamlines.tck"))
 
@@ -178,11 +210,11 @@ micromamba run -n simasl python tools/gen_p0_fixture.py
 ls tests/fixtures/p0_baseline/
 ```
 
-Expected: `wm.nii.gz gm.nii.gz csf.nii.gz mask.nii.gz fmap.nii.gz scheme.bval scheme.bvec streamlines.tck`
+Expected: `wm gm csf mask fmap` and `sim_wm sim_gm sim_csf sim_mask sim_fmap` (all `.nii.gz`), `scheme.bval scheme.bvec streamlines.tck`. Check the grids: `sim_*` must be `16 x 64 x 4` and the rest `8 x 32 x 4`.
 
 - [ ] **Step 4: Write the baseline runner**
 
-Create `TRXScan/tools/run_p0_baseline.sh`. It runs four configurations under two feature sets and writes checksums. The four configurations between them cover every at-risk path.
+Create `TRXScan/tools/run_p0_baseline.sh`. It runs five configurations under two feature sets and writes checksums. The five configurations between them cover every at-risk path. `--fmap` is passed always: the legacy configuration requires it and the oversampled ones ignore it (`src/bin/trxscan.rs:399-402`).
 
 ```bash
 #!/usr/bin/env bash
@@ -197,9 +229,13 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 COMMON=(--wm "$FIX/wm.nii.gz" --gm "$FIX/gm.nii.gz" --csf "$FIX/csf.nii.gz"
-        --mask "$FIX/mask.nii.gz" --streamlines "$FIX/streamlines.tck"
+        --mask "$FIX/mask.nii.gz" --fmap "$FIX/fmap.nii.gz"
+        --sim-wm "$FIX/sim_wm.nii.gz" --sim-gm "$FIX/sim_gm.nii.gz"
+        --sim-csf "$FIX/sim_csf.nii.gz" --sim-mask "$FIX/sim_mask.nii.gz"
+        --sim-fmap "$FIX/sim_fmap.nii.gz"
+        --streamlines "$FIX/streamlines.tck"
         --bval "$FIX/scheme.bval" --bvec "$FIX/scheme.bvec"
-        --fmap "$FIX/fmap.nii.gz" --seed 20260921)
+        --seed 20260921)
 
 run_config() {  # $1 = features, $2 = config name, rest = extra flags
   local features="$1" name="$2"; shift 2
@@ -208,14 +244,16 @@ run_config() {  # $1 = features, $2 = config name, rest = extra flags
     "${COMMON[@]}" "$@" -o "$out" >/dev/null
   for f in "$out"*; do
     [ -f "$f" ] || continue
-    printf '%s  %s/%s\n' "$(sha256sum "$f" | cut -d' ' -f1)" \
-      "$(basename "$(dirname "$f")")" "$(basename "$f")"
+    # Basename only. The directory is a fresh mktemp every run, so including it would make
+    # every manifest line unique per invocation and Step 7 could never pass. The basename
+    # already carries the configuration and feature-set names.
+    printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")"
   done
 }
 
 : > "$OUTFILE"
 for FEATURES in "cli" "cli,kspace,par"; do
-  # 1. plain: no eddy, single coil, no acceleration, no multiband
+  # 1. plain: oversampled production path (o=2), no eddy, single coil, no accel, no MB
   run_config "$FEATURES" plain                          >> "$OUTFILE"
   # 2. eddy: nonzero linear and quadratic eddy + eddy phase
   run_config "$FEATURES" eddy    --eddy 0.03 --eddy-quad 0.01 --eddy-phase 0.02 >> "$OUTFILE"
@@ -223,6 +261,11 @@ for FEATURES in "cli" "cli,kspace,par"; do
   run_config "$FEATURES" parallel --coils 4 --accel 2   >> "$OUTFILE"
   # 4. multiband: within-volume motion dropout
   run_config "$FEATURES" mb      --mb 2 --dropout-rate 0.5 >> "$OUTFILE"
+  # 5. legacy: simulate_acquisition_legacy (o=1), also touched by changes 1, 2, 4, 5.
+  #    Eddy must be ON here: the legacy wrapper's own trap, (g/|g|)*|g| != g, is only
+  #    reachable through the eddy model, and with eddy off (kspace.rs:393-394) the gate
+  #    could not tell Some(g) from Some(bvec*bval).
+  run_config "$FEATURES" legacy  --oversample 1 --eddy 0.03 --eddy-quad 0.01 --eddy-phase 0.02 >> "$OUTFILE"
 done
 
 sort -k2 -o "$OUTFILE" "$OUTFILE"
@@ -236,7 +279,7 @@ cd /mnt/c/Users/tsalo/Documents/rust-trx/TRXScan
 cargo run --quiet --release --features cli --bin trxscan -- --help
 ```
 
-Expected: every flag used in `run_p0_baseline.sh` appears. `--eddy-quad`, `--eddy-phase`, `--dropout-rate`, `--mb`, `--accel`, `--coils`, and `--seed` are the ones to check; clap derives kebab-case from the field names at `src/bin/trxscan.rs:155-200`. Fix the script if any differ. The first build compiles the I/O stack from source (trx-rs, itk-transforms-rs, hdf5-metno-src) and needs network and cmake; expect it to take a while.
+Expected: every flag used in `run_p0_baseline.sh` appears. `--eddy-quad`, `--eddy-phase`, `--dropout-rate`, `--mb`, `--accel`, `--coils`, `--seed`, `--oversample`, and the five `--sim-*` flags are the ones to check; clap derives kebab-case from the field names at `src/bin/trxscan.rs:155-200`. Fix the script if any differ. The first build compiles the I/O stack from source (trx-rs, itk-transforms-rs, hdf5-metno-src) and needs network and cmake; expect it to take a while.
 
 - [ ] **Step 6: Generate the baseline**
 
@@ -247,7 +290,7 @@ tools/run_p0_baseline.sh tests/fixtures/p0_baseline/checksums.txt
 cat tests/fixtures/p0_baseline/checksums.txt
 ```
 
-Expected: 8 groups of output files (4 configs x 2 feature sets), each with at least a `part-mag` and `part-phase` NIfTI. Non-empty checksums for every line.
+Expected: 10 groups of output files (5 configs x 2 feature sets), each with at least a `part-mag` and `part-phase` NIfTI. Non-empty checksums for every line. The `legacy` runs print a `WARNING: --oversample 1 uses the legacy path` line on stderr; that is expected. The `mb` runs also write `_desc-dropout_slices.tsv`, which is checksummed with the rest.
 
 - [ ] **Step 7: Prove the baseline is reproducible**
 
@@ -269,9 +312,10 @@ git switch -c p0-mrsim-acq-extraction
 git add tools/gen_p0_fixture.py tools/run_p0_baseline.sh tests/fixtures/p0_baseline/
 git commit -m "test: add P0 bit-identity baseline fixture and checksums
 
-Captured at 57858a5 before any files move. Four configurations (plain,
-eddy, multi-coil GRAPPA, multiband dropout) under both --features cli and
---features cli,kspace,par. The scheme's b0 row is written the FSL way,
+Captured at 57858a5 before any files move. Five configurations (plain,
+eddy, multi-coil GRAPPA, multiband dropout, legacy o=1) under both
+--features cli and --features cli,kspace,par, on a two-grid fixture so
+the default oversampled entry point is the one under test. The scheme's b0 row is written the FSL way,
 bval=5 with a zero bvec, because that is the row interface change 2 puts
 at risk.
 
@@ -545,7 +589,9 @@ cd /mnt/c/Users/tsalo/Documents/rust-trx/mrsim-acq
 cargo build 2>&1 | head -40
 ```
 
-Expected failures name `crate::kspace` (from `phase.rs`'s `Rng` comment reference or `motion`'s use of grid helpers) or `crate::raster::Grid`. For `Grid`, change to `crate::grid::Grid`. For anything naming `kspace`, note it and leave it broken **only** if Task 4 will supply it; if `phase` or `motion` genuinely needs a symbol from a module that is not moving, stop and report rather than duplicating code.
+Expected failures name `crate::kspace` (from `phase.rs`'s `Rng` comment reference or `motion`'s use of grid helpers) or `crate::raster::Grid`. For `Grid`, change to `crate::grid::Grid`.
+
+One failure surfaces on the **TRXScan** side instead: `gnl.rs:433` calls `crate::motion::trilinear`, which is `pub(crate)` (`motion.rs:179`). Through the re-export that is now a foreign crate's private item. Make it `pub` in `mrsim-acq/src/motion.rs` with a one-line doc comment; `gnl` stays in TRXScan and its call site does not change. Also expect `motion.rs:250`'s doc link to `crate::compartments::generate_compartments_moving` to become a broken intra-doc link (rustdoc warning, not a build error); reword it to plain text naming TRXScan. For anything naming `kspace`, note it and leave it broken **only** if Task 4 will supply it; if `phase` or `motion` genuinely needs a symbol from a module that is not moving, stop and report rather than duplicating code.
 
 - [ ] **Step 5: Build and test both crates**
 
@@ -643,7 +689,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ### Task 5: Split io and forward the features
 
-`io.rs` splits by responsibility. The volume readers, grid helper, NIfTI header builder and array writers move; the streamline loaders, `write_benchmark`, `write_dwi`, `write_scalar_maps` and `subsample_streamlines` stay, because they depend on `trx-rs` or on TRXScan's own types. `write_complex_dwi` moves as-is and is split in Task 13.
+`io.rs` splits by responsibility. The volume readers, grid helper, NIfTI header builder and array writers move; the streamline loaders, `write_benchmark`, `write_dwi`, `write_scalar_maps` and `subsample_streamlines` stay, because they depend on `trx-rs` or on TRXScan's own types. `write_complex_dwi` and `SidecarInfo` **also stay, until Task 13**: the function takes `scheme: &GradientScheme` and calls the private `write_bval_bvec` (`io.rs:444`, `:450`), both TRXScan-only, so moving it verbatim would make `mrsim-acq` depend on TRXScan, a cycle. Task 13 creates `write_complex_4d` in `mrsim-acq` and deletes `write_complex_dwi` from TRXScan.
 
 **Files:**
 - Create: `mrsim-acq/src/io.rs`
@@ -651,11 +697,11 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `mrsim_acq::grid::Grid`
-- Produces: `mrsim_acq::io::{load_volume, hires_grid, write_3d, write_4d, write_3d_i16, write_complex_dwi, SidecarInfo}`, all behind the `io` feature, with signatures unchanged. `header_for_grid` stays private to the module.
+- Produces: `mrsim_acq::io::{load_volume, hires_grid, write_3d, write_4d, write_3d_i16}`, all behind the `io` feature, with signatures unchanged. `header_for_grid`, `affine_from_header`, and `quatern_to_mat44` move too and stay private to the module.
 
 - [ ] **Step 1: Create the moved half**
 
-Create `mrsim-acq/src/io.rs` containing, copied verbatim from `TRXScan/src/io.rs`: the `nifti`/`ndarray`/`nalgebra` imports, `load_volume` (`:208`), `hires_grid` (`:264`), `header_for_grid` (`:242`), `write_4d` (`:353`), `write_3d` (`:364`), `write_3d_i16` (`:374`), `SidecarInfo` (`:422`), `write_complex_dwi` (`:437`), and the `#[cfg(test)] mod tests` cases that exercise only those.
+Create `mrsim-acq/src/io.rs` containing, copied verbatim from `TRXScan/src/io.rs`: the `nifti`/`ndarray`/`nalgebra` imports, `affine_from_header` (`:164`) and `quatern_to_mat44` (`:184`) — private, but `load_volume` calls them at `:212` and does not compile without them — `load_volume` (`:208`), `hires_grid` (`:264`), `header_for_grid` (`:242`), `write_4d` (`:353`), `write_3d` (`:364`), `write_3d_i16` (`:374`), and the `#[cfg(test)] mod tests` cases that exercise only those. Not `SidecarInfo` or `write_complex_dwi`, for the reason above.
 
 Head it with:
 
@@ -670,9 +716,10 @@ Head it with:
 Delete the moved items from `TRXScan/src/io.rs` and add at the top:
 
 ```rust
-pub use mrsim_acq::io::{load_volume, hires_grid, write_3d, write_3d_i16, write_4d,
-                        write_complex_dwi, SidecarInfo};
+pub use mrsim_acq::io::{load_volume, hires_grid, write_3d, write_3d_i16, write_4d};
 ```
+
+`write_complex_dwi` and `SidecarInfo` remain defined in this file and call the re-exported `write_4d`.
 
 `load_tissue` (`io.rs:227`) stays and calls the re-exported `load_volume`.
 
@@ -691,8 +738,11 @@ In `TRXScan/Cargo.toml`, make the three shared features forward. Forgetting this
 ```toml
 io = ["dep:trx-rs", "dep:nifti", "dep:ndarray", "dep:nalgebra", "mrsim-acq/io"]
 kspace = ["dep:rustfft", "dep:ndarray", "dep:nalgebra", "dep:rand", "dep:rand_distr", "mrsim-acq/kspace"]
+config = ["dep:serde", "dep:toml", "mrsim-acq/config"]
 par = ["dep:rayon", "mrsim-acq/par"]
 ```
+
+`config` forwards too, and it is the one that fails loudly rather than silently: Task 3 re-exports `mrsim_acq::config` under TRXScan's `config` feature, and `mrsim-acq` gates the module on its own `config` feature, so without the forward `cargo build --features config` in TRXScan has nothing to re-export.
 
 - [ ] **Step 4: Verify the forwarding actually took**
 
@@ -701,7 +751,7 @@ cd /mnt/c/Users/tsalo/Documents/rust-trx/TRXScan
 cargo tree --features cli,kspace,par -p mrsim-acq -e features 2>/dev/null | head -20
 ```
 
-Expected: `mrsim-acq` appears with its `io`, `kspace`, and `par` features enabled. If they are absent the forwarding did not take, and the NUFFT path is silently off.
+Expected: `mrsim-acq` appears with its `io`, `kspace`, and `par` features enabled. If they are absent the forwarding did not take, and the NUFFT path is silently off. Also `cargo build --features config` in TRXScan, which must compile.
 
 - [ ] **Step 5: Confirm mrsim-acq never pulls HDF5**
 
@@ -851,10 +901,11 @@ The subtle part is the disabled predicate. Today `do_eddy` tests `bval.abs() > 1
 **Files:**
 - Modify: `mrsim-acq/src/kspace.rs` — `SliceInput` (`:269-272`), `simulate_slice` (`:391-394`, `:484`, `:663`), `simulate_acquisition_oversampled` (`:1237`), `simulate_acquisition_legacy` (`:1332-1350`)
 - Modify: `TRXScan/src/bin/trxscan.rs` — call site
+- Modify: `TRXScan/src/benchmark.rs` — `produce_slice` takes `bvec: [f64; 3], bval: f64` (`:61-62`) and forwards them into a `SliceInput` literal (`:85-95`); it becomes `eddy_drive: Option<[f64; 3]>`. `src/bin/trxscan_benchmark.rs` calls it. This file is easy to miss because it is a library module, not a binary, and the file-structure table above lists only binaries.
 
 **Interfaces:**
 - Consumes: `mrsim_acq::kspace::SliceInput`
-- Produces: `SliceInput { eddy_drive: Option<[f64; 3]>, .. }` replacing `bvec: [f64;3]` and `bval: f64`. `simulate_acquisition_oversampled` takes `eddy_drive: &[Option<[f64; 3]>]` of length `n_volumes` in place of `bvals`/`bvecs`.
+- Produces: `SliceInput { eddy_drive: Option<[f64; 3]>, .. }` replacing `bvec: [f64;3]` and `bval: f64`. `simulate_acquisition_oversampled` gains `eddy_drive: &[Option<[f64; 3]>]` of length `n_volumes` **alongside** `bvals`/`bvecs`, which Task 9 removes.
 
 - [ ] **Step 1: Write the failing tests for criteria 4 and 5**
 
@@ -877,11 +928,16 @@ fn eddy_drive_some_reproduces_the_bvec_bval_product() {
         eddy_drive: Some([bvec[0] * bval, bvec[1] * bval, bvec[2] * bval]),
         slice_seed: 7, eddy_lin: None,
     };
-    let got = simulate_slice(&inp, &acq);
-    // The expected values are the pre-extraction output for this configuration, regenerated
-    // once at Task 8 time by running this same input through the tag `p0-move-complete`.
-    assert!(got.iter().any(|(re, im)| re.abs() > 1e-6 || im.abs() > 1e-6),
-            "eddy path produced an all-zero slice; the drive is not reaching the model");
+    let got = simulate_slice_kspace(&inp, &acq);
+    // EXPECTED_BITS is this exact slice's first eight k-space coefficients as produced by the
+    // pre-change bvec/bval path at tag `p0-move-complete` (captured in Step 2, before the
+    // struct changes). Bit equality, not a tolerance: the drive is the same product the old
+    // code formed internally, so the arithmetic must be the same. A nonzero check would pass
+    // with eddy ignored entirely.
+    const EXPECTED_BITS: [(u64, u64); 8] = [/* paste from Step 2 */];
+    for (i, (re, im)) in got.iter().take(8).enumerate() {
+        assert_eq!((re.to_bits(), im.to_bits()), EXPECTED_BITS[i], "coefficient {i} moved");
+    }
 }
 
 #[test]
@@ -908,19 +964,24 @@ fn eddy_drive_none_disables_but_zero_vector_does_not() {
         assert!((a - c).abs() < 1e-6 && (b - d).abs() < 1e-6,
                 "zero-vector drive should match None numerically on this slice");
     }
-    // But they must not be collapsed into the same input: assert the predicate directly.
-    assert!(Some([0.0f64; 3]).is_some(), "Some([0;3]) must remain distinct from None");
+    // But they must not be collapsed into the same input. The eligibility decision lives in
+    // `eddy_enabled` (Step 4) so it can be pinned here: `is_some()`, never "is the vector zero".
+    assert!(eddy_enabled(&acq, Some([0.0; 3])), "a zero-vector drive must keep eddy enabled");
+    assert!(!eddy_enabled(&acq, None), "None must disable eddy");
+    assert!(!eddy_enabled(&Acquisition::default(), Some([1.0; 3])), "eddy_strength 0 disables");
 }
 ```
 
-- [ ] **Step 2: Run them to confirm they fail**
+- [ ] **Step 2: Capture the reference bits, then run the tests to confirm they fail**
+
+Before touching the struct, add a temporary test that builds the same slice with the *old* fields, `bvec: [0.6, 0.8, 0.0], bval: 1000.0`, and prints `(re.to_bits(), im.to_bits())` for the first eight entries of `simulate_slice_kspace(&inp, &acq)`. Run it with `cargo test print_eddy_reference -- --nocapture`, paste the eight pairs into `EXPECTED_BITS`, delete the temporary test. The tree is still at `p0-move-complete` plus Task 7's rename, so these are the pre-change numbers.
 
 ```bash
 cd /mnt/c/Users/tsalo/Documents/rust-trx/mrsim-acq
 cargo test eddy_drive 2>&1 | tail -20
 ```
 
-Expected: compile failure — `SliceInput` has no field `eddy_drive`.
+Expected: compile failure — `SliceInput` has no field `eddy_drive`, and `eddy_enabled` is undefined.
 
 - [ ] **Step 3: Change the struct**
 
@@ -940,15 +1001,26 @@ At `kspace.rs:391-394`:
 
 ```rust
     let gradient = inp.eddy_drive.unwrap_or([0.0; 3]);
-    let do_eddy = acq.eddy_strength != 0.0 && inp.eddy_drive.is_some();
+    let do_eddy = eddy_enabled(acq, inp.eddy_drive);
     let do_eddy_phase = acq.eddy_phase != 0.0 && inp.eddy_drive.is_some();
 ```
 
-`kspace.rs:484` and `:663` already read the local `gradient`, so they need no edit. Confirm with `grep -n "inp.bval\|inp.bvec" mrsim-acq/src/kspace.rs` returning nothing.
+with the decision factored out above `build_coil_kspace` so the test can pin it:
+
+```rust
+/// The eddy eligibility decision, in one place. `None` disables; `Some` enables even for a
+/// zero vector (the FSL b0 row, which must keep the NUFFT path disabled as it is today); a zero
+/// `eddy_strength` disables regardless.
+pub(crate) fn eddy_enabled(acq: &Acquisition, drive: Option<[f64; 3]>) -> bool {
+    acq.eddy_strength != 0.0 && drive.is_some()
+}
+```
+
+The test oracle `reference_coil_kspace` (`kspace.rs:1420-1423`) has the same three lines and gets the same replacement. `kspace.rs:484` and `:663` already read the local `gradient`, so they need no edit. Confirm with `grep -n "inp.bval\|inp.bvec" mrsim-acq/src/kspace.rs` returning nothing.
 
 - [ ] **Step 5: Change the entry point and the legacy wrapper**
 
-In `simulate_acquisition_oversampled`, replace the `bvals: &[f64], bvecs: &[[f64; 3]]` parameters with `eddy_drive: &[Option<[f64; 3]>]`, validate the length before the volume loop, and pass `eddy_drive[g]` into `SliceInput`:
+In `simulate_acquisition_oversampled`, **add** `eddy_drive: &[Option<[f64; 3]>]` next to the existing `bvals: &[f64], bvecs: &[[f64; 3]]` parameters, validate its length before the volume loop, and pass `eddy_drive[g]` into `SliceInput`. `bvals` and `bvecs` cannot go yet: `kspace.rs:1238` still feeds them to `phase.diffusion.shot(bvals[g], bvecs[g], ..)`, and rebuilding them from the product would change that call's operation order. Task 9 Step 5 deletes them when `prep_drive` replaces that call. Through Task 8, TRXScan's call site passes all three.
 
 ```rust
     assert_eq!(eddy_drive.len(), n_volumes,
@@ -1013,6 +1085,7 @@ The caller must **not** pre-normalize. The division by `n` has to stay inside th
 - Modify: `mrsim-acq/src/phase.rs:101-132`
 - Modify: `mrsim-acq/src/kspace.rs` — `SliceInput`, `:1238`
 - Modify: `TRXScan/src/bin/trxscan.rs`
+- Modify: `TRXScan/src/benchmark.rs` — `produce_slice` gains `prep_drive`, and its two tests build `DiffusionPhase { .. }.shot(0.0, [0.0; 3], ..)` (`:234-242`, `:265-272`), which follow the rename and the new parameter names; their `PhaseModel` literals use `..PhaseModel::none()` (`:240`) and need nothing. `bin/trxscan_benchmark.rs` constructs `PhaseModel` and may name the old field. The compiler lists every site.
 
 **Interfaces:**
 - Consumes: `mrsim_acq::phase::{PhaseModel, ShotPhase}`
@@ -1059,11 +1132,12 @@ In `mrsim-acq/src/phase.rs`, rename `DiffusionPhase` to `PrepPhase` and change `
 pub struct PhaseModel {
     pub global: f64,
     pub background: BackgroundPhase,
-    pub shot: ShotPhase,
     /// Preparation-gradient phase. `None` for a sequence with no large prep gradient.
     pub prep: Option<PrepPhase>,
 }
 ```
+
+`ShotPhase` is not a field and never was (`phase.rs:132-137`); a realized shot is passed to `PhaseModel::at` per call (`phase.rs:141`).
 
 - [ ] **Step 5: Thread the drive through k-space**
 
@@ -1085,7 +1159,7 @@ Replace the call at `kspace.rs:1238`:
             };
 ```
 
-Add `prep_drive: &[Option<(f64, [f64; 3])>]` to the entry point with the same length assertion as `eddy_drive`.
+Add `prep_drive: &[Option<(f64, [f64; 3])>]` to the entry point with the same length assertion as `eddy_drive`, and **delete the `bvals`/`bvecs` parameters**: the call just replaced was their last reader. Confirm with `grep -n "bvals\|bvecs" mrsim-acq/src/kspace.rs`, which should return only the legacy wrapper's local names. TRXScan's call site drops the two arguments in the same step.
 
 - [ ] **Step 6: Update TRXScan's call site**
 
@@ -1126,6 +1200,7 @@ The structural change, and the one the spec warns is not a one-line edit. `kspac
 **Files:**
 - Modify: `mrsim-acq/src/kspace.rs` — new types, `SliceInput` (`:255-280`), `simulate_slice` (`:647-653`, `:695-698`), NUFFT gate (`:540`), `reference_coil_kspace` (`:1479`), entry point (`:1188`, `:1223`)
 - Modify: `TRXScan/src/bin/trxscan.rs`, `trxscan_benchmark.rs` — wrap scalars in `T2Volume::Uniform`
+- Modify: `TRXScan/src/benchmark.rs` — `produce_slice(.., t2: &[f32], ..)` (`:52`) becomes `t2: &[T2Slice]` with `t_inhom: None` in its `SliceInput` literal
 
 **Interfaces:**
 - Consumes: everything from Tasks 8-9
@@ -1178,9 +1253,10 @@ fn varying_t2_map_matches_the_literal_sum() {
         eddy_drive: None, prep_drive: None, slice_seed: 5, eddy_lin: None,
     };
     let got = simulate_slice_kspace(&inp, &acq);
-    let want = reference_coil_kspace(&inp, &acq);
-    for ((gr, gi), (wr, wi)) in got.iter().zip(want.iter()) {
-        assert!((gr - wr).abs() < 1e-10 && (gi - wi).abs() < 1e-10,
+    // (inp, acq, coil, ncoils) -> Vec<C>, per kspace.rs:1403; single coil here.
+    let want = reference_coil_kspace(&inp, &acq, 0, 1);
+    for ((gr, gi), w) in got.iter().zip(want.iter()) {
+        assert!((gr - w.re).abs() < 1e-10 && (gi - w.im).abs() < 1e-10,
                 "restructured forward diverged from the literal sum");
     }
 }
@@ -1265,8 +1341,8 @@ pub fn validate_acquisition_timing(acq: &Acquisition, nx: usize, ny: usize) -> R
         let need = acq.t_echo - worst;
         return Err(format!(
             "trf = {worst:.3} ms <= 0 on an acquired line: the readout starts before the \
-             excitation. Raise t_echo to at least {need:.3} ms, or shorten the readout with \
-             partial Fourier."));
+             excitation. Raise t_echo above {need:.3} ms or shorten t_line. Partial Fourier \
+             does not help: it drops low-ky lines, which this trajectory reads last."));
     }
     let _ = t_ms;
     Ok(())
@@ -1285,7 +1361,27 @@ Replace `kspace.rs:647-653` with a uniformity test hoisted above the line loop, 
         && inp.t_inhom.map_or(true, |ti| ti.iter().all(|s| matches!(s, T2Slice::Uniform(_))));
 ```
 
-When `uniform`, keep the existing `rel[c]` loop exactly as it is, reading the scalar out of the enum. When not, leave `rel` unused and evaluate inside the voxel loop at `kspace.rs:695-698`:
+When `uniform`, keep the existing `rel[c]` loop, reading both scalars out of their enums. The per-compartment `t_inhom` **must** be read here too, not only in the map branch: `class` mode in aslscan passes `Uniform` T2' per label and expects it honoured on the fast path, and nothing in P0's gate would notice if it were silently ignored, because TRXScan always passes `None`.
+
+```rust
+        for (c, w) in rel.iter_mut().enumerate() {
+            *w = if acq.do_relaxation {
+                let T2Slice::Uniform(t2c) = t2[c] else { unreachable!("uniform branch") };
+                let tic = match inp.t_inhom.map(|ti| ti[c]) {
+                    None => acq.t_inhom,
+                    Some(T2Slice::Uniform(v)) => v as f64,
+                    Some(T2Slice::Map(_)) => unreachable!("uniform branch"),
+                };
+                (-trf / t2c as f64 - t.abs() * 1000.0 / tic).exp()
+            } else {
+                1.0
+            };
+        }
+```
+
+With `t_inhom: None` the expression is `-trf / t2c as f64 - t.abs() * 1000.0 / acq.t_inhom`, the same operations in the same order as today, which is what keeps the gate. Add a fifth test to Step 1, `uniform_t_inhom_overrides_the_acquisition_scalar`: the same slice with `t_inhom: Some(&[T2Slice::Uniform(20.0)])` and `acq.t_inhom = 50.0` must differ from the `None` run, and must equal the run with `t_inhom: None, acq.t_inhom = 20.0` bit for bit.
+
+When not uniform, leave `rel` unused and evaluate inside the voxel loop at `kspace.rs:695-698`:
 
 ```rust
                 for (c, comp) in compartments.iter().enumerate() {
@@ -1395,22 +1491,29 @@ fn per_volume_slice_lengths_are_validated_before_the_loop() {
     let t2 = [T2Volume::Uniform(100.0)];
     let fmap = vec![0.0f32; 16];
     let acq = Acquisition::default();
-    let phase = PhaseModel { global: 0.0, background: Default::default(),
-                             shot: Default::default(), prep: None };
+    let phase = PhaseModel { global: 0.0, background: Default::default(), prep: None };
+    // The panic MESSAGE is asserted, not the panic. An out-of-bounds `tr[g]` (kspace.rs:1257)
+    // already panics today, so `is_err()` would pass before any validation exists.
+    fn message(r: std::thread::Result<(Vec<f32>, Vec<f32>)>) -> String {
+        let e = r.expect_err("must panic");
+        e.downcast_ref::<String>().cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
     // Two volumes, but only one drive entry.
     let r = std::panic::catch_unwind(|| {
         simulate_acquisition_oversampled(
             dims, dims, 2, &images, &t2, &fmap, None, &acq,
             &[None], &[None, None], &phase, 1, None, None)
     });
-    assert!(r.is_err(), "a short eddy_drive slice must be rejected");
+    assert!(message(r).contains("eddy_drive has 1 entries for 2 volumes"));
 
     let r = std::panic::catch_unwind(|| {
         simulate_acquisition_oversampled(
             dims, dims, 2, &images, &t2, &fmap, None, &acq,
             &[None, None], &[None, None], &phase, 1, None, Some(&[[0.0; 3]]))
     });
-    assert!(r.is_err(), "a short eddy_trace slice must be rejected");
+    assert!(message(r).contains("eddy_trace has 1 entries for 2 volumes"));
 }
 ```
 
@@ -1421,7 +1524,7 @@ cd /mnt/c/Users/tsalo/Documents/rust-trx/mrsim-acq
 cargo test per_volume_slice_lengths 2>&1 | tail -10
 ```
 
-Expected: the second assertion fails — `eddy_trace` is not yet validated.
+Expected: the second assertion fails. The call does panic, but with `index out of bounds` from `tr[g]` at `kspace.rs:1257`, not with the validation message, which does not exist yet.
 
 - [ ] **Step 3: Rename and validate**
 
@@ -1582,7 +1685,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 ### Task 13: Change 8 — split the complex writer, then run the full gate
 
-`write_complex_dwi` and `SidecarInfo` become `write_complex_4d` plus a sidecar struct carrying only what both modalities share. `.bval`/`.bvec` writing moves back to TRXScan. Ends with every acceptance criterion run in one pass.
+`write_complex_dwi` becomes `write_complex_4d` in `mrsim-acq`, and `SidecarInfo` moves with it now (Task 5 left both in TRXScan because `write_complex_dwi` names `GradientScheme`). `.bval`/`.bvec` writing stays in TRXScan as `write_dwi_scheme`, and `write_complex_dwi` is deleted. Ends with every acceptance criterion run in one pass.
 
 **Files:**
 - Modify: `mrsim-acq/src/io.rs`
@@ -1613,7 +1716,9 @@ pub fn write_complex_4d(
     grid: &Grid,
     info: &SidecarInfo,
 ) -> R<()> {
-    let p = |tail: &str| format!("{out_prefix}{tail}");
+    // PathBuf, as io.rs:447 has it: `write_4d` takes `&Path` (io.rs:353) and `&String` does
+    // not coerce to it.
+    let p = |tail: &str| PathBuf::from(format!("{out_prefix}{tail}"));
     write_4d(&p(&format!("_part-mag_{suffix}.nii.gz")), dims, n_volumes, mag, grid)?;
     write_4d(&p(&format!("_part-phase_{suffix}.nii.gz")), dims, n_volumes, phase, grid)?;
     // the sidecar-writing tail of the old body follows here unchanged, with `_dwi.json`
@@ -1631,7 +1736,9 @@ In `TRXScan/src/io.rs`:
 pub fn write_dwi_scheme(out_prefix: &str, scheme: &GradientScheme) -> R<()> {
     // The `write_bval_bvec` call lifted out of write_complex_dwi (io.rs:450), with the same
     // `_dwi.bval` / `_dwi.bvec` names it wrote before.
-    let p = |tail: &str| format!("{out_prefix}{tail}");
+    // PathBuf, as io.rs:447 has it: `write_4d` takes `&Path` (io.rs:353) and `&String` does
+    // not coerce to it.
+    let p = |tail: &str| PathBuf::from(format!("{out_prefix}{tail}"));
     write_bval_bvec(&p("_dwi.bval"), &p("_dwi.bvec"), scheme)
 }
 ```
@@ -1698,7 +1805,7 @@ git tag p0-complete
 | 3. Bit-identical `trxscan` output, both feature sets | Task 1 (baseline), Task 6, and every task from 7 on |
 | 4. `eddy_drive: Some(bvec * bval)` reproduces the old eddy path | Task 8 Step 1, first test |
 | 5. `None` disables as `bval.abs() > 1e-9` did; `Some([0;3])` does not | Task 8 Step 1, second test |
-| 6. Two map-path tests; `trf <= 0` rejected | Task 10 Step 1, four tests |
+| 6. Two map-path tests; `trf <= 0` rejected | Task 10 Step 1, five tests |
 | 7. No new clippy warnings | Task 13 Step 5 |
 
 ## What P0 does not do

@@ -220,8 +220,11 @@ adds nothing that was not there.
 | `class` | Force the decomposition. Error, naming the first offending label and voxel, if the test fails. |
 | `voxel` | Force the single-compartment `Map` form, whatever the phantom looks like. |
 
-The constancy test is exact bitwise equality of `T1`, `T2`, and the **derived** `T2'` within each
-foreground `dseg` label. Testing derived T2' rather than raw T2\* matters, because the derivation
+The constancy test is exact bitwise equality of `T2` and the **derived** `T2'` within each
+foreground `dseg` label. `T1`, `M0`, perfusion, and transit time are deliberately not tested:
+`kinetic` and `mrsignal` run per phantom voxel before the decomposition (see grids and
+resampling), so nothing downstream of them needs those to be uniform, and requiring it would
+push a phantom with a smooth T1 map and tabulated T2 onto the slow path for no reason. Testing derived T2' rather than raw T2\* matters, because the derivation
 collapses several raw cases to `INFINITY`: a label whose T2\* varies only among values that all
 exceed its T2 is constant in T2' even though it is not constant in T2\*. Bitwise rather than
 tolerant, because a converted phantom is painted from a table of constants and any spread in it
@@ -243,16 +246,27 @@ The compartment count is no longer fixed at two, so the order is pinned. For `K`
 labels sorted ascending:
 
 ```
-compartments[0 .. K)   tissue, one per foreground label, in sorted label order
-compartments[K]        labeled blood
-compartments[K + 1]    arterial blood            (P4, not P1)
+compartments[0 .. K)    tissue, one per foreground label, in sorted label order
+compartments[K .. 2K)   labeled blood, one per foreground label, same order
+compartments[2K]        arterial blood            (P4, not P1)
 ```
 
-`voxel` mode is the `K = 1` case of this, with the single tissue compartment carrying maps instead
-of scalars. Everywhere this document says "the tissue compartment" it means `0..K`, and "the blood
-compartment" means index `K`. The row semantics table, `mrsignal`, and the linearity property all
-read in those terms: `mrsignal` applies the tissue signal equation to each of `0..K` with that
-label's constants, and the linearity property varies only index `K`.
+The blood is decomposed by label too, and that is forced rather than chosen. The blood
+compartment's T2' is the T2' of the tissue the labeled water sits in, since susceptibility
+dropout acts on both. In `voxel` mode that is one shared map. In `class` mode there is no single
+map, only `K` uniform values, and a blood compartment can carry one value or a map. One value
+would give WM-resident label GM's dropout; a map would take the whole slice off the fast path,
+which is the thing `class` mode exists to keep. So label `i`'s blood is compartment `K + i`,
+with `T2 = T2_blood` and label `i`'s uniform T2'. A label with zero perfusion everywhere, CSF in
+the ASLDRO phantom, still gets its compartment; it is all zeros and costs one extra row pass,
+and a fixed layout is worth more than the saving.
+
+`voxel` mode is the `K = 1` case of this, with the two compartments carrying maps instead of
+scalars. Everywhere this document says "the tissue compartment" it means `0..K`, and "the blood
+compartment" means `K..2K`. The row semantics table and the linearity property read in those
+terms: a row's tissue input is applied to every `0..K` and its blood input to every `K..2K`, and
+the linearity property varies only `K..2K`. `mrsignal` is not per compartment at all; it runs per
+phantom voxel and the decomposition masks its output.
 
 The mode and the resolved label ordering are recorded in the output sidecar, because together they
 determine what a per-compartment debug dump means.
@@ -302,15 +316,22 @@ background `T2 == 0` to `INFINITY`, as it does for `T2'`.
 
 **`trf` must be positive on every acquired line.** `trf = t_echo + t` goes negative for early
 lines whenever `t_echo` is shorter than the time from the first acquired line to the echo. TRXScan
-never hits this at TE 88 ms. ASL will: TE near 12 ms with a 64-line, 0.5 ms/line full-Fourier
-readout puts the first line 16 ms before the echo. A negative `trf` is a readout that starts
-before the excitation, and the code responds with signal *growth*, `exp(+|trf|/T2)`. The entry
-point rejects an `Acquisition` whose earliest acquired line (after the partial-Fourier and GRAPPA
-mask) has `trf <= 0`, naming the minimum feasible `t_echo`. This is a new check, it cannot fire on
-any currently valid TRXScan configuration. It is why a short-TE ASL protocol must declare partial
-Fourier or a `TotalReadoutTime` short enough to fit, as a real one does. Line timing here follows
-the line index, not the sampling mask (`line_times`, `kspace.rs:237`), so GRAPPA shortens the
-readout only through the effective `TotalReadoutTime` the sidecar reports, never through `accel`.
+never hits this at TE 88 ms. ASL will: TE 12 ms with a 64-line, 0.5 ms/line readout puts the
+centre of the first line 15.75 ms before the echo, so `trf = -3.75 ms`. A negative `trf` is a
+readout that starts before the excitation, and the code responds with signal *growth*,
+`exp(+|trf|/T2)`. The entry point rejects an `Acquisition` whose earliest acquired line (after the
+sampling mask) has `trf <= 0`, naming the `t_echo` the protocol must exceed. This is a new check
+and it cannot fire on any currently valid TRXScan configuration.
+
+The only remedies in this model are a longer `EchoTime` or a shorter `TotalReadoutTime`. Partial
+Fourier is **not** one, although a scanner's is. `sampling_mask` drops the low-ky lines
+(`kspace.rs:341-356`), the trajectory visits low ky *last* in both polarities (`readout.rs:44-56`),
+and `line_times` (`kspace.rs:237`) times lines by index regardless of the mask, so partial Fourier
+removes late lines and leaves the early ones exactly where they were. The 64-line example has the
+same `trf` minimum at partial Fourier 1, 3/4, and 1/2. GRAPPA does not help either, for the same
+reason: the readout shortens only through the effective `TotalReadoutTime` the sidecar reports,
+never through `accel`. A line timing in which partial Fourier shortens the pre-echo readout is a
+change to the readout model and is listed under deferred decisions.
 
 ### 2. Diffusion gradients become a generic eddy drive
 
@@ -351,9 +372,10 @@ diffusion gradient in one consumer and a crusher or labeling gradient in the oth
 
 ### 4. The diffusion phase component becomes optional, and gets its own drive
 
-`PhaseModel` (`phase.rs:132`) holds `BackgroundPhase`, `ShotPhase`, and `DiffusionPhase`
-(`phase.rs:101`). The third becomes `prep: Option<PrepPhase>`, with the same fields and the same
-evaluation. TRXScan constructs it; aslscan leaves it `None` until P4 introduces vascular crushing.
+`PhaseModel` (`phase.rs:132`) holds a global phase, a `BackgroundPhase`, and a `DiffusionPhase`
+(`phase.rs:101`); a realized `ShotPhase` is not a field but is passed to `PhaseModel::at` per call
+(`phase.rs:141`). The `DiffusionPhase` becomes `prep: Option<PrepPhase>`, with the same fields and
+the same evaluation. TRXScan constructs it; aslscan leaves it `None` until P4 introduces vascular crushing.
 
 `PrepPhase` needs a per-volume drive of its own, and `eddy_drive` cannot serve.
 `DiffusionPhase::shot` forms `q_eff = c_q * sqrt(bval) * bvec_unit` (`phase.rs:110-117`), which is
@@ -401,7 +423,7 @@ pub fn simulate_acquisition_oversampled(
     images: &[Vec<f32>],
     t2: &[T2Volume],
     fmap: &[f32],
-    t_inhom: Option<&[f32]>,
+    t_inhom: Option<&[T2Volume]>,             // one per compartment, see change 6
     acq: &Acquisition,
     eddy_drive: &[Option<[f64; 3]>],           // length n_volumes
     prep_drive: &[Option<(f64, [f64; 3])>],    // length n_volumes
@@ -413,7 +435,8 @@ pub fn simulate_acquisition_oversampled(
 ```
 
 `ngrad` becomes `n_volumes`, the `bvals`/`bvecs` pair becomes the two drive slices, and `t_inhom`
-carries the per-voxel map from change 6, on the simulation grid with the fieldmap's layout. Both
+carries the per-compartment T2' of change 6, each entry `Uniform` or a `Map` on the simulation
+grid with the fieldmap's layout. Both
 drive slices must have length `n_volumes`; a mismatch is rejected before the volume loop. So must
 `eddy_trace` when present: it is indexed `tr[g]` inside the loop (`kspace.rs:1257`), and today
 only TRXScan's CLI checks its length (`trxscan.rs:868-885`). An extracted public entry point
@@ -479,18 +502,18 @@ or `INFINITY`, never zero or `NaN`. aslscan derives T2' from the phantom as
 `class` mode. The derivation is total, and the stored map contains only finite positive values or
 `INFINITY` — never zero, never negative, never `NaN`.
 
-| `T2` | `T2star` | Stored `T2'` |
+| `dseg` | `T2`, `T2star` | Stored `T2'` |
 |---|---|---|
-| positive | positive, `< T2` | `1 / (1/T2star - 1/T2)`, finite positive |
-| positive | positive, `>= T2` | `INFINITY` (no inhomogeneity decay) |
-| positive | zero | `INFINITY` |
-| zero | any | `INFINITY` (background; the compartment is zero there anyway) |
-| any | any, either `NaN` | rejected at load |
+| background (0) | anything finite | `INFINITY`; the compartments are zero there and the values are never read |
+| foreground | `0 < T2star < T2` | `1 / (1/T2star - 1/T2)`, finite positive |
+| foreground | `0 < T2 <= T2star` | `INFINITY` (no inhomogeneity decay) |
+| foreground | either zero or negative | rejected at load, naming label and voxel |
+| any | either `NaN` or infinite | rejected at load, naming the voxel |
 
-`phantom` validates that every T2 and T2\* voxel is finite and non-negative, and rejects the map
-naming the first offending voxel otherwise. Background voxels are expected to be zero in a
-converted phantom and are not an error. `T2star > T2` is physically impossible but common in
-noisy real maps, so it is tolerated as no inhomogeneity decay rather than rejected.
+The same rule applies to T1 and M0 in the foreground. Background voxels are expected to be zero
+in a converted phantom and are not an error. `T2star > T2` is physically impossible but common in
+noisy real maps, so it is tolerated as no inhomogeneity decay rather than rejected. The rows are
+the same in `class` and `voxel` mode; `class` mode merely evaluates them once per label.
 
 A floored rate of zero means no inhomogeneity decay, and it must not be stored as `T2' = 0`. The
 decay term at `kspace.rs:649` divides by `t_inhom`. A stored zero gives `x/0`, which is `INFINITY`
@@ -572,7 +595,7 @@ holds only `benchmark_cli.rs`), so building it is the first task of P0, not a by
 protocol   asl.json + aslcontext.tsv (+ optional TOML overlay) -> Protocol
 phantom    BIDS-derivatives maps -> Phantom
 kinetic    Buxton general kinetic model -> delta_m
-mrsignal   post-excitation magnetization -> two compartments (spin echo only in P1)
+mrsignal   post-excitation magnetization, per phantom voxel (spin echo only in P1)
 resample   phantom grid -> simulation grid and acquisition grid
 series     volume list from aslcontext, assembles the 4D compartments, calls mrsim-acq once
 bids       part-mag / part-phase NIfTI, aslcontext.tsv, sidecar, ground-truth maps
@@ -589,9 +612,9 @@ BIDS phantom maps -----------+
                               |
                        kinetic::gkm  ->  delta_m
                               |
-                       mrsignal      ->  [tissue (T2_tissue), blood (T2_blood)]
+                       mrsignal      ->  tissue, blood  (per phantom voxel)
                               |
-                       resample      ->  simulation grid
+                       resample      ->  simulation grid, split by label in class mode
                               |
              mrsim_acq::simulate_acquisition_oversampled
                               v
@@ -600,9 +623,14 @@ BIDS phantom maps -----------+
 
 One volume per row of `aslcontext.tsv`, and one call to the acquisition stage for the whole
 series. The rows are volumes of a single call, not separate calls, for the seeding reason given
-under P0 change 5a. The static tissue compartment is identical in every `control` and `label`
-volume and is replicated into the 4D layout the entry point takes. At 128 x 128 x 40 simulation
-voxels and 60 volumes that is about 160 MB per compartment, which is accepted.
+under P0 change 5a. The static tissue signal depends on the row only through its resolved
+repetition time, `M0 (1 - exp(-TR/T1))`, so it is computed once per distinct
+`RepetitionTimePreparation` value and replicated into the 4D layout the entry point takes across
+the rows that share it; with a scalar `RepetitionTimePreparation` that is once. At 128 x 128 x 40 simulation
+voxels and 60 volumes that is about 160 MB per compartment, and `class` mode on the ASLDRO
+phantom has six of them, so roughly 1 GB. That is accepted for P1; if it becomes a problem the
+remedy is an entry-point variant that takes a per-volume closure instead of materialised 4D
+arrays, which is an `mrsim-acq` change and not an aslscan one.
 
 ## Protocol contract
 
@@ -611,8 +639,8 @@ voxels and 60 volumes that is about 160 MB per compartment, which is accepted.
 `ArterialSpinLabelingType`, `LabelingDuration`, `PostLabelingDelay`, `BolusCutOffFlag`,
 `BolusCutOffTechnique`, `BolusCutOffDelayTime`, `BackgroundSuppression`, `M0Type`,
 `RepetitionTimePreparation`, `EchoTime`, `MagneticFieldStrength`, `AcquisitionVoxelSize`,
-`SliceTiming`, `PhaseEncodingDirection`, `TotalReadoutTime`, `ParallelReductionFactorInPlane`,
-`MultibandAccelerationFactor`.
+`MRAcquisitionType`, `SliceTiming`, `SliceEncodingDirection`, `PhaseEncodingDirection`,
+`TotalReadoutTime`, `ParallelReductionFactorInPlane`, `MultibandAccelerationFactor`.
 
 `PostLabelingDelay`, `LabelingDuration`, and `RepetitionTimePreparation` are each a scalar or an
 array. BIDS defines the array form as one value **per volume**, in acquisition order, `m0scan`
@@ -684,15 +712,21 @@ oversampling factor. The overlay maps onto `mrsim_acq::Acquisition`, but not one
 gaps are where mistakes will land.
 
 `protocol` checks the resolved timing before anything is simulated: the echo time must leave
-every acquired line after the excitation (P0 change 1). A short-TE full-Fourier protocol fails
-here, with the minimum feasible `EchoTime` and the `partial_fourier` that would fit in the
-message, rather than deep inside the acquisition stage.
+every acquired line after the excitation (P0 change 1). A short-TE protocol with a long
+`TotalReadoutTime` fails here, with the `EchoTime` it must exceed and the `TotalReadoutTime` that
+would fit in the message, rather than deep inside the acquisition stage. Partial Fourier and
+in-plane acceleration do not shorten the pre-echo readout in this model (change 1), so the
+message does not suggest them.
 
 **Units.** `Acquisition` is in milliseconds throughout: `t_line`, `t_echo`, `t_inhom`, `eddy_tau`
-(`kspace.rs:147-175`), as is `readout.rs`. BIDS and the phantom are in seconds. The conversion
-boundary is `protocol`: everything leaving it is milliseconds, and nothing downstream converts
-again. The same applies to the phantom's T2, T2\*, and the blood T2 default, which are stated in
-seconds in this document and stored in milliseconds once loaded.
+(`kspace.rs:147-175`), as is `readout.rs`. BIDS, the phantom, and simasl are in seconds, and so is
+the kinetic model: `f = perfusion / 6000` is per second (`gkm_filter.py:105`) and is summed with
+`1/T1t` (`gkm_filter.py:141-153`), so `kinetic` and `mrsignal` run in seconds, with the labeling
+times, T1, and TR untouched. The conversion boundary is the hand-off to the acquisition stage:
+`protocol` converts `EchoTime` and `TotalReadoutTime` to milliseconds for `Acquisition`, and
+`phantom` converts T2, T2\*, the derived T2', and the blood T2 default to milliseconds for the
+`T2Volume` inputs. Nothing downstream of that boundary converts again, and nothing upstream of it
+is in milliseconds.
 
 **Derived fields.** These have no direct counterpart and must be computed:
 
@@ -754,8 +788,26 @@ the phantom's T2\* map and a supplied fieldmap are independent inputs: nothing c
 intravoxel dephasing one implies is consistent with the field gradients of the other.
 
 `tools/hrgt_to_bids.py`, run in the `simasl` micromamba environment, converts ASLDRO's packed 5D
-`hrgt_icbm_2009a_nls_v3` ground truth into this layout. That provides a real phantom from the
-first commit.
+ground truth into this layout. ASLDRO v2.2.0 ships two, `hrgt_icbm_2009a_nls_3t` and
+`hrgt_icbm_2009a_nls_1.5t` (`src/asldro/data/filepaths.py`); an earlier revision of this spec
+named a `_v3` that does not exist. Each is a 197 x 233 x 189 x 1 x 7 float64 NIfTI at 1 mm with
+the quantities `perfusion_rate`, `transit_time`, `t1`, `t2`, `t2_star`, `m0`, and `seg_label`,
+and a JSON carrying units, the segmentation names (`grey_matter` 1, `white_matter` 2, `csf` 3),
+and a `parameters` block with `lambda_blood_brain`, `t1_arterial_blood`, and
+`magnetic_field_strength`. That provides a real phantom from the first commit.
+
+The converter writes the `parameters` block and the label names into a top-level `phantom.json`.
+The phantom's `lambda_blood_brain` and `t1_arterial_blood` take precedence over the field-strength
+defaults in the protocol contract and yield to the overlay, so the kinetic constants the oracle
+was built with are the ones the port uses unless someone says otherwise. A phantom whose
+`magnetic_field_strength` disagrees with the sidecar's `MagneticFieldStrength` is an error: the
+relaxation values in the maps are field-specific, and simulating a 1.5 T phantom under a 3 T
+protocol produces a dataset that is neither.
+
+In these phantoms every map is exactly constant within each label (checked bitwise, 2026-09-23),
+so `auto` resolves to `class` with `K = 3`. CSF carries `transit_time = 1000 s` as a
+never-arrives sentinel with zero perfusion, which the kinetic model handles by the not-arrived
+branch and which the ground-truth writer must not average into neighbouring voxels; see below.
 
 ## Grids and resampling
 
@@ -785,16 +837,12 @@ phantom slices.
 per foreground label on the phantom grid, each zero outside its label. Each of those images is
 then box-averaged to the simulation grid independently. A boundary simulation voxel therefore
 holds a fractional contribution in each of the labels it straddles, every one of which still
-carries its own label's uniform T1, T2, and T2'. Nothing is averaged that is not magnetization.
+carries its own label's uniform T2 and T2'. Nothing is averaged that is not magnetization.
 
 Averaging the T2 map first and then splitting would defeat the whole decomposition: a boundary
 voxel would acquire an intermediate T2 belonging to no tissue, the constancy test would fail on
 the resampled grid, and the run would silently fall back to `voxel` mode. The order is not an
 implementation detail.
-
-In `voxel` mode there is one tissue image, box-averaged the same way, and the relaxation maps are
-resampled as **rates**, magnetization-weighted. That is an approximation and is labeled as one
-below.
 
 This order matters. Magnetization is what physically adds within a voxel, so averaging it gives
 the correct partial-volume signal. Averaging perfusion, transit time, or T1 first and then
@@ -805,17 +853,29 @@ Because `SliceTiming` makes `t` depend on the acquired slice, `kinetic` is evalu
 acquired slice, over the slab of phantom voxels that slice overlaps, at that slice's `t`. A
 phantom voxel straddling two acquired slices contributes to each at that slice's timing.
 
-The relaxation maps cannot follow the same rule, because a voxel has one decay rate per
-compartment in `mrsim-acq`. The T2 and T2' maps on the simulation grid are the
-magnetization-weighted mean of the **rates** `1/T2` and `1/T2'` over the overlapped phantom
-voxels, inverted back to times, with a zero mean rate stored as `INFINITY`. This is the
-first-order-correct single-exponential stand-in for a multi-exponential voxel, and it is an
-approximation: it is exact where the simulation voxel is homogeneous and slightly overstates
-decay where it is not. The fieldmap is volume-weighted averaged.
+In `voxel` mode the relaxation maps cannot follow the same rule, because a voxel has one decay
+rate per compartment in `mrsim-acq`, fixed for the whole call. The T2 and T2' maps on the
+simulation grid are the mean of the **rates** `1/T2` and `1/T2'` over the overlapped phantom
+voxels, weighted by the phantom's equilibrium `M0`, inverted back to times, with a zero mean rate
+(or a zero total weight) stored as `INFINITY`. The weight is `M0` and not the signal, on purpose.
+The signal differs between the compartments and, for the blood compartment, between volumes:
+`delta_m` is zero in every `control` row and follows the delivery state in every `label` row,
+while the maps must be one value per voxel per compartment for the series. `M0` is static and
+shared. For the tissue compartment this is the first-order-correct single-exponential stand-in
+for a multi-exponential voxel, exact where the simulation voxel is homogeneous and slightly
+overstating decay where it is not. For the blood compartment's T2' it is a further
+approximation: the label in a mixed voxel sits preferentially in whichever tissue has received
+it, and an `M0`-weighted rate does not know that. Both rate-derived maps are written under
+`ground-truth/` as `desc-acq_T2map` and `desc-acq_T2primemap`, distinct from the plain
+volume-weighted `T2map` that section describes, so the approximation is inspectable. `class` mode has no such step, which is the cross-check under change 1.
+The fieldmap is volume-weighted averaged in both modes.
 
 Ground-truth outputs on the acquisition grid use the same machinery: `delta_m` and the tissue
 signal are box-averaged, and the parameter maps (`perfusion`, `att`, T1, T2) are plain
-volume-weighted means, labelled as such in their sidecars. `dseg` is resampled by majority vote.
+volume-weighted means, labelled as such in their sidecars. `att` is the exception: it is
+averaged over the perfused phantom voxels only (`perfusion > 0`) and written as zero where there
+are none, because the ASLDRO phantom marks CSF with a 1000 s sentinel that a plain mean would
+smear into every voxel bordering a ventricle. `dseg` is resampled by majority vote.
 
 ## Kinetic model
 
@@ -918,19 +978,19 @@ rather than folded into tissue M0.
 
 ```
 class mode, K foreground labels:
-  compartments[0..K)  static tissue, one per label   T2, T2' uniform per label
-  compartments[K]     labeled blood                  T2 = T2_blood, T2' uniform
+  compartments[0..K)   static tissue, one per label   T2, T2' uniform per label
+  compartments[K..2K)  labeled blood, one per label   T2 = T2_blood, T2' of that label
 
 voxel mode (K = 1):
-  compartments[0]     static tissue                  T2 = T2map, T2' = derived map
-  compartments[1]     labeled blood                  T2 = T2_blood, T2' = tissue map
+  compartments[0]      static tissue                  T2 = T2map, T2' = derived map
+  compartments[1]      labeled blood                  T2 = T2_blood, T2' = tissue map
 ```
 
 simasl instead adds `delta_m` to `M0` as `mag_enc` before relaxation
 (`src/asldro/filters/acquire_mri_image_filter.py:46`), so the label relaxes at tissue T2.
 Separating the compartments lets the label carry its own T2, and `mrsim-acq` does decay each
 compartment independently across the readout and sum them coherently before spatial encoding
-(`kspace.rs:647`, `kspace.rs:677`). Compartment index 2 is where P4's arterial component goes.
+(`kspace.rs:647`, `kspace.rs:677`). Compartment index `2K` is where P4's arterial component goes.
 
 The claim stops there. Assigning all of `delta_m` blood T2 is a modeling choice, not an
 unambiguous correction. GKM `delta_m` is the total perfusion contrast under single-compartment
@@ -942,7 +1002,8 @@ work. What P1 buys is the compartment slot and an explicit knob, not better phys
 
 `T2_blood` is a scalar, not a map, because the phantom has no blood T2 map. It comes from the
 TOML overlay, defaulting by `MagneticFieldStrength` to 0.165 s at 3 T and 0.290 s at 1.5 T. The
-blood compartment shares the tissue T2' map, since susceptibility dropout acts on both.
+blood compartments take the T2' of the tissue they sit in, per the compartment ordering above,
+since susceptibility dropout acts on both.
 
 ### Division of labor with the acquisition stage
 
@@ -974,7 +1035,7 @@ that have one, in P3 and P5.
 Each `aslcontext.tsv` row maps to one volume and one pair of compartment inputs. This table is the
 behavioral contract for the whole series.
 
-| Row | `compartments[0]` tissue | `compartments[1]` blood | Notes |
+| Row | tissue compartments `0..K` | blood compartments `K..2K` | Notes |
 |---|---|---|---|
 | `control` | tissue signal | 0 | |
 | `label` | tissue signal | `-delta_m` at this row's PLD | |
@@ -1106,7 +1167,13 @@ New code, written test-first.
   time too short for the readout, both `PhaseEncodingDirection` signs, and overlay precedence
   over sidecar.
 - **phantom** — unit conversion, an unexpected unit string, a missing map, a map on a
-  different grid, and an absent fieldmap.
+  different grid, an absent fieldmap, a foreground zero in T2\*, a field-strength mismatch with
+  the protocol, and the T2 modes: `auto` resolves to `class` on the converted ASLDRO phantom;
+  one perturbed T2 voxel makes `auto` fall back to `voxel` and makes `class` fail naming that
+  label and voxel; a perturbation in T2\* that leaves the derived T2' constant does neither; a
+  perturbation in T1 does neither.
+- **series / class mode** — the two cross-check tests under P0 change 1: mode equivalence on a
+  homogeneous grid at `1e-5`, and the tracked boundary discrepancy on the oversampled grid.
 - **resample** — a constant image stays constant; total magnetization is conserved to 1e-6
   relative when the grids tile the same extent; a two-tissue boundary voxel equals the
   volume-weighted mean of the two signals and not the signal of the mean parameters; slice `z`
@@ -1173,9 +1240,14 @@ contribution it replaces. The test requires `n_spikes = 0`.
 Required settings: `noise_variance = 0`, `noise_sigma = None`, `accel = 1`, `n_spikes = 0`, no
 motion, a fixed seed, and identical acquisition parameters across the three runs.
 
-Tolerance is `|I_C - I_L - I_B| <= atol + rtol * |I_B|` with `rtol = 1e-5` and `atol = 1e-6 *
-max|I_B|`. The absolute floor is required because a pure relative bound is undefined wherever
-`delta_m` is zero, which is every not-arrived voxel (`gkm_filter.py:163`).
+Tolerance is `|I_C - I_L - I_B| <= atol + rtol * |I_B|` with `rtol = 1e-5` and
+`atol = 1e-6 * max(max|I_B|, max|I_C|)`. The absolute floor is required for two reasons. A pure
+relative bound is undefined wherever `delta_m` is zero, which is every not-arrived voxel
+(`gkm_filter.py:163`). And the floor must scale with the *tissue* signal, not only the blood:
+`I_C` and `I_L` are each stored as `f32`, so their difference carries rounding error of a few ulps
+of `|I_C|`, which for a 1% perfusion contrast is a few times `1e-5 |I_B|` and for a just-arriving
+bolus is larger than `|I_B|` itself. A floor of `1e-6 max|I_C|` covers that and still fails a sign
+or index error, whose residual is of order `2 |I_B|`, about a percent of `|I_C|`.
 
 The identity is not bit-exact and the tolerance is not slack. Run L sums tissue and blood before
 the `f64` to `f32` rounding in the coil combine at `kspace.rs:977`, while C and B round
@@ -1206,10 +1278,14 @@ These are settled as roadmap direction and specified in their own sub-projects, 
   different echo-formation model in `mrsim-acq`: P5.
 - Hadamard time-encoding, Look-Locker, velocity-selective labeling, and multi-TE: P6.
 - A time-segmented NUFFT that keeps the O(N log N) forward path under per-voxel T2 and T2' maps.
+  Unscheduled; taken up only if `voxel` mode's measured run time demands it.
 - Per-compartment NUFFT eligibility, so a `Uniform` compartment keeps the fast path alongside a
   `Map` one. The data structures at `kspace.rs:554-561` are already per compartment; only the gate
-  at `kspace.rs:680` is not.
-  Unscheduled; taken up only if P1's measured run time demands it.
+  at `kspace.rs:680` is not. Unscheduled, for the same reason.
+- A line timing in which partial Fourier omits the *early* lines and shortens the pre-echo
+  readout, as a scanner's does. Today `line_times` times lines by index and the mask drops the
+  late, low-ky lines (P0 change 1), so a short-TE full-matrix ASL protocol cannot be simulated at
+  its real `EchoTime`. Unscheduled; a change to the readout model, not to an interface.
 - Phase encoding along a data axis other than the second, by permuting through `orient`.
   Unscheduled; taken up when a target dataset needs it.
 - The `--compat-asldro` path and the voxelwise benchmark: P2. It requires porting numpy's
