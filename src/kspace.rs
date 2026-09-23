@@ -266,10 +266,11 @@ pub struct SliceInput<'a> {
     pub acq_matrix: [usize; 2],
     pub z: usize,
     pub nz: usize,
-    /// Unit diffusion-gradient direction. Kept separate from `bval` so the phase model can form
-    /// an effective q-vector without recovering it from a scaled product (spec 3.2).
-    pub bvec: [f64; 3],
-    pub bval: f64,
+    /// Per-volume eddy drive in the legacy model's units, `bvec * bval` for diffusion.
+    /// `None` disables eddy for this volume, reproducing the old `bval ~= 0` branch.
+    /// `Some([0.0; 3])` does NOT: an FSL b0 row (`bval = 5`, zero `bvec`) is `Some`, keeps
+    /// `do_eddy` true with identity rotors, and keeps the NUFFT path disabled.
+    pub eddy_drive: Option<[f64; 3]>,
     pub slice_seed: u64,
     /// Optional per-volume linear eddy shear `[a_x, a_y, a_z]` (dimensionless: PE shift in acquired
     /// voxels per acquired voxel of position). Replays a real DIFFPREP/TORTOISE eddy estimate
@@ -371,6 +372,13 @@ pub fn sampling_mask(nx: usize, ny: usize, acq: &Acquisition) -> Vec<bool> {
     m
 }
 
+/// The eddy eligibility decision, in one place. `None` disables; `Some` enables even for a
+/// zero vector (the FSL b0 row, which must keep the NUFFT path disabled as it is today); a zero
+/// `eddy_strength` disables regardless.
+pub(crate) fn eddy_enabled(acq: &Acquisition, drive: Option<[f64; 3]>) -> bool {
+    acq.eddy_strength != 0.0 && drive.is_some()
+}
+
 fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: usize) -> Vec<C> {
     let [snx, sny] = inp.sim;
     let [nx, ny] = inp.acq_matrix;
@@ -388,10 +396,10 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
         reverse_phase: acq.reverse_phase,
     };
     let (t_ms, trf_ms, tread_ms) = line_times(&epi);
-    let gradient = [inp.bvec[0] * inp.bval, inp.bvec[1] * inp.bval, inp.bvec[2] * inp.bval];
-    // eddy currents affect diffusion-weighted volumes only (b0 gradient ≈ 0)
-    let do_eddy = acq.eddy_strength != 0.0 && inp.bval.abs() > 1e-9;
-    let do_eddy_phase = acq.eddy_phase != 0.0 && inp.bval.abs() > 1e-9;
+    let gradient = inp.eddy_drive.unwrap_or([0.0; 3]);
+    // eddy currents affect volumes with a prep gradient only (`None` = the old b0 branch)
+    let do_eddy = eddy_enabled(acq, inp.eddy_drive);
+    let do_eddy_phase = acq.eddy_phase != 0.0 && inp.eddy_drive.is_some();
     let trt_s = acq.t_line * ny as f64 / 1000.0; // total readout time (s), for the shift<->phase map
     // acquired-matrix centres (k-space indexing) and sim-grid centres (image indexing)
     // Centred k-space indexing: the acquired band is [-n/2, n/2-1], asymmetric about k=0 by one
@@ -1195,6 +1203,8 @@ pub fn simulate_acquisition_oversampled(
     acq: &Acquisition,
     bvals: &[f64],
     bvecs: &[[f64; 3]],
+    // Per-volume eddy drive (`SliceInput::eddy_drive`); `None` disables eddy for that volume.
+    eddy_drive: &[Option<[f64; 3]>],
     phase: &PhaseModel,
     seed: u64,
     // Optional per-voxel per-component noise SD on the ACQUIRED grid (`x + nx*(y + ny*z)`). When
@@ -1219,6 +1229,8 @@ pub fn simulate_acquisition_oversampled(
         assert_eq!(im.len(), nvox_sim * ngrad, "compartment image is not on the simulation grid");
     }
     assert_eq!(fmap.len(), nvox_sim, "fieldmap is not on the simulation grid");
+    assert_eq!(eddy_drive.len(), ngrad,
+               "eddy_drive has {} entries for {} volumes", eddy_drive.len(), ngrad);
 
     let per_vol = |g: usize| -> (Vec<f32>, Vec<f32>) {
         let (mut mag, mut ph) = (vec![0.0f32; nvox_acq], vec![0.0f32; nvox_acq]);
@@ -1252,8 +1264,7 @@ pub fn simulate_acquisition_oversampled(
                     acq_matrix: [nx, ny],
                     z,
                     nz,
-                    bvec: bvecs[g],
-                    bval: bvals[g],
+                    eddy_drive: eddy_drive[g],
                     slice_seed,
                     eddy_lin: eddy_trace.map(|tr| tr[g]),
                 },
@@ -1333,6 +1344,12 @@ pub fn simulate_acquisition_legacy(
         let bval = (gr[0] * gr[0] + gr[1] * gr[1] + gr[2] * gr[2]).sqrt();
         let bvec =
             if bval > 1e-12 { [gr[0] / bval, gr[1] / bval, gr[2] / bval] } else { [0.0; 3] };
+        // (g/|g|)*|g| is not bit-equal to g: keep forming the product the forward model formed.
+        let eddy_drive = if bval.abs() > 1e-9 {
+            Some([bvec[0] * bval, bvec[1] * bval, bvec[2] * bval])
+        } else {
+            None
+        };
         for z in 0..nz {
             for y in 0..ny {
                 for x in 0..nx {
@@ -1356,8 +1373,7 @@ pub fn simulate_acquisition_legacy(
                 acq_matrix: [nx, ny],
                 z,
                 nz,
-                bvec,
-                bval,
+                eddy_drive,
                 slice_seed: seed,
                 eddy_lin: None,
             };
@@ -1417,10 +1433,10 @@ mod tests {
             reverse_phase: acq.reverse_phase,
         };
         let (t_ms, trf_ms, tread_ms) = line_times(&epi);
-        let gradient = [inp.bvec[0] * inp.bval, inp.bvec[1] * inp.bval, inp.bvec[2] * inp.bval];
-        // eddy currents affect diffusion-weighted volumes only (b0 gradient ≈ 0)
-        let do_eddy = acq.eddy_strength != 0.0 && inp.bval.abs() > 1e-9;
-        let do_eddy_phase = acq.eddy_phase != 0.0 && inp.bval.abs() > 1e-9;
+        let gradient = inp.eddy_drive.unwrap_or([0.0; 3]);
+        // eddy currents affect volumes with a prep gradient only (`None` = the old b0 branch)
+        let do_eddy = eddy_enabled(acq, inp.eddy_drive);
+        let do_eddy_phase = acq.eddy_phase != 0.0 && inp.eddy_drive.is_some();
         let do_eddy_trace = inp.eddy_lin.is_some();
         let trt_s = acq.t_line * ny as f64 / 1000.0; // total readout time (s), for the shift<->phase map
         // acquired-matrix centres (k-space indexing) and sim-grid centres (image indexing)
@@ -1591,6 +1607,11 @@ mod tests {
         } else {
             [0.0; 3]
         };
+        let eddy_drive = if bval.abs() > 1e-9 {
+            Some([bvec[0] * bval, bvec[1] * bval, bvec[2] * bval])
+        } else {
+            None
+        };
         let comps: [&[f32]; 1] = [img];
         simulate_slice(
             &SliceInput {
@@ -1602,8 +1623,7 @@ mod tests {
                 acq_matrix: [nx, ny],
                 z,
                 nz,
-                bvec,
-                bval,
+                eddy_drive,
                 slice_seed,
                 eddy_lin: None,
             },
@@ -1962,7 +1982,7 @@ mod tests {
         SliceInput {
             compartments: comps, t2: &[100.0], fmap, phase0,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0, eddy_lin: None
+            eddy_drive: None, slice_seed: 0, eddy_lin: None
         }
     }
 
@@ -1981,7 +2001,7 @@ mod tests {
             &SliceInput {
                 compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                 sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 9, eddy_lin: None
+                eddy_drive: None, slice_seed: 9, eddy_lin: None
             },
             &acq,
         );
@@ -2007,7 +2027,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 3, eddy_lin: None
+                    eddy_drive: None, slice_seed: 3, eddy_lin: None
                 },
                 &acq,
             );
@@ -2049,7 +2069,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 1000 + t as u64, eddy_lin: None
+                    eddy_drive: None, slice_seed: 1000 + t as u64, eddy_lin: None
                 },
                 &acq,
             );
@@ -2117,7 +2137,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0, eddy_lin: None
+                    eddy_drive: None, slice_seed: 0, eddy_lin: None
                 },
                 &Acquisition { partial_fourier: pf, ..clean() },
             )
@@ -2180,7 +2200,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5, eddy_lin: None
+                    eddy_drive: None, slice_seed: 5, eddy_lin: None
                 },
                 &Acquisition { noise_variance: 1.0, window: w, ..clean() },
             );
@@ -2203,7 +2223,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0, eddy_lin: None
+                    eddy_drive: None, slice_seed: 0, eddy_lin: None
                 },
                 &Acquisition { window: w, ..clean() },
             );
@@ -2294,8 +2314,7 @@ mod tests {
                 acq_matrix: [nx, ny],
                 z: 0,
                 nz: 1,
-                bvec: [0.0, 0.0, 0.0],
-                bval: 0.0,
+                eddy_drive: None,
                 slice_seed: 0,
                 eddy_lin: None,
             };
@@ -2321,7 +2340,7 @@ mod tests {
         let inp = SliceInput {
             compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0, eddy_lin: None
+            eddy_drive: None, slice_seed: 0, eddy_lin: None
         };
         let out = simulate_slice(&inp, &clean());
         let row = ny / 2;
@@ -2344,7 +2363,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[100.0], fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 0, eddy_lin: None
+                    eddy_drive: None, slice_seed: 0, eddy_lin: None
                 },
                 &acq,
             )
@@ -2381,7 +2400,7 @@ mod tests {
         let model = PhaseModel::hbcd_like();
         let (mag, ph) = simulate_acquisition_oversampled(
             [snx, sny, nz], [nx, ny, nz], 1, &[img], &[100.0], &fmap, &acq,
-            &[1000.0], &[[1.0, 0.0, 0.0]], &model, 7,
+            &[1000.0], &[[1.0, 0.0, 0.0]], &[Some([1000.0, 0.0, 0.0])], &model, 7,
             None,
             None,
         );
@@ -2455,7 +2474,7 @@ mod tests {
             &SliceInput {
                 compartments: &comps, t2: &[100.0], fmap: &vec![0.0f32; nx * ny], phase0: None,
                 sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                bvec: [0.0, 0.0, 0.0], bval: 0.0, slice_seed: 5, eddy_lin: None
+                eddy_drive: None, slice_seed: 5, eddy_lin: None
             },
             &acq,
         );
@@ -2544,28 +2563,29 @@ mod tests {
                 do_distortions: true, do_relaxation: true, signal_scale: 100.0,
                 ..Acquisition::default()
             };
-            let cases: Vec<(&str, Acquisition, [f64; 3], f64, Option<[f64; 3]>, usize, usize)> = vec![
-                ("clean", Acquisition { do_distortions: false, do_relaxation: false, ..full.clone() }, [0.0; 3], 0.0, None, 0, 1),
-                ("distortion+relaxation", full.clone(), [0.0; 3], 0.0, None, 0, 1),
-                ("reverse", Acquisition { reverse_phase: true, ..full.clone() }, [0.0; 3], 0.0, None, 0, 1),
-                ("ghost", Acquisition { ghost_offset: 0.015, ..full.clone() }, [0.0; 3], 0.0, None, 0, 1),
+            // eddy_drive is bvec*bval of the old table; every drive there had bval 1.0 or 0.0.
+            let cases: Vec<(&str, Acquisition, Option<[f64; 3]>, Option<[f64; 3]>, usize, usize)> = vec![
+                ("clean", Acquisition { do_distortions: false, do_relaxation: false, ..full.clone() }, None, None, 0, 1),
+                ("distortion+relaxation", full.clone(), None, None, 0, 1),
+                ("reverse", Acquisition { reverse_phase: true, ..full.clone() }, None, None, 0, 1),
+                ("ghost", Acquisition { ghost_offset: 0.015, ..full.clone() }, None, None, 0, 1),
                 ("eddy-poly", Acquisition { eddy_strength: 3.0, eddy_quad: 0.4, eddy_tau: 70.0, ..full.clone() },
-                    [0.3, -0.8, 0.5], 1.0, None, 0, 1),
-                ("eddy-phase", Acquisition { eddy_phase: 0.2, ..full.clone() }, [0.6, 0.6, 0.5], 1.0, None, 0, 1),
-                ("eddy-trace", full.clone(), [0.6, 0.6, 0.5], 1.0, Some([0.03, -0.05, 0.02]), 0, 1),
-                ("pf-fiberfox", Acquisition { partial_fourier: 0.75, ..full.clone() }, [0.0; 3], 0.0, None, 0, 1),
+                    Some([0.3, -0.8, 0.5]), None, 0, 1),
+                ("eddy-phase", Acquisition { eddy_phase: 0.2, ..full.clone() }, Some([0.6, 0.6, 0.5]), None, 0, 1),
+                ("eddy-trace", full.clone(), Some([0.6, 0.6, 0.5]), Some([0.03, -0.05, 0.02]), 0, 1),
+                ("pf-fiberfox", Acquisition { partial_fourier: 0.75, ..full.clone() }, None, None, 0, 1),
                 ("pf-contiguous-reverse", Acquisition { partial_fourier: 0.75, pf_mode: PartialFourierMode::Contiguous,
-                    reverse_phase: true, ..full.clone() }, [0.0; 3], 0.0, None, 0, 1),
-                ("grappa-coils", Acquisition { accel: 2, acs_lines: 6, n_coils: 4, ..full.clone() }, [0.0; 3], 0.0, None, 2, 4),
-                ("grappa3", Acquisition { accel: 3, acs_lines: 8, n_coils: 4, ..full.clone() }, [0.0; 3], 0.0, None, 1, 4),
+                    reverse_phase: true, ..full.clone() }, None, None, 0, 1),
+                ("grappa-coils", Acquisition { accel: 2, acs_lines: 6, n_coils: 4, ..full.clone() }, None, None, 2, 4),
+                ("grappa3", Acquisition { accel: 3, acs_lines: 8, n_coils: 4, ..full.clone() }, None, None, 1, 4),
                 ("everything", Acquisition { ghost_offset: 0.02, eddy_strength: 2.0, eddy_quad: 0.3, eddy_phase: 0.1,
                     partial_fourier: 0.8, accel: 2, acs_lines: 8, n_coils: 3, ..full.clone() },
-                    [0.5, 0.5, 0.7], 1.0, Some([0.02, 0.04, -0.01]), 0, 3),
+                    Some([0.5, 0.5, 0.7]), Some([0.02, 0.04, -0.01]), 0, 3),
             ];
-            for (name, acq, bvec, bval, eddy_lin, coil, ncoils) in cases {
+            for (name, acq, eddy_drive, eddy_lin, coil, ncoils) in cases {
                 let inp = SliceInput {
                     compartments: &comp_refs, t2: &t2, fmap: &fmap, phase0: Some(&phase0),
-                    sim: [snx, sny], acq_matrix: [nx, ny], z: 3, nz: 9, bvec, bval, slice_seed: 0, eddy_lin,
+                    sim: [snx, sny], acq_matrix: [nx, ny], z: 3, nz: 9, eddy_drive, slice_seed: 0, eddy_lin,
                 };
                 let a = build_coil_kspace(&inp, &acq, coil, ncoils);
                 let b = reference_coil_kspace(&inp, &acq, coil, ncoils);
@@ -2615,5 +2635,66 @@ mod tests {
             "inverse {nx}x{ny}: direct {:.2} us/call, fft {:.2} us/call, speedup {:.1}x (sink {sink:.1})",
             td.as_micros() as f64 / n as f64, tf.as_micros() as f64 / n as f64,
             td.as_secs_f64() / tf.as_secs_f64());
+    }
+
+    #[test]
+    fn eddy_drive_some_reproduces_the_bvec_bval_product() {
+        // Criterion 4. The expected values are this slice's first eight k-space coefficients as
+        // produced by the pre-change bvec/bval path (bvec [0.6, 0.8, 0.0], bval 1000) at tag
+        // `p0-move-complete` plus the Task 7 rename. Bit equality, not a tolerance: the drive is
+        // the same product the old code formed internally, so the arithmetic must be the same.
+        // A nonzero check would pass with eddy ignored entirely. One reference per build shape:
+        // the `kspace` feature swaps the x-stage to rustfft, which differs in the last bits
+        // from the std twiddle-table sum, before and after this change alike.
+        const EXPECTED_BITS_STD: [(u64, u64); 8] = [(0xbf85ec1cb1daa8d4, 0x3fa5ffff06e41c35), (0xbf3ac84a01a68680, 0x3f817f28896f61be), (0xbf83c1e814334026, 0xbfb080ac7ad7ff65), (0xbf7548454640584a, 0xbf8d9e9dd3358a7c), (0x3fb6e06347299105, 0x3fc30724fd363632), (0x3fc9ee837d7455c5, 0x3fcc89859a43e2be), (0x3fc5f2c7a85a66e2, 0x3fc03bf44552eb93), (0x3f8f6e71db6b4c1c, 0x3f7da1ff8d601054)];
+        const EXPECTED_BITS_FFT: [(u64, u64); 8] = [(0xbf85ec1cb1daa8b8, 0x3fa5ffff06e41c36), (0xbf3ac84a01a68879, 0x3f817f28896f61c4), (0xbf83c1e81433403f, 0xbfb080ac7ad7ff64), (0xbf75484546405882, 0xbf8d9e9dd3358a91), (0x3fb6e06347299108, 0x3fc30724fd363630), (0x3fc9ee837d7455c7, 0x3fcc89859a43e2ba), (0x3fc5f2c7a85a66e4, 0x3fc03bf44552eb91), (0x3f8f6e71db6b4c24, 0x3f7da1ff8d60105a)];
+        let expected = if cfg!(feature = "kspace") { EXPECTED_BITS_FFT } else { EXPECTED_BITS_STD };
+        let (nx, ny) = (16, 16);
+        let comps = vec![box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
+        let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
+        let fmap = vec![0.0f32; nx * ny];
+        let acq = Acquisition { eddy_strength: 0.05, ..Default::default() };
+        let (bval, bvec) = (1000.0f64, [0.6f64, 0.8, 0.0]);
+        let inp = SliceInput {
+            compartments: &comp_refs, t2: &[100.0], fmap: &fmap, phase0: None,
+            sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
+            eddy_drive: Some([bvec[0] * bval, bvec[1] * bval, bvec[2] * bval]),
+            slice_seed: 7, eddy_lin: None,
+        };
+        let got = simulate_slice_kspace(&inp, &acq);
+        for (i, (re, im)) in got.iter().take(8).enumerate() {
+            assert_eq!((re.to_bits(), im.to_bits()), expected[i], "coefficient {i} moved");
+        }
+    }
+
+    #[test]
+    fn eddy_drive_none_disables_but_zero_vector_does_not() {
+        // Criterion 5: None and Some([0,0,0]) are DIFFERENT inputs. The FSL b0 row
+        // (bval=5, bvec=[0,0,0]) is Some([0,0,0]) and must keep eddy "on" with a zero gradient,
+        // because that is what disables the NUFFT path today.
+        let (nx, ny) = (16, 16);
+        let comps = vec![box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
+        let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
+        let fmap = vec![3.0f32; nx * ny];
+        let acq = Acquisition { eddy_strength: 0.05, ..Default::default() };
+
+        let make = |drive| SliceInput {
+            compartments: &comp_refs, t2: &[100.0], fmap: &fmap, phase0: None,
+            sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
+            eddy_drive: drive, slice_seed: 7, eddy_lin: None,
+        };
+        let none = simulate_slice(&make(None), &acq);
+        let zero = simulate_slice(&make(Some([0.0; 3])), &acq);
+
+        // Identical numerically: a zero gradient multiplies by identity rotors.
+        for ((a, b), (c, d)) in none.iter().zip(zero.iter()) {
+            assert!((a - c).abs() < 1e-6 && (b - d).abs() < 1e-6,
+                    "zero-vector drive should match None numerically on this slice");
+        }
+        // But they must not be collapsed into the same input. The eligibility decision lives in
+        // `eddy_enabled` so it can be pinned here: `is_some()`, never "is the vector zero".
+        assert!(eddy_enabled(&acq, Some([0.0; 3])), "a zero-vector drive must keep eddy enabled");
+        assert!(!eddy_enabled(&acq, None), "None must disable eddy");
+        assert!(!eddy_enabled(&Acquisition::default(), Some([1.0; 3])), "eddy_strength 0 disables");
     }
 }

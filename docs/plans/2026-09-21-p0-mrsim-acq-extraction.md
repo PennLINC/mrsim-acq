@@ -978,7 +978,9 @@ fn eddy_drive_none_disables_but_zero_vector_does_not() {
 
 - [ ] **Step 2: Capture the reference bits, then run the tests to confirm they fail**
 
-Before touching the struct, add a temporary test that builds the same slice with the *old* fields, `bvec: [0.6, 0.8, 0.0], bval: 1000.0`, and prints `(re.to_bits(), im.to_bits())` for the first eight entries of `simulate_slice_kspace(&inp, &acq)`. Run it with `cargo test print_eddy_reference -- --nocapture`, paste the eight pairs into `EXPECTED_BITS`, delete the temporary test. The tree is still at `p0-move-complete` plus Task 7's rename, so these are the pre-change numbers.
+Before touching the struct, add a temporary test that builds the same slice with the *old* fields, `bvec: [0.6, 0.8, 0.0], bval: 1000.0`, and prints `(re.to_bits(), im.to_bits())` for the first eight entries of `simulate_slice_kspace(&inp, &acq)`. Run it **twice**, `cargo test print_eddy_reference -- --nocapture` and the same with `--features kspace`, and keep both sets as `EXPECTED_BITS_STD` and `EXPECTED_BITS_FFT`, selected in the test by `cfg!(feature = "kspace")`. The two differ in the last bits: the `kspace` feature swaps the x-stage to rustfft, and the std twiddle-table sum and rustfft do not agree bit for bit, before or after this change. One reference would pass under one build and fail under the other. Delete the temporary test afterwards. The tree is still at `p0-move-complete` plus Task 7's rename, so these are the pre-change numbers.
+
+Two more `SliceInput` sites exist than the module-level grep suggests, and the compiler will name them: the oversampled-path test in `kspace.rs` that calls `simulate_acquisition_oversampled` directly, and TRXScan's integration test `tests/kspace_alignment.rs`.
 
 ```bash
 cd /mnt/c/Users/tsalo/Documents/rust-trx/mrsim-acq
