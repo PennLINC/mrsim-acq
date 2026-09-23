@@ -233,7 +233,7 @@ impl Default for Acquisition {
 }
 
 /// Per-PE-line readout times (ms): `t` from max echo, `tRf` from RF, `tRead` from the last
-/// diffusion gradient (drives eddy-current decay).
+/// preparation gradient (drives eddy-current decay).
 fn line_times(epi: &SingleShotEpi) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let (nx, ny) = (epi.kx_max, epi.ky_max);
     let xs = nx / 2;
@@ -243,7 +243,7 @@ fn line_times(epi: &SingleShotEpi) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         if kx == xs {
             t[ky] = epi.time_from_max_echo(tick);
             trf[ky] = epi.time_from_rf(tick);
-            tread[ky] = epi.time_from_last_diffusion_gradient(tick);
+            tread[ky] = epi.time_from_prep_gradient(tick);
         }
     }
     (t, trf, tread)

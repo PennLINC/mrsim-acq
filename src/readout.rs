@@ -10,8 +10,10 @@ pub trait Readout {
     fn kspace_index(&self, tick: usize) -> (usize, usize);
     /// ms from the maximum-echo (k-space centre) time.
     fn time_from_max_echo(&self, tick: usize) -> f64;
-    /// ms since readout start (used for eddy-current decay).
-    fn time_from_last_diffusion_gradient(&self, tick: usize) -> f64;
+    /// ms from the last large preparation gradient to the sample at `tick` (drives eddy-current
+    /// decay). That gradient is a diffusion gradient in one consumer and a crusher or labeling
+    /// gradient in the other.
+    fn time_from_prep_gradient(&self, tick: usize) -> f64;
     /// ms since the RF pulse (used for T2/T2* relaxation).
     fn time_from_rf(&self, tick: usize) -> f64;
 }
@@ -58,7 +60,7 @@ impl Readout for SingleShotEpi {
     fn time_from_max_echo(&self, tick: usize) -> f64 {
         self.dt() * (tick as f64 + 0.5) - self.half_read_time()
     }
-    fn time_from_last_diffusion_gradient(&self, tick: usize) -> f64 {
+    fn time_from_prep_gradient(&self, tick: usize) -> f64 {
         tick as f64 * self.dt() + self.dt() / 2.0
     }
     fn time_from_rf(&self, tick: usize) -> f64 {
