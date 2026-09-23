@@ -1,0 +1,32 @@
+[package]
+name = "mrsim-acq"
+version = "0.0.0"
+edition = "2021"
+description = "Shared MRI acquisition stage: k-space forward model, EPI readout, motion, complex NIfTI output"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Every external dependency is optional and off by default, so the default build is
+# pure std and `cargo test` runs offline with no system libraries.
+[features]
+default = []
+# NIfTI volume read + scalar/complex 4D write. Deliberately no trx-rs: streamline
+# I/O stays in TRXScan so this crate never pulls HDF5.
+io = ["dep:nifti", "dep:ndarray", "dep:nalgebra"]
+# k-space FFT backend (rustfft); the default k-space path is std-only.
+kspace = ["dep:rustfft", "dep:ndarray", "dep:nalgebra", "dep:rand", "dep:rand_distr"]
+# config parsing (TOML); currently a stub.
+config = ["dep:serde", "dep:toml"]
+# parallelism
+par = ["dep:rayon"]
+
+[dependencies]
+nifti = { version = "0.17", features = ["ndarray_volumes"], optional = true }
+ndarray = { version = "0.16", optional = true }
+nalgebra = { version = "0.33", optional = true }
+rustfft = { version = "6", optional = true }
+rand = { version = "0.8", optional = true }
+rand_distr = { version = "0.4", optional = true }
+rayon = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+toml = { version = "0.8", optional = true }
