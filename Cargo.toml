@@ -21,7 +21,7 @@ config = ["dep:serde", "dep:toml"]
 par = ["dep:rayon"]
 
 [dependencies]
-nifti = { version = "0.17", features = ["ndarray_volumes"], optional = true }
+nifti = { version = "0.17", features = ["ndarray_volumes", "nalgebra_affine"], optional = true }
 ndarray = { version = "0.16", optional = true }
 nalgebra = { version = "0.33", optional = true }
 rustfft = { version = "6", optional = true }

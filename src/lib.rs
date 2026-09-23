@@ -41,3 +41,6 @@ pub mod nufft;
 /// Simulation config (feature `config`). `load` is a `todo!()` stub.
 #[cfg(feature = "config")]
 pub mod config;
+/// NIfTI volume read + scalar/complex 4D write (feature `io`).
+#[cfg(feature = "io")]
+pub mod io;

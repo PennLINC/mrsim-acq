@@ -703,6 +703,8 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 Create `mrsim-acq/src/io.rs` containing, copied verbatim from `TRXScan/src/io.rs`: the `nifti`/`ndarray`/`nalgebra` imports, `affine_from_header` (`:164`) and `quatern_to_mat44` (`:184`) — private, but `load_volume` calls them at `:212` and does not compile without them — `load_volume` (`:208`), `hires_grid` (`:264`), `header_for_grid` (`:242`), `write_4d` (`:353`), `write_3d` (`:364`), `write_3d_i16` (`:374`), and the `#[cfg(test)] mod tests` cases that exercise only those. Not `SidecarInfo` or `write_complex_dwi`, for the reason above.
 
+The manifest needs one thing TRXScan's does not say: `nifti = { version = "0.17", features = ["ndarray_volumes", "nalgebra_affine"] }`. `header_for_grid` calls `NiftiHeader::set_qform`/`set_sform(&Matrix4, ..)`, which nifti gates behind `nalgebra_affine`. TRXScan never enables it explicitly; `trx-rs` does, and feature unification hides that. Standalone, `mrsim-acq --features io` fails to compile without it, while TRXScan's build of the same file succeeds.
+
 Head it with:
 
 ```rust
@@ -748,10 +750,12 @@ par = ["dep:rayon", "mrsim-acq/par"]
 
 ```bash
 cd /mnt/c/Users/tsalo/Documents/rust-trx/TRXScan
-cargo tree --features cli,kspace,par -p mrsim-acq -e features 2>/dev/null | head -20
+cargo tree -e features --features cli,kspace,par -i mrsim-acq 2>/dev/null
 ```
 
-Expected: `mrsim-acq` appears with its `io`, `kspace`, and `par` features enabled. If they are absent the forwarding did not take, and the NUFFT path is silently off. Also `cargo build --features config` in TRXScan, which must compile.
+(The inverted form. `-p mrsim-acq --features ...` is refused because features can only be named for workspace members, and the forward tree shows only `mrsim-acq feature "default"` because the forwarded features hang off `trxscan feature "io"` etc., not off the package node.)
+
+Expected: `mrsim-acq feature "io"`, `"kspace"`, and `"par"` nodes, each with a `trxscan feature` child. If they are absent the forwarding did not take, and the NUFFT path is silently off. Also `cargo build --features config` in TRXScan, which must compile.
 
 - [ ] **Step 5: Confirm mrsim-acq never pulls HDF5**
 
