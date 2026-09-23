@@ -715,7 +715,9 @@ for p in pcasl_single pasl_cutoff pcasl_multipld; do
 done
 ```
 
-Record wall time per run in `docs/` notes; the spec asked for the `voxel`-mode cost to be measured, so run `pcasl_single` once more with `--t2-mode voxel` and record that too.
+Record wall time per run here; the spec asked for the `voxel`-mode cost to be measured, so run `pcasl_single` once more with `--t2-mode voxel` and record that too.
+
+**Measured 2026-09-23** (release, `cli,kspace,par`, WSL on the full 3T phantom, acquisition 64 x 68 x 38, simulation 128 x 136 x 38, `class` mode with 6 compartments): `pcasl_single` (20 volumes) 4.0 s wall, 0.7 GB RSS; `pasl_cutoff` (10) 2.7 s; `pcasl_multipld` (16) 2.9 s. `voxel` mode on `pcasl_single`: 4.2 s. The rotor path is not the bottleneck at ASL matrix sizes; the spec's fallback to a time-segmented NUFFT is not needed for P1. The tracked `class`-vs-`voxel` boundary discrepancy on the crop at 3 mm / `oversample 2` is 4.9e-3 of peak.
 
 - [ ] **Step 2: bids-validator on each**
 
@@ -724,7 +726,9 @@ export PATH=$HOME/.nvm/versions/node/v22.22.2/bin:$PATH
 for p in pcasl_single pasl_cutoff pcasl_multipld; do deno run -A jsr:@bids/validator work/run-$p --ignoreWarnings; done
 ```
 
-Expected: no errors. Warnings about `AslscanSimulation` (an unknown key) are acceptable and are the reason for `--ignoreWarnings`; any *error* is a defect in `bids` to fix before continuing. Criterion 3.
+Expected: no errors. Any *error* is a defect in `bids` to fix before continuing. Criterion 3.
+
+Two errors the first run produced, both fixed in `bids`: bids-validator 3.0.2 checks required keys on each `part-` file **without merging the inheritance-level `_asl.json` in**, so a `part-phase` sidecar carrying only `Units` fails `SIDECAR_KEY_REQUIRED` — both part sidecars are now written complete, with `_asl.json` kept as well; and `.bidsignore` needs `**/ground-truth/**` (the `**/ground-truth/` directory form alone did not exclude the files). The remaining warnings are `NIFTI_UNIT`/`NIFTI_PIXDIM` from the shared writer's header (`header_for_grid` leaves `pixdim[4]` and the time unit unset), which is an `mrsim-acq` change to propose rather than make here, plus recommended-key warnings.
 
 - [ ] **Step 3: The linearity property (criterion 5)**
 
