@@ -96,20 +96,19 @@ equals `tissue_se` only at `fa = 90`.
 
 `protocol` additions, each with its error naming the values:
 
-- **Background suppression.** When `BackgroundSuppression` is true: `BackgroundSuppressionNumberPulses`
-  (non-negative integer) and `BackgroundSuppressionPulseTime` (array, that many finite
-  non-negative entries) are required; length mismatch names both. Overlay
-  `[background_suppression] inversion_efficiency` (default 0.95, in `[0, 1]`), `presaturation`
-  (default false), `pulse_times_per_pld` (array of arrays, one per distinct non-m0 PLD in
-  ascending order, each entry validated like the sidecar array). Per row the pulse set is the
-  per-PLD array when given, else the sidecar array; m0scan rows get none. For a multi-PLD series
-  without the per-PLD override, `first_pld_times_applied_to_all = true` is recorded. Checks per
-  non-m0 row: every pulse `< row.t` (the first slice's readout), every pulse `>= row.tau`, and
+- **Background suppression.** When `BackgroundSuppression` is true:
+  `BackgroundSuppressionNumberPulses` (non-negative integer) and
+  `BackgroundSuppressionPulseTime` (array, that many finite non-negative entries) are
+  required; length mismatch names both. Overlay `[background_suppression]
+  inversion_efficiency` (default 0.95, in `[0, 1]`), `presaturation` (default false),
+  `pulse_times_per_pld` (array of arrays, one per distinct non-m0 PLD in ascending order, each
+  entry validated like the sidecar array). Per row the pulse set is the per-PLD array when
+  given, else the sidecar array; m0scan rows get none. For a multi-PLD series without the
+  per-PLD override, `first_pld_applied_to_all = true` is recorded. Checks per non-m0 row: every
+  pulse `< row.t` (the first slice's readout), every pulse `>= row.tau`, and
   `row.t + max(slice_offsets) <= row.tr` (this last one for every row, suppression or not).
-  `Protocol::suppression: Option<SuppressionSpec { epsilon: (f64, Source), presaturation: (bool, Source), per_row: Vec<Vec<f64>>, first_pld_applied_to_all: bool }>`.
 - **IR contrast.** `[signal] inversion_time`, `excitation_flip_angle`, `inversion_flip_angle`;
   sidecar `InversionTime`, `FlipAngle`. Precedence overlay > sidecar > default with `Source`.
-  `Protocol::ir: Option<IrSpec { params: IrParams, inversion_time: Source, excitation_flip: Source, inversion_flip: Source }>`.
   Rules: `"ir"` with suppression true is rejected naming both; `"se"` with a `FlipAngle` (sidecar
   or overlay) other than 90 is rejected naming the spin-echo assumption; `"se"` with
   `InversionTime` in the sidecar (or the overlay) is rejected. Ranges: TI `>= 0`, angles in
@@ -117,14 +116,23 @@ equals `tissue_se` only at `fa = 90`.
 - **Multiband schedule.** With `mb > 1`, derive the shot grouping from the slice offsets: the
   slices sharing each distinct offset must be `{g, g + n_groups, ...}` for one `g`, and the
   groups ordered by offset must be `0, 1, 2, ...` (sequential) or `0, 2, 4, ..., 1, 3, ...`
-  (interleaved). `Protocol::mb_interleaved: bool`. Any other pattern is rejected naming the
-  first mismatched slice.
+  (interleaved). Any other pattern is rejected naming the first mismatched slice.
 - **Motion.** `[motion] mode` (`off` default | `trajectory` | `random` | `linear`), `trajectory`
   (path, read relative to the overlay file's directory by `load`; `parse` reads it as given),
-  `trans_mm`, `rot_deg` (3-vectors, finite, non-negative), `volumes` (indices `< n`; default all
-  non-zero... default all), `within_volume { dropout_rate in [0, 1], severity in [0, 1], jump_mm, jump_deg }`
-  (needs `mb > 1`). `Protocol::motion: Option<MotionSpec { mode: mrsim_acq::motion::MotionMode, within: Option<WithinVolume> }>`.
-  Trajectory pose count must equal the row count.
+  `trans_mm`, `rot_deg` (3-vectors, finite, non-negative), `volumes` (indices `< n`, no repeats;
+  default all), `within_volume` (`dropout_rate` and `severity` in `[0, 1]`, `jump_mm`,
+  `jump_deg`; needs `mb > 1`). Trajectory pose count must equal the row count.
+
+The resolved types on `Protocol`:
+
+```rust
+pub suppression: Option<SuppressionSpec>,  // epsilon, presaturation (with Source), per_row,
+                                           // first_pld_pulses, first_pld_applied_to_all
+pub ir: Option<IrSpec>,                    // IrParams plus a Source per parameter
+pub motion: Option<MotionSpec>,            // mrsim_acq::motion::MotionMode, mode_name,
+                                           // within: Option<WithinVolume>
+pub mb_interleaved: bool,
+```
 
 Tests for each rule, plus: asl002 and asl004 now parse (suppression on, 2 pulses, factor 0.81
 at the default), asl002 with `pulse_times_per_pld` of the wrong length is rejected, the multiband

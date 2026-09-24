@@ -81,11 +81,14 @@ pub fn load_volume(path: &Path) -> R<(Vec<f32>, Grid)> {
     Ok((flat, Grid { dims, voxel_to_world: aff }))
 }
 
-fn header_for_grid(v: [[f64; 4]; 4]) -> NiftiHeader {
+/// The NIfTI-1 header for a grid. With `tr_s`, the 4th dimension's step is that repetition time
+/// in seconds and the units field says so (mm | s); without it the temporal fields stay zero,
+/// which is what TRXScan has always written and its bit-identity gate expects.
+fn header_for_grid(v: [[f64; 4]; 4], tr_s: Option<f64>) -> NiftiHeader {
     let mut h = NiftiHeader::default();
     let col_norm = |c: usize| (v[0][c].powi(2) + v[1][c].powi(2) + v[2][c].powi(2)).sqrt() as f32;
-    h.pixdim = [1.0, col_norm(0), col_norm(1), col_norm(2), 0.0, 0.0, 0.0, 0.0];
-    h.xyzt_units = 2; // mm
+    h.pixdim = [1.0, col_norm(0), col_norm(1), col_norm(2), tr_s.unwrap_or(0.0) as f32, 0.0, 0.0, 0.0];
+    h.xyzt_units = if tr_s.is_some() { 2 | 8 } else { 2 }; // NIFTI_UNITS_MM (| NIFTI_UNITS_SEC)
     let m = Matrix4::<f64>::new(
         v[0][0], v[0][1], v[0][2], v[0][3],
         v[1][0], v[1][1], v[1][2], v[1][3],
@@ -121,11 +124,19 @@ pub fn hires_grid(g: &Grid, o: usize) -> Grid {
 }
 
 pub fn write_4d(path: &Path, dims: [usize; 3], ngrad: usize, data: &[f32], grid: &Grid) -> R<()> {
+    write_4d_timed(path, dims, ngrad, data, grid, None)
+}
+
+/// [`write_4d`] with the volume repetition time (s) in the header's 4th `pixdim` and time units,
+/// which BIDS validators expect of a 4D series. `None` writes the header [`write_4d`] does.
+pub fn write_4d_timed(path: &Path, dims: [usize; 3], ngrad: usize, data: &[f32], grid: &Grid, tr_s: Option<f64>)
+    -> R<()>
+{
     let [nx, ny, nz] = dims;
     let arr = Array4::from_shape_fn((nx, ny, nz, ngrad), |(x, y, z, g)| {
         data[(x + nx * (y + ny * z)) * ngrad + g]
     });
-    let hdr = header_for_grid(grid.voxel_to_world);
+    let hdr = header_for_grid(grid.voxel_to_world, tr_s);
     WriterOptions::new(path).reference_header(&hdr).write_nifti(&arr)?;
     Ok(())
 }
@@ -135,7 +146,7 @@ pub fn write_3d(path: &Path, dims: [usize; 3], data: &[f32], grid: &Grid) -> R<(
     let [nx, ny, nz] = dims;
     let arr =
         ndarray::Array3::from_shape_fn((nx, ny, nz), |(x, y, z)| data[x + nx * (y + ny * z)]);
-    let hdr = header_for_grid(grid.voxel_to_world);
+    let hdr = header_for_grid(grid.voxel_to_world, None);
     WriterOptions::new(path).reference_header(&hdr).write_nifti(&arr)?;
     Ok(())
 }
@@ -145,7 +156,7 @@ pub fn write_3d_i16(path: &Path, dims: [usize; 3], data: &[i16], grid: &Grid) ->
     let [nx, ny, nz] = dims;
     let arr =
         ndarray::Array3::from_shape_fn((nx, ny, nz), |(x, y, z)| data[x + nx * (y + ny * z)]);
-    let hdr = header_for_grid(grid.voxel_to_world);
+    let hdr = header_for_grid(grid.voxel_to_world, None);
     WriterOptions::new(path).reference_header(&hdr).write_nifti(&arr)?;
     Ok(())
 }
@@ -155,6 +166,8 @@ pub fn write_3d_i16(path: &Path, dims: [usize; 3], data: &[i16], grid: &Grid) ->
 /// modality-independent; anything diffusion- or ASL-specific belongs beside the consumer's own
 /// writer (TRXScan's `write_dwi_scheme`, aslscan's `_aslcontext.tsv`).
 pub struct SidecarInfo {
+    /// BIDS `Manufacturer`: the simulator that produced the data (`"TRXScan"`, `"aslscan"`).
+    pub manufacturer: String,
     /// BIDS PhaseEncodingDirection ("j", "j-", …) already resolved for the *written* voxel frame
     /// (see `orient` + the caller): a +off-resonance field displaces signal toward +this-axis.
     pub phase_encoding_direction: String,
@@ -163,6 +176,9 @@ pub struct SidecarInfo {
     pub partial_fourier: f64,
     pub accel: usize,
     pub mb: usize,
+    /// The volume repetition time (s) for the NIfTI header's 4th `pixdim` and time units;
+    /// `None` leaves the temporal header fields zero (TRXScan's convention).
+    pub repetition_time_s: Option<f64>,
     /// Modern BIDS B0 linkage: when a fieldmap is written for this DWI, its
     /// `B0FieldIdentifier` label is recorded here so the DWI carries the matching
     /// `B0FieldSource` (the replacement for the deprecated `IntendedFor`).
@@ -186,8 +202,8 @@ pub fn write_complex_4d(
     info: &SidecarInfo,
 ) -> R<()> {
     let p = |s: &str| PathBuf::from(format!("{out_prefix}{s}"));
-    write_4d(&p(&format!("_part-mag_{suffix}.nii.gz")), dims, n_volumes, mag, grid)?;
-    write_4d(&p(&format!("_part-phase_{suffix}.nii.gz")), dims, n_volumes, phase, grid)?;
+    write_4d_timed(&p(&format!("_part-mag_{suffix}.nii.gz")), dims, n_volumes, mag, grid, info.repetition_time_s)?;
+    write_4d_timed(&p(&format!("_part-phase_{suffix}.nii.gz")), dims, n_volumes, phase, grid, info.repetition_time_s)?;
     // PED is resolved by the caller for the written frame (native grid, or reoriented to LAS with
     // --fsl-orientation). EffectiveEchoSpacing is per the PE axis the code names, not a fixed axis.
     let ped = info.phase_encoding_direction.as_str();
@@ -198,11 +214,11 @@ pub fn write_complex_4d(
         None => String::new(),
     };
     let common = format!(
-        "  \"Manufacturer\": \"TRXScan\",\n  \"PhaseEncodingDirection\": \"{ped}\",\n  \
+        "  \"Manufacturer\": \"{}\",\n  \"PhaseEncodingDirection\": \"{ped}\",\n  \
          \"TotalReadoutTime\": {:.6},\n  \"EffectiveEchoSpacing\": {:.8},\n  \
          \"EchoTime\": {:.4},\n  \"PartialFourier\": {},\n  \
          \"ParallelReductionFactorInPlane\": {},\n  \"MultibandAccelerationFactor\": {}{b0src}",
-        info.total_readout_time, ees, info.echo_time, info.partial_fourier, info.accel, info.mb,
+        info.manufacturer, info.total_readout_time, ees, info.echo_time, info.partial_fourier, info.accel, info.mb,
     );
     std::fs::write(p(&format!("_part-mag_{suffix}.json")),
         format!("{{\n{common},\n  \"ImageComparison\": \"magnitude\"\n}}\n"))?;
@@ -214,6 +230,28 @@ pub fn write_complex_4d(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn four_d_header_carries_the_time_step_only_when_asked() {
+        let dir = std::env::temp_dir().join(format!("mrsim-acq-io-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = Grid { dims: [3, 2, 2], voxel_to_world: [[2.0, 0.0, 0.0, 1.0], [0.0, 2.0, 0.0, 2.0], [0.0, 0.0, 3.0, 3.0], [0.0, 0.0, 0.0, 1.0]] };
+        let data = vec![0.5f32; 3 * 2 * 2 * 4];
+        let header = |name: &str, tr: Option<f64>| {
+            let p = dir.join(name);
+            write_4d_timed(&p, g.dims, 4, &data, &g, tr).unwrap();
+            let h = ReaderOptions::new().read_file(&p).unwrap().header().clone();
+            (h.pixdim, h.xyzt_units)
+        };
+        let (pix, units) = header("timed.nii.gz", Some(4.25));
+        assert_eq!(&pix[1..5], &[2.0, 2.0, 3.0, 4.25]);
+        assert_eq!(units, 10, "mm | s");
+        // the default is TRXScan's header, unchanged: zero time step, mm only
+        let (pix, units) = header("plain.nii.gz", None);
+        assert_eq!(&pix[1..5], &[2.0, 2.0, 3.0, 0.0]);
+        assert_eq!(units, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn hires_affine_preserves_the_fov() {
