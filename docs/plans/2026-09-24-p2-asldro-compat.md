@@ -58,10 +58,11 @@ origins on a signed affine; the 3 T phantom's dimensions `[197, 233, 189]` with 
 `[197/64, 233/64, 189/12]` give `[64, 64, 12]` under the `ceil(extent / voxel - 1e-9)` rule
 (each quotient is exactly representable).
 
-`protocol`: `CompatOverlay { asldro: Option<bool>, desired_snr: Option<f64>, grid_origin: Option<String> }`,
-`Protocol::compat: Option<CompatSpec { desired_snr: Option<f64>, grid_origin: GridOrigin }>`
-(`Some` only when `asldro = true`), plus `Protocol::grid_origin` for the non-compat case
-(default `Corner`; `grid_origin` may be set without `asldro`). With `asldro = true`:
+`protocol`: an overlay table `CompatOverlay` with `asldro: Option<bool>`,
+`desired_snr: Option<f64>` and `grid_origin: Option<String>`; on the protocol,
+`compat: Option<CompatSpec>` holding `desired_snr` and `grid_origin` (`Some` only when
+`asldro = true`), plus `Protocol::grid_origin` for the non-compat case (default `Corner`;
+`grid_origin` may be set without `asldro`). With `asldro = true`:
 
 - Pinned, checked against the overlay's explicit `Option`s: `oversample = 1`,
   `partial_fourier = 1`, `n_coils = 1`, `ghost_offset = 0`, `n_spikes = 0`,
@@ -91,7 +92,8 @@ Tests for each rule, plus a compat protocol that parses cleanly with an otherwis
   bypassed anyway when compat is off, to keep the code paths separate).
 - `noise_variance = (signal_scale * mean(M0_acq over M0_acq != 0) / desired_snr)^2` from
   `r_acq.mean(&ph.m0)`, set on the `Acquisition` before the one call; `None` SNR leaves 0.
-  `SeriesOutput` gains `compat: Option<CompatFacts { noise_variance, m0_reference_mean, grid_origin }>`.
+  `SeriesOutput` gains `compat: Option<CompatFacts>` carrying the noise variance, the M0
+  reference mean and the grid origin.
 - The separate M0 scan under compat: simasl has no such thing (its M0 is an `m0scan` row); a
   compat protocol with `M0Type: Separate` is refused in `protocol` (Task 1) naming the row form.
 
