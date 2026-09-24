@@ -650,7 +650,17 @@ mismatch is an error naming both counts. An earlier revision of this spec counte
 non-`m0scan` rows; that contradicts the standard, would reject valid datasets, and would have
 aslscan write sidecars that `bids-validator` fails. A nonzero `m0scan` entry in either timing
 array is an error. `aslcontext.tsv` supplies volume order from the values `m0scan`, `control`,
-`label`, `deltam`, and `cbf`.
+`label`, `deltam`, and `cbf`. A one-element array is an array, not a scalar, and is held to the
+per-volume length rule; only a JSON number broadcasts.
+
+Fields P1 does not model are read and refused rather than ignored: `LookLocker: true` (P6) and
+`VascularCrushing: true` (P4) are errors naming the sub-project, as `BackgroundSuppression: true`
+is (P3). `BackgroundSuppression` must be present, because BIDS requires it and the output sidecar
+echoes the input; likewise `BolusCutOffTechnique` when `BolusCutOffFlag` is true, and `M0Estimate`
+when `M0Type` is `Estimate`. `BolusCutOffDelayTime` accepts a number or a two-element array; more
+entries are an error. Every timing and readout value must be finite and in range (positive
+repetition times, echo time, readout time and field strength; non-negative delays and slice
+times), and the overlay's values likewise, before anything is simulated.
 
 The `RepetitionTimePreparation` array is how an `Included` M0 volume gets its own, usually longer,
 repetition time: row `i` uses entry `i`. With a scalar, every row including `m0scan` uses the same
@@ -723,9 +733,9 @@ message does not suggest them.
 the kinetic model: `f = perfusion / 6000` is per second (`gkm_filter.py:105`) and is summed with
 `1/T1t` (`gkm_filter.py:141-153`), so `kinetic` and `mrsignal` run in seconds, with the labeling
 times, T1, and TR untouched. The conversion boundary is the hand-off to the acquisition stage:
-`protocol` converts `EchoTime` and `TotalReadoutTime` to milliseconds for `Acquisition`, and
-`phantom` converts T2, T2\*, the derived T2', and the blood T2 default to milliseconds for the
-`T2Volume` inputs. Nothing downstream of that boundary converts again, and nothing upstream of it
+`protocol` converts `EchoTime` and `TotalReadoutTime` to milliseconds for `Acquisition` and the
+blood T2 (an overlay or default value, so it is `protocol`'s) through `Protocol::t2_blood_ms`, and
+`phantom` converts T2, T2\*, and the derived T2' to milliseconds for the `T2Volume` inputs. Nothing downstream of that boundary converts again, and nothing upstream of it
 is in milliseconds.
 
 **Derived fields.** These have no direct counterpart and must be computed:
@@ -1113,7 +1123,12 @@ the same arrays the signal stage used, so the answer key and the data cannot dis
 mirrors what `trxscan-microstructure` does for diffusion.
 
 The output sidecar echoes the input protocol and adds what the simulator resolved, including the
-overlay values and the random seed.
+overlay values and the random seed. Standard keys describe what was **simulated**: where an
+overlay overrides the sidecar's `LabelingEfficiency`, or the effective `PartialFourier`,
+`ParallelReductionFactorInPlane`, `MultibandAccelerationFactor` or `TotalAcquiredPairs` differ
+from the input, the standard key carries the effective value and the input's value is kept under
+`AslscanSimulation.InputValuesReplaced`. A sidecar whose standard keys contradict the data would
+mislead every consumer that does not know to look in the simulator's block.
 
 ## P1 acceptance criteria
 

@@ -772,6 +772,20 @@ git tag p1-complete
 | 6. Noise uncorrelated across volumes and with the separate M0 | Task 7 unit test; Task 9 Step 4 |
 | 7. `cargo test` passes in the pure-std default build | Every task; Task 9 Step 5 |
 
+## Codex adversarial review (2026-09-24)
+
+Fifteen findings on `p1-complete`, all accepted and fixed in the follow-up commit: output sidecar
+standard keys now carry the simulated values (originals under `InputValuesReplaced`); one-element
+timing arrays are arrays; empty `EchoTime` arrays, negative or non-finite timing/overlay values,
+`LookLocker: true`, `VascularCrushing: true`, an absent `BackgroundSuppression`, a missing
+`BolusCutOffTechnique`/`M0Estimate`, more than two cutoff times, and multiband groups of the wrong
+size are all rejected; non-finite fieldmaps and non-integral or out-of-int16 labels are rejected;
+the M0 sidecar carries `SliceEncodingDirection` and the readout keys; the converter refuses
+negative crop bounds; `simulate_with`/`RowOverride` are behind `cfg(test)` or the `test-hooks`
+feature; the homogeneous-grid test is per-voxel relative with an absolute floor; blood T2's
+conversion moved to `protocol`. Nothing numerical was found wrong in `kinetic`, `mrsignal`,
+`resample` or `series`.
+
 ## What P1 does not do
 
 Background suppression, IR and GE contrasts, motion, vascular crushing, the macrovascular compartment, 3D readouts, multi-TE, Hadamard/Look-Locker, `--compat-asldro`: all later sub-projects per the spec. Phase encoding must be the second data axis. The phantom must be axis-aligned. `Manufacturer` in the part sidecars is overwritten after the fact rather than parameterized in `mrsim-acq`.
