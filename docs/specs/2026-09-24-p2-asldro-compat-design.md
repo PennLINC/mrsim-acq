@@ -97,13 +97,17 @@ T2 is not used; the sidecar records `T2Blood` as unused under compat. The compar
 itself stays (it is what makes the linearity identity testable), and the class/voxel choice
 becomes irrelevant to the numbers, since no per-compartment relaxation is applied.
 
-**Readout with no effects.** With `oversample = 1` the acquisition stage is the legacy exact
-round trip (the main spec: "no Gibbs ringing and no object phase"), with `do_distortions` off
-(no fieldmap is allowed), no relaxation, one coil, full sampling. The forward transform and the
-reconstruction are then inverses up to floating point, and the acquired complex image is the
-simulation-grid input. The `SliceTiming` the 2D contract requires is all zeros; the sidecar says
-so, and `MRAcquisitionType` stays `"2D"` (simasl labels its output 3D; this is a metadata
-difference, not a numerical one, and P5 owns 3D).
+**Readout with no effects.** `aslscan` always calls `simulate_acquisition_oversampled`. With
+`oversample = 1` its simulation and acquisition grids coincide, so the forward transform and the
+reconstruction are a same-size pair and inverses up to floating point, the property
+`kspace.rs` documents for the legacy entry point ("no Gibbs ringing and no object phase") and
+the one P1's homogeneous-grid test and P3's translation test already rely on. With
+`do_distortions` off (no fieldmap is allowed), no relaxation, one coil, full sampling, no
+window, and the CLI's phase model (global 0, no background modes, no preparation phase), the
+acquired complex image is the real-valued simulation-grid input, and its phase is zero. The
+`SliceTiming` the 2D contract requires is all zeros; the sidecar says so, and
+`MRAcquisitionType` stays `"2D"` (simasl labels its output 3D; this is a metadata difference,
+not a numerical one, and P5 owns 3D).
 
 **The grid.** `grid_origin = "voxel-centre"` places acquisition voxel 0's centre on phantom
 voxel 0's centre, as simasl's `transform_resample_affine` does, so the two outputs are on the
