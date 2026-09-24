@@ -47,8 +47,9 @@ Per ASL series, seeded with `np.random.seed(random_seed)`:
      parts of every k-space sample, inverse FFT. The image-space noise is therefore white with
      per-component standard deviation `mean(|m0_acq|) / desired_snr` (default SNR 50), the same
      amplitude for every volume.
-   - `PhaseMagnitudeFilter`: magnitude by default, or the complex image with
-     `output_image_type = "complex"`.
+   - `PhaseMagnitudeFilter`: the ASL branch always keeps the magnitude
+     (`examples.py:226-234`); `output_image_type = "complex"` exists for the structural series
+     only.
 4. The volumes are concatenated and written as BIDS with simasl's own (draft-era) sidecar keys.
 
 A `ground_truth` series resamples every ground-truth quantity to `acq_matrix` with the same
@@ -160,9 +161,14 @@ against the right cause:
 `aslscan/tools/compat_asldro.py`, run in the `simasl` environment, since it imports
 `asldro`. It takes a benchmark name and a phantom, and for each case:
 
-1. Builds simasl's `input_params` (the schema `validate_input_params` accepts) and runs
-   `run_full_pipeline` to a temporary archive, with `output_image_type = "complex"` so that the
-   complex image is compared, not a magnitude.
+1. Builds simasl's `input_params` (the schema `validate_input_params` accepts) and runs the
+   ASL branch of `run_full_pipeline` filter by filter, with the same objects in the same order
+   under the same `np.random.seed`, keeping each volume's **complex** image before
+   `PhaseMagnitudeFilter` (the pipeline itself writes magnitudes only). Once per benchmark it
+   also runs `run_full_pipeline` proper to a temporary archive and checks that the archive's
+   magnitude equals the modulus of its own complex volumes, so the replication is known to be
+   faithful. The comparisons below are on complex images where both sides have them and on
+   magnitudes for the archive check.
 2. Writes the equivalent `aslscan` inputs: an `asl.json` from the parameter table below, an
    `aslcontext.tsv` from `asl_context`, and an overlay with `[compat]`, `[kinetic]` and the
    pose trajectory when the case has motion, then runs the `aslscan` binary on the phantom
