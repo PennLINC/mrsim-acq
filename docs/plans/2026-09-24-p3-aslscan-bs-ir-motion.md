@@ -235,6 +235,24 @@ spin-echo fixture is byte-identical to P1's.
 | Random motion, same seed, twice | byte-identical magnitude NIfTI |
 | bids-validator 3.0.2 on the suppression, IR and motion runs | 0 errors; warnings as P1 (NIFTI_UNIT/PIXDIM, recommended keys, TOO_FEW_AUTHORS) |
 
+## Codex adversarial review (2026-09-24)
+
+Nine findings on the tagged range, all verified and fixed; `p3-complete` moved onto the fix
+commits. The blocker: the suppressed-tissue slice cache was keyed on `(TR, t_read, pulse set)`
+but not the slice, so simultaneously excited multiband slices received the first slice's
+anatomy (found independently while the review ran; the suppression ratio test now runs on a
+multiband timing and fails with the old key). The defects: effective
+`BackgroundSuppressionPulseTime`/`NumberPulses` are now written from the first PLD's resolved
+pulses; the separate M0 sidecar's `FlipAngle` is the 90 degrees it is simulated at; the
+trajectory TSV is validated before mrsim-acq's loader (which zeroes bad cells and accepts NaN);
+a sidecar `FlipAngle` in BIDS' `[0, 360]` is normalised to simasl's signed range; the
+readout-in-TR check covers included m0scan rows and the separate M0; duplicate `motion.volumes`
+are refused (mrsim-acq's linear mode would halve the ramp); an overlay
+`excitation_flip_angle = 90` is accepted for spin echo; and the series IR tests gained a real
+inversion case and an exact `sin(fa)` check so a bypass of the IR tissue equation cannot pass.
+Nothing numerical was found wrong in `longitudinal`, `mrsignal`, the motion application or the
+ground truth.
+
 Acceptance run recipe (gitignored): `tools/hrgt_to_bids.py --name hrgt_icbm_2009a_nls_3t --out
 work/phantom-3t-z100 --crop 0:197 0:233 45:145`, then `work/acceptance_p3.sh` (asl002's real
 sidecar and aslcontext with `[m0] repetition_time = 8.0`; the `inversion_efficiency = 1.0` and
