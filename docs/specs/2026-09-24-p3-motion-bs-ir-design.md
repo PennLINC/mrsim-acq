@@ -415,10 +415,12 @@ New code, test-first, pure std where the P1 modules are.
    model name.
 2. A second `asl002` run with the overlay also setting `inversion_efficiency = 1.0`, compared
    with a third run with suppression switched off in the overlay: the first slice's GM and WM
-   tissue signal is suppressed by more than 80%, and the complex `control - label` difference in
-   GM changes by less than `1e-6` relative between the two runs (the label factor is `+1`, and the
-   difference must not care about the tissue's suppression). Magnitude subtraction does not
-   inherit the linearity identity, so the comparison is on the complex images.
+   tissue signal is suppressed by more than 80%, and the complex `control - label` difference
+   changes by less than `1e-4` of its peak between the two runs (the label factor is `+1`, and
+   the difference must not care about the tissue's suppression; the difference is about 1% of
+   the tissue signal, so the float32 storage of the images puts the floor near `1e-5`).
+   Magnitude subtraction does not inherit the linearity identity, so the comparison is on the
+   complex images.
 3. An `"ir"` protocol simulates against the simasl-derived fixtures at `1e-12`.
 4. A `trajectory` motion run reproduces an integer-voxel in-plane translation exactly at the
    resampler and within tolerance through the acquisition, and a `random` motion run is

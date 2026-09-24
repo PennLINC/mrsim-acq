@@ -206,6 +206,37 @@ suppression-off twins for criterion 2; an IR run; a `random` motion run and its 
 | 4. Trajectory translation exact at the resampler and within tolerance through the acquisition; random reproducible | Task 4 + Task 6 |
 | 5. mrsim-acq unchanged; `cargo test` default build green in both crates | every task |
 
-## Measurements
+## Measurements (2026-09-24, tag `p3-complete`)
 
-(filled in as the tasks complete)
+Executed as six commits on `aslscan` (`80a99d3` … the Task 6 commit); `mrsim-acq` untouched.
+Deviations from the plan text: the motion ground truth is two TSVs (`desc-motion_gt.tsv` with
+the per-volume poses, rotations in radians, and `desc-motionEvents_gt.tsv` with the shot events)
+rather than one mixed file; the IR fixture grid uses `TI in {0.3, 1.0, 1.8}` because simasl
+requires `TR >= TE + TI`, a constraint `protocol` now enforces too; and criterion 2's tolerance
+on the complex difference is `1e-4` of its peak, not `1e-6`, because the difference is about 1%
+of the tissue signal and the float32 storage of the images puts the floor near `1e-5`
+(measured `3.3e-5` on the crop, `4.1e-5` on the full phantom). The addendum was updated.
+
+Tests: 38 (default build), 70 (`io`), 8 end-to-end (`io,test-hooks`); clippy clean with
+`cli,test-hooks --tests`. The 24 IR fixture cases match simasl at `1e-12` relative and the
+spin-echo fixture is byte-identical to P1's.
+
+| Measurement | Value |
+|---|---|
+| Linearity residual / tolerance: P1, with suppression, with a shared pose | 0.138, 0.100, 0.152 |
+| asl002 on the crop, first-slice GM control ratio (perfect pulses / off) | 0.1608 (closed form 0.1608) |
+| asl002 on the crop, first-slice WM control ratio | 0.1757 (closed form 0.1757) |
+| Complex `control - label` change, perfect pulses vs off (crop / full phantom) | 3.3e-5 / 4.1e-5 of peak |
+| Default efficiency: deviation from 0.81 x the unsuppressed difference | 2.5e-5 / 3.3e-5 |
+| Full phantom (z-cropped to 20 slices), slice-0 interior GM / WM suppression | 83.8% / 82.3% |
+| Trajectory +2 voxel shift: acquired magnitude deviation (o = 1) | < 1e-5 of peak; ground truth bit-exact |
+| Within-volume events, dropout 1.0 / severity 0.5: image vs half the still image | < 1e-6 of peak |
+| Run time, asl002 real sidecar, 70 volumes, 106 x 126 x 20 simulation grid, release | 7.3 s (suppression), 7.9 s (IR), 9.0 s (random motion) |
+| Random motion, same seed, twice | byte-identical magnitude NIfTI |
+| bids-validator 3.0.2 on the suppression, IR and motion runs | 0 errors; warnings as P1 (NIFTI_UNIT/PIXDIM, recommended keys, TOO_FEW_AUTHORS) |
+
+Acceptance run recipe (gitignored): `tools/hrgt_to_bids.py --name hrgt_icbm_2009a_nls_3t --out
+work/phantom-3t-z100 --crop 0:197 0:233 45:145`, then `work/acceptance_p3.sh` (asl002's real
+sidecar and aslcontext with `[m0] repetition_time = 8.0`; the `inversion_efficiency = 1.0` and
+`BackgroundSuppression: false` twins; an IR overlay on the suppression-off sidecar; a `random`
+motion overlay run twice) and `work/acc_check.py` for criterion 2.
