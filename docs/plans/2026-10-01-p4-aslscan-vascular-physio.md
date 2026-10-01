@@ -101,9 +101,9 @@ Tests:
 - `arterial_dm`: the two closed forms at three times in the window, zero at `aatt - eps` and at
   `aatt + tau`, nonzero at `aatt`; the parcel coordinate.
 
-- [ ] Write the functions and tests in `src/kinetic.rs`.
-- [ ] `cargo test` (default features) green in WSL.
-- [ ] Commit: `feat: kinetic — sub-boluses, the intravascular part and the arterial term`.
+- [x] Write the functions and tests in `src/kinetic.rs`.
+- [x] `cargo test` (default features) green in WSL.
+- [x] Commit: `feat: kinetic — sub-boluses, the intravascular part and the arterial term`.
 
 ### Task 2: `crushing`, `rng::normal`, `physio`
 
@@ -157,9 +157,9 @@ sequence of the first five periods and drift values (the normative stream test),
 reference is checked again through `series` in Task 5, so a correct unit and a wrongly salted
 caller cannot coexist.
 
-- [ ] Write the three modules and their tests; add the modules to `lib.rs`.
-- [ ] `cargo test` (default features) green.
-- [ ] Commit: `feat: crushing, physio and a normal generator`.
+- [x] Write the three modules and their tests; add the modules to `lib.rs`.
+- [x] `cargo test` (default features) green.
+- [x] Commit: `feat: crushing, physio and a normal generator`.
 
 ### Task 3: `bolus`
 
@@ -198,9 +198,9 @@ boundary; PASL `Global` never cuts; `Slab(d)` cuts at `p - d`; the arterial fact
 both sides of a cut; zero-efficiency pulses give factor 1 but still cut (part A's invariance test
 in Task 6 uses this).
 
-- [ ] Write `src/bolus.rs` and tests; add to `lib.rs`.
-- [ ] `cargo test` green.
-- [ ] Commit: `feat: bolus — parcel entry, sub-bolus partition and factors`.
+- [x] Write `src/bolus.rs` and tests; add to `lib.rs`.
+- [x] `cargo test` green.
+- [x] Commit: `feat: bolus — parcel entry, sub-bolus partition and factors`.
 
 ### Task 4: `phantom` and `protocol` — inputs, activation, refusals
 
@@ -280,9 +280,9 @@ and value rules; compat refusals for every part; P1-P3 protocols parse to the sa
 fields as before (the existing protocol tests unchanged, plus a field-by-field comparison on the
 asl002 and pasl fixtures with no P4 input).
 
-- [ ] Write the phantom and protocol changes and tests.
-- [ ] `cargo test --features io,test-hooks` green.
-- [ ] Commit: `feat: protocol and phantom — P4 inputs, activation and refusals`.
+- [x] Write the phantom and protocol changes and tests.
+- [x] `cargo test --features io,test-hooks` green.
+- [x] Commit: `feat: protocol and phantom — P4 inputs, activation and refusals`.
 
 ### Task 5: `series`
 
@@ -367,9 +367,9 @@ tightly in f64 in Tasks 1 and 3.
 - the separate M0 scan is unchanged by every part (bit for bit against the part-off run);
 - with every part off, every existing series test passes unchanged.
 
-- [ ] Implement and test.
-- [ ] `cargo test --features io,test-hooks` green.
-- [ ] Commit: `feat: series — the P4 compartments, factors and ground truth`.
+- [x] Implement and test.
+- [x] `cargo test --features io,test-hooks` green.
+- [x] Commit: `feat: series — the P4 compartments, factors and ground truth`.
 
 ### Task 6: `bids` and the CLI
 
@@ -387,8 +387,8 @@ against the `Protocol` and `SeriesOutput`, each ground-truth file's presence and
 protocol's sidecar unchanged byte for byte with P4 code (the regression in Task 7 covers it at
 scale); validator run on the every-part dataset.
 
-- [ ] Implement and test; validator clean (errors none).
-- [ ] Commit: `feat: bids — P4 sidecar blocks and ground truth`.
+- [x] Implement and test; validator clean (errors none).
+- [x] Commit: `feat: bids — P4 sidecar blocks and ground truth`.
 
 ### Task 7: end to end, regression, acceptance
 
@@ -414,8 +414,9 @@ scale); validator run on the every-part dataset.
   exercised); run on the crop, validated.
 - Record every number in Measurements.
 
-- [ ] Commit: `test: P4 end to end and acceptance`.
-- [ ] Codex adversarial review of the implementation; fix the valid findings; ordinary Codex
+- [x] Commit: `test: P4 end to end and acceptance`.
+- [ ] Codex adversarial review of the implementation (skipped for now: the workspace was out of
+  credits; an internal adversarial review stood in and its findings are fixed); ordinary Codex
   review as the final pass; tag `p4-complete`.
 
 ## Acceptance criteria coverage
@@ -451,4 +452,51 @@ geometry added and the `mrsim-acq` test command made explicit.
 
 ## Measurements
 
-(filled in as the tasks complete)
+Measured 2026-10-01 at `aslscan` `9247127`. Unit and integration tests were run natively on
+Windows (`CARGO_TARGET_DIR=target-win`) while WSL was unresponsive, and in WSL for the release
+builds, the regression and the benchmarks; both builds pass the same suites (128 unit, 16
+end-to-end tests, clippy clean).
+
+**Task 1, `kinetic`.** `delta_m` is bit-identical to its pre-refactor body on 216 000+ points
+(three label types, four tissue settings, the `lambda` and `T1b` guards). Sub-boluses over random
+partitions, with cuts at the representable neighbours of the delivery edges, match the whole bolus
+to `1.9e-15` of peak (criterion `1e-12`). The intravascular part: partition-invariant and bounded
+by `delta_m`; the share is `0.95` at `ATT + 1e-7` s and below `2e-6` at `ATT + 1` s for
+`tau_ex = 1e-6`, finite in both PASL branches where the shared GKM form gives NaN.
+
+**Task 2.** `Si` matches `scipy.special.sici` to `1e-12` at six points and the asymptotic at
+`1e6`; `c(1) = 0.5894898722360835`; survival strictly decreasing on `r` in `[0, 3]`. Period mean
+and CV within 2% over 10 000 periods (the CV is 0.987 of the requested, the truncation at
+`±3 sd`); `mean_sin` exact against Simpson to `1e-10`; the OU lag-`tau_d` correlation within 0.05
+of `e^-1`. The reference stream is pinned and reproduced through `simulate`.
+
+**Task 3, `bolus`.** `"global"` after labeling gives P3's `label_factor` bit for bit at
+`epsilon` 1, 0.95 and 0.7. `asl002`'s GM with slab entry at arrival: `0.0821045` by the sub-bolus
+sum, by the closed form and by a parcel quadrature split at the cut.
+
+**Task 5, `series`** (crop, homogeneous grid). A matched `VENC` pair (0 and 4 cm/s, velocities
+10 / 6 / 3 cm/s) differs by `sum_c (c_c - 1) A_c` to `3.0e-7` of peak in both `class` and
+`voxel` mode. `"global"` bolus-position equals the global-bolus run bit for bit. The split
+conserves each label's total; the arterial image is the closed form per voxel for PCASL and PASL,
+in and out of the window. The separate M0 scan is bit-identical with every part on.
+
+**Task 7.** Linearity with every part on: `0.18` of the tolerance. Negative controls: the
+extravascular part routed to the blood breaks it by `54x`; the intravascular part routed to
+tissue 0 (`tau_ex = 10` s) and a control/label swap on the P4 path by more than `1e2`.
+`tools/regress_identity.sh p2-complete`: all 14 cases byte-identical (`pasl_cutoff` on the full
+phantom; the crop PCASL fixture in class and voxel mode; asl002 with suppression and its separate
+M0, motion, noise and IR on the z-cropped phantom; the crop at 2 x 2 x 3 mm with suppression, IR,
+motion, and PASL with suppression and with motion; asl004 in class and voxel mode on a 97-slice
+crop, its readout shortened to 0.025 s because as published it reads before the excitation in
+this model, the main spec's deferred line timing). P2's benchmarks rerun with the P4 build: every
+number as recorded in the P2 plan (A `6.2e-8`, E `9.9e-8` on 3 T; B, C, D, D-grid unchanged).
+`tests/fixtures/protocols/p4_all` (every part on, a slab pulse during labeling) on the crop
+validates with no errors (the three recommended-key warnings of every aslscan dataset).
+
+**Reviews.** The Codex adversarial review of the implementation died at its start ("workspace is
+out of credits") and was skipped at the user's direction. An internal adversarial review stood in;
+it confirmed the PASL stable algebra, the sub-bolus coordinates, compartment placement, slab
+indexing, the activation matrix and byte identity, and found one real defect (the drift window
+mean merged most windows into one trapezoid through grid-index rounding) and minor ones (the swap
+control on the P4 path, unbounded physiological amplitudes, three tests weaker than their names,
+regression coverage); all fixed in `9247127`, the VENC refusal kept and recorded in the spec.

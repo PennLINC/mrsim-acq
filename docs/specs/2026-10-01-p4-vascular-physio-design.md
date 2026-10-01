@@ -79,7 +79,11 @@ changes `mrsim-acq`.
 
 **Every part is opt-in, and P1, P2 and P3 outputs are byte-identical when none is enabled.** The
 P3 rule stands; the check is P2's (the pre-P4 binary in a sibling worktree, every NIfTI
-decompressed and every sidecar compared), plus P2's benchmarks A-E passing unchanged.
+decompressed and every sidecar compared), plus P2's benchmarks A-E passing unchanged. One input
+changes on purpose (implementation review): a sidecar carrying `VascularCrushingVENC` with
+`VascularCrushing` false or absent parsed before P4, its VENC ignored, and is refused now, since
+"nothing is ignored" applies to it as to any inactive input. No accepted input changes its
+output.
 
 **Activation is resolved in one place and nothing is ignored.** A part is on when its inputs are
 present (listed per part), and every P4 input that belongs to a part that is off is an error
