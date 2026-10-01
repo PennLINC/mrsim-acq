@@ -253,9 +253,12 @@ single-axis. ICBM 3 T (not gated): pure mask 28 voxels (mixed), 0 (single-axis);
 
 **The motion approximation (D on `[64, 64, 12]`, reported).** Box average then trilinear on the
 acquisition grid against simasl's single spline: ICBM 3 T all-voxel max rel 0.85, RMS 0.19;
-synthetic all-voxel 0.69, on the 9 886-voxel pure mask 0.11 (trilinear reads a neighbouring
-15.75 mm slice). This is the number the deferred move-then-evaluate pipeline would have to
-beat.
+synthetic all-voxel 0.69, RMS 0.23, and on the 6 570-voxel pure mask 9.9e-5. The pure mask for
+motion on a coarse grid covers the box footprints of every cell trilinear reads (`1.5 v` about
+the sample point; a final Codex review found the first version covered only one, which had put
+0.11 here). So the double resampling agrees with simasl wherever the tissue is uniform over
+what both read, and its cost is all at boundaries: the all-voxel numbers are what the deferred
+move-then-evaluate pipeline would have to beat.
 
 **The implementation review.** Codex reviewed `5812074..7ec099d` on 2026-10-01 (four major,
 two minor, all verified and fixed; no P1/P3 regression found): compat now refuses a sidecar
