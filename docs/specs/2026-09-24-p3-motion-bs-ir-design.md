@@ -177,7 +177,9 @@ phantom's GM (`ATT` 0.8 s, `tau` 1.8 s) is 2.6 s, after `asl002`'s first pulse a
 slab-confined model with two perfect pulses, the label delivered before 2.05 s is inverted twice
 and the rest once, and weighting the delivery kernel (blood decay at the phantom's `T1b` 1.65 s
 until arrival, tissue decay at 1.33 s after it) by the pulse history gives roughly `0.33` times
-the unsuppressed difference instead of `+1`. The global-bolus factor is therefore an upper bound
+the unsuppressed difference instead of `+1` (corrected in the P4 addendum: `asl002` is PCASL, and
+with PCASL's parcel weighting the value is `0.0821`; `0.33` came from weighting the parcels as
+PASL ones). The global-bolus factor is therefore an upper bound
 on the retained label, not an estimate of it. Doing better needs the pulse history along the
 delivery, which is the bolus-position modeling P4 introduces with the vascular compartment; it
 is the first item under "Decisions deferred", and the sidecar key is there so that P4's model
