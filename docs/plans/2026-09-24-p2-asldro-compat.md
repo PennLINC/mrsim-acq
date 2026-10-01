@@ -13,8 +13,15 @@ beyond `[compat]`. **`mrsim-acq` is not modified**: `do_relaxation`, `noise_vari
 same-size transform pair at `oversample = 1` already exist.
 
 **Spec:** the P2 addendum; the main spec and the P3 addendum where it is silent. P3 is complete
-at `aslscan` tag `p3-complete`. The Codex review of the P2 addendum could not run (the workspace
-was out of credits); its prompt is saved and the review is owed before or during Task 1.
+at `aslscan` tag `p3-complete`. The Codex adversarial review of the addendum ran on 2026-10-01
+(11 findings, all verified against the source and applied to the addendum and this plan): the
+box weights needed a corner offset, not only a new affine; an IR series' m0scan row is IR in
+simasl; the two noise references differ fivefold in variance; B's and D's in-plane interior
+masks keep through-plane and post-motion mixing (27% and 31% of peak), replaced by a 3D pure
+mask; compat must refuse unequal slice timings; simasl's kinetic overrides are
+`parameter_override`, not series keys; the driver must require a positive identity source
+affine; E runs on both phantoms; the crop needs a packed ground truth; C's seeds must differ
+beyond bit 0; the ASL default SNR is 100.
 
 ## Global constraints
 
@@ -28,7 +35,7 @@ was out of credits); its prompt is saved and the review is owed before or during
 - **The driver never resamples either output.** It checks the two affines and dimensions agree
   and errors otherwise; a comparison after a resample would measure the resample.
 - **Numbers, not adjectives, in the plan's Measurements section**, per benchmark, per phantom.
-- Commit per task with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`; tag
+- Commit per task with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`; tag
   `p2-complete` at the end.
 
 ## File structure
@@ -53,10 +60,14 @@ was out of credits); its prompt is saved and the review is owed before or during
 `acquisition_grid(phantom, voxel_mm, matrix_override, origin)`. `Corner` is P1's rule
 (`m[a][3] = o - 0.5 p + 0.5 v`); `VoxelCentre` is `m[a][3] = o`, acquisition voxel 0 centred on
 phantom voxel 0, which is what simasl's `transform_resample_affine` produces
-(`resampling_translate_affine` from the source origin). Dimensions are unchanged. Tests: both
-origins on a signed affine; the 3 T phantom's dimensions `[197, 233, 189]` with voxel
+(`resampling_translate_affine` from the source origin). Dimensions are unchanged. The box
+weights gain the corner offset: `axis_weights_offset(.., offset)`, `Resampler::with_offset`,
+and `corner_offset(src, dst)` deriving it from the two grids (exactly 0.0 for P1's corner
+grids, so `Resampler::new` is `with_offset(.., [0; 3])` bit for bit); a target cell before the
+source's near edge is a partial or empty cell, as one past the far edge is. Tests: both origins
+on a signed affine and their offsets; the 3 T phantom's dimensions `[197, 233, 189]` with voxel
 `[197/64, 233/64, 189/12]` give `[64, 64, 12]` under the `ceil(extent / voxel - 1e-9)` rule
-(each quotient is exactly representable).
+(each quotient is exactly representable); near-edge partial cells; offset 0 equals P1.
 
 `protocol`: an overlay table `CompatOverlay` with `asldro: Option<bool>`,
 `desired_snr: Option<f64>` and `grid_origin: Option<String>`; on the protocol,
@@ -70,8 +81,9 @@ origins on a signed affine; the 3 T phantom's dimensions `[197, 233, 189]` with 
   `noise_variance = 0`. A conflicting explicit value is an error naming the key, the value and
   the pinned value; an absent key takes the pinned value.
 - Refused from the sidecar: `ParallelReductionFactorInPlane > 1`,
-  `MultibandAccelerationFactor > 1`, `BackgroundSuppression: true`; from the overlay:
-  `[motion.within_volume]`. Each names simasl as the reason.
+  `MultibandAccelerationFactor > 1`, `BackgroundSuppression: true`, `M0Type: Separate`
+  (naming the m0scan row form), and a `SliceTiming` whose entries are not all equal; from the
+  overlay: `[motion.within_volume]`. Each names simasl as the reason.
 - `desired_snr` (finite, `>= 0`; 0 means none) is accepted only with `asldro = true`.
 - `grid_origin` defaults to `voxel-centre` under compat and `corner` otherwise; the strings
   `"corner"` and `"voxel-centre"` are the only ones.
@@ -83,8 +95,11 @@ Tests for each rule, plus a compat protocol that parses cleanly with an otherwis
 
 ### Task 2: `series` under compat
 
-- `acquisition_grid(..., p.grid_origin)`.
+- `acquisition_grid(..., p.grid_origin)`, and both resamplers built with
+  `corner_offset(phantom, acq_grid)` (the simulation grid shares the acquisition grid's corner).
 - A phantom with a fieldmap is refused under compat, naming simasl.
+- Under compat an included m0scan row takes the series' signal equation (IR for an IR series),
+  with no label; outside compat it stays the P3 spin-echo readout.
 - The per-voxel factor `te_factor(i) = exp(-TE / t2[i])` with `exp(0) = 1` at `t2 == 0`
   (simasl's `np.divide(where=t2 != 0)`), applied inside the tissue closures and the blood
   closure so tissue and blood of a voxel share it; `1.0` when compat is off, so the P1/P3 paths
@@ -97,11 +112,12 @@ Tests for each rule, plus a compat protocol that parses cleanly with an otherwis
 - The separate M0 scan under compat: simasl has no such thing (its M0 is an `m0scan` row); a
   compat protocol with `M0Type: Separate` is refused in `protocol` (Task 1) naming the row form.
 
-Tests: on the crop, a compat control run equals a non-compat run with `oversample = 1` and an
-overlay `noise_variance = 0` in which the acquisition has `do_relaxation = false` and the input
-was scaled by `exp(-TE/T2)` per voxel (built through `simulate_with` and a test hook that
-exposes the factor, or by comparing against a hand-scaled phantom copy); the noise variance
-formula reproduces on the crop; the linearity identity holds under compat.
+Tests: on the crop at the identity grid, a compat run's signed real image equals the closed
+form `(tissue + blood) * exp(-TE/T2)` per voxel (`tissue_se`/`tissue_ir`, `delta_m`, the
+zero-T2 guard) to float32 precision, for control, label and m0scan rows, SE and IR; the m0scan
+row of a non-compat IR series is still spin echo; the voxel-centre grid at 2 mm puts a
+single-voxel M0 point source where the affine says; the noise variance formula reproduces on
+the crop; a fieldmap phantom is refused; the linearity identity holds under compat.
 
 - [ ] Commit: `feat: series — compat relaxation at the echo, SNR noise, grid origin`.
 
@@ -120,17 +136,19 @@ error). Validator run on a compat dataset from the crop.
 
 `tools/compat_asldro.py` (`simasl` env: numpy 1.19, nibabel 3.1, nilearn 0.6.2, asldro):
 
-- `simasl_asl_series(params, keep_complex=True)`: builds the filter chain of
-  `examples.py:126-249` object for object (GkmFilter, InvertImageFilter, the M0
-  `TransformResampleImageFilter`, one `AcquireMriImageFilter` per `asl_context` entry with the
-  same inputs, `np.random.seed` first), returns the complex volumes, the resampled M0 and the
-  affines. `simasl_archive(params, path)` runs `run_full_pipeline` and returns the archive's
-  `asl/001_asl.nii.gz` magnitude; `assert_replication_faithful` checks
-  `|complex| == magnitude` to `1e-10` relative.
+- `run_simasl(params, out_zip)`: runs `run_full_pipeline` itself with
+  `asldro.examples.AcquireMriImageFilter` replaced by a recording subclass, and returns each
+  ASL volume's complex image (from the recorded filters' outputs), the noise reference (the M0
+  resample's output) and the archive's magnitude; `|complex| == magnitude` to float32 precision
+  is asserted, so the recording is known to be the run.
 - `translate(params) -> (asl_json, aslcontext, overlay_toml)` per the addendum's table, with
-  `AcquisitionVoxelSize = extent / acq_matrix` computed from the ground truth's shape and the
-  1 mm assumption checked against its affine (an error if the source voxels are not 1 mm, since
-  simasl's `output_voxel_size = scale` assumes it).
+  `AcquisitionVoxelSize = extent / acq_matrix` computed from the ground truth's shape; an error
+  unless the ground truth's linear affine is the positive identity; `lambda_blood_brain` and
+  `t1_arterial_blood` resolved from the ground-truth JSON merged with
+  `global_configuration.parameter_override`.
+- `pure_mask(dseg, acq_affine, acq_dims, pose=None)`: the addendum's 3D purity rule (box
+  footprint plus an 8-voxel cube about the pre-motion sample point, one foreground label),
+  with a check that the phantom's maps are constant per label.
 - `pose_to_mrsim(rot_deg_xyz, transl_mm, fov_centre, origin=(0, 0, 0)) -> (rot_deg_zyx, transl)`:
   `R = Rx Ry Rz` (simasl, `rot_x_mat` etc.), ZYX Euler extraction for `mrsim-acq`'s `Rz Ry Rx`,
   `t' = t + (R - I)(c - o)`, with the gimbal case (`|R[2][0]| = 1`) handled; the FOV centre from
@@ -144,27 +162,29 @@ error). Validator run on a compat dataset from the crop.
 - Subcommands `A`, `B`, `C`, `D`, `E`, `all`, each writing `work/compat/<bench>-<phantom>.json`
   and a Markdown table, exit status from the criteria.
 
-`tools/test_compat_asldro.py`: ten random poses (and one at the gimbal case) round-trip
-through `pose_to_mrsim` and re-composition to the same 4x4 within `1e-12`; the parameter
-translation of simasl's defaults yields `PostLabelingDelay = 1.8`, `LabelingDuration = 1.8`,
-`RepetitionTimePreparation = [10, 5, 5]`, `M0Type = "Included"`, `AcquisitionVoxelSize =
+`tools/test_compat_asldro.py`: ten random poses (and one at the gimbal case) map points through
+`pose_to_mrsim` and `mrsim-acq`'s `Pose::to_matrix` (re-implemented in numpy) to the same place
+as through simasl's transform, within `1e-12`, and each of D's wrong conversions does not; the
+parameter translation of simasl's defaults yields `PostLabelingDelay = 1.8`, `LabelingDuration =
+1.8`, `RepetitionTimePreparation = [10, 5, 5]`, `M0Type = "Included"`, `AcquisitionVoxelSize =
 [3.078125, 3.640625, 15.75]`, `SliceTiming` of 12 zeros; a PASL case maps `signal_time` to the
-PLD and `label_duration` to the cutoff.
+PLD and `label_duration` to the cutoff; a `parameter_override` reaches `[kinetic]`; a flipped
+source affine is refused.
 
 - [ ] Commit: `tools: the ASLDRO compat driver and its tests`.
 
 ### Task 5: the benchmarks and acceptance
 
 Convert both phantoms (`work/phantom-3t`, `work/phantom-1.5t`, full resolution). Run `all` on
-the 3 T phantom and `A` on the 1.5 T one. Record every number in Measurements. If a criterion
-fails, the finding goes in Measurements with its cause; the criterion is not loosened without a
-reason written next to it.
+the 3 T phantom and `A` and `E` on the 1.5 T one. Record every number in Measurements. If a
+criterion fails, the finding goes in Measurements with its cause; the criterion is not loosened
+without a reason written next to it.
 
 `tests/end_to_end.rs`: `linearity_holds_under_compat`; `compat_benchmark_a_on_the_crop`,
 gated on `ASLSCAN_SIMASL_ENV` (the micromamba env name) and printing a loud skip otherwise,
-which shells out to the driver with the crop as the ground truth (the driver accepts a
-converted-phantom directory plus the ASLDRO 5D file for simasl; the crop's source 5D is
-regenerated by `hrgt_to_bids.py --crop` into `work/` for this).
+which shells out to the driver's `crop` mode: it writes the crop window of the 3 T ground truth
+as a packed ASLDRO ground truth (5D NIfTI with the shifted affine, and the JSON) under `work/`,
+converts the same window with `hrgt_to_bids.py --crop`, and runs benchmark A on the pair.
 
 - [ ] Commit: `test: P2 benchmarks and acceptance`; tag `p2-complete`.
 
@@ -173,9 +193,9 @@ regenerated by `hrgt_to_bids.py --crop` into `work/` for this).
 | Criterion | Where |
 |---|---|
 | 1. A and E at 1e-5 of peak on both phantoms | Task 5 |
-| 2. B interior at 1e-3; boundary and ground truth recorded | Task 5 |
-| 3. C statistics on both sides | Task 5 |
-| 4. D passes converted, fails unconverted | Task 4 tests + Task 5 |
+| 2. B pure mask at 1e-3; all-voxel numbers and ground truth recorded | Task 5 |
+| 3. C statistics on both sides, cross-side reference ratio | Task 5 |
+| 4. D passes converted, fails each wrong conversion | Task 4 tests + Task 5 |
 | 5. Compat dataset validates; sidecar names every pinned value | Task 3 |
 | 6. mrsim-acq unchanged; default builds green | every task |
 
