@@ -234,10 +234,10 @@ T1 4.1e-6, T2 3.6e-6, M0 1.1e-4; ATT 4.7e-3, reported not gated (simasl's spline
 
 **C (3 T, `[64, 64, 12]`, SNR 50, seeds 2..16 even): pass.**
 
-| Side | M0 ref mean | ref voxels | predicted var | var re | var im | rho re/im | adjacent rho x/y/z | Var(C-L)/Var(C) |
+| Side | M0 ref mean | ref voxels | predicted var | var re | var im | rho re/im | adjacent rho x/y/z, re ; im | Var(C-L)/Var(C) |
 |---|---|---|---|---|---|---|---|---|
-| aslscan | 56.360 | 13 282 | 1.271 | 1.270 | 1.270 | -0.0006 | +0.0007 / -0.0001 / -0.0002 | 1.999 |
-| simasl | 25.513 | 29 492 | 0.2604 | 0.2600 | 0.2599 | -0.0003 | +0.0024 / +0.0000 / +0.0004 | 1.997 |
+| aslscan | 56.360 | 13 282 | 1.271 | 1.270 | 1.270 | -0.0006 | +0.0007 / -0.0001 / -0.0002 ; -0.0004 / +0.0012 / -0.0008 | 1.999 |
+| simasl | 25.513 | 29 492 | 0.2604 | 0.2600 | 0.2599 | -0.0003 | +0.0024 / +0.0000 / +0.0004 ; -0.0008 / +0.0008 / -0.0005 | 1.997 |
 
 Cross-side variance ratio 0.2047 against a squared reference ratio of 0.2049: the fivefold
 difference in noise at equal `desired_snr` is the M0 reference and nothing else. All 8
@@ -256,6 +256,17 @@ acquisition grid against simasl's single spline: ICBM 3 T all-voxel max rel 0.85
 synthetic all-voxel 0.69, on the 9 886-voxel pure mask 0.11 (trilinear reads a neighbouring
 15.75 mm slice). This is the number the deferred move-then-evaluate pipeline would have to
 beat.
+
+**The implementation review.** Codex reviewed `5812074..7ec099d` on 2026-10-01 (four major,
+two minor, all verified and fixed; no P1/P3 regression found): compat now refuses a sidecar
+`PartialFourier` other than 1; `all` on an ICBM phantom also runs the synthetic B, D and D-grid,
+so it cannot succeed without the gates; C checks whiteness and `Var(C - L)/Var(C)` on the
+imaginary component too (a correlated-imaginary field had passed); D's negative controls need
+a valid mask and a finite error above the tolerance, and a non-finite archive comparison is an
+error (a NaN had counted as an expected failure); the synthetic and crop ground truths are
+regenerated on every run and converted phantoms are reused only on a matching content
+fingerprint, recorded in each report; the gimbal tests now reach the gimbal branch (the
+earlier poses did not). The numbers above are from the run after the fixes.
 
 **Compatibility of the non-compat paths.** P1/P3 outputs are byte-identical to `5812074` (every
 NIfTI decompressed and every sidecar) for PASL cutoff on the full 3 T phantom, the crop PCASL
