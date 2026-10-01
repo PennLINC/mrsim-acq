@@ -296,6 +296,30 @@ number a label-inverting preparation would then move away from.
 The default phantom for every benchmark is `hrgt_icbm_2009a_nls_3t`; benchmarks A and E also run
 on `hrgt_icbm_2009a_nls_1.5t` to cover the 1.5 T defaults.
 
+**The pure mask on the ICBM anatomy is empty** (measured during implementation, 2026-10-01): the
+3 T segmentation has no cube of one tissue with half-width 8 (half-width 6: about 3 000 GM and
+3 500 WM voxels; 8: none), so B's and D's pure masks hold 0 voxels on both ICBM phantoms. As the
+risks below require, the mask is not relaxed (a reach of 4 voxels leaves the spline's step
+response at about 7%, not `1e-3`). Instead B and D gate on a **synthetic ground truth**: the
+3 T phantom's grid, affine, quantities and per-label values, with three blocks for anatomy (WM
+`x 30:167, y 30:203, z 30:159`, GM its `x < 98` part, a CSF block `x 110:140, y 90:140,
+z 60:100` inside the WM), which keeps every boundary kind and has a large pure mask, and a
+linear ramp in M0 inside the tissue (`1 + 0.6 (x - 98)/68 + 0.15 (y - 116)/86 + 0.2 (z - 94)/64`
+times the label's value). Constant blocks proved blind to D's wrong conversions (both passed:
+a sub-millimetre misplacement inside a constant block reads the same constant); both kernels
+reproduce a linear field exactly, so the ramp keeps the right pose exact and makes a
+misplacement visible. On the synthetic phantom D's criterion is `1e-4` of peak, not `1e-3`: the
+right pose measured `2e-5` and the wrong conversions misplace the ramp by about `1e-3` at
+worst (the order error is at most 0.5 mm over the blocks for `(2, -3, 4)` degrees), so `1e-3`
+would not separate them. On the ICBM phantoms B and D run and are reported with their mask
+size, not gated. The geometry
+errors B and D exist to catch are independent of the anatomy; the anatomy's own kernel cost
+is the all-voxel number. One ground-truth map is reported rather than gated: ATT, whose CSF
+value is a 1000 s sentinel, a step about a thousand times the tissue value, which simasl's
+spline carries past the 8-voxel reach (WM reads 1.2057 s for 1.2 s on the synthetic blocks).
+The reach bound assumes a step no larger than the map's peak; `aslscan`'s masked mean over
+perfused voxels does not see the sentinel at all.
+
 ---
 
 # Part C: what P2 decides for P3
@@ -374,10 +398,11 @@ round trip already exist. The driver and its report are Python in the `simasl` e
 
 1. Benchmarks A and E pass at `1e-5` of peak on both phantoms; the numbers are recorded in the
    plan.
-2. Benchmark B passes its pure-mask criterion on a mask of at least 50 voxels; its all-voxel
+2. Benchmark B passes its pure-mask criterion on a mask of at least 50 voxels on the synthetic
+   ground truth; on the ICBM phantom its mask size, all-voxel
    numbers and the ground-truth comparison are recorded.
 3. Benchmark C passes every statistic on both sides and the cross-side reference check.
-4. Benchmark D passes for the mixed-axis and single-axis poses and fails for each of the two
+4. Benchmark D (synthetic ground truth) passes for the mixed-axis and single-axis poses and fails for each of the two
    wrong conversions.
 5. A compat dataset validates with no errors, and its sidecar names every pinned value.
 6. `mrsim-acq` is unchanged; `cargo test` is green in the default build of both crates.

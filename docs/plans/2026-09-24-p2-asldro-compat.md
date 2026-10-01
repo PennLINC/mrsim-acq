@@ -91,7 +91,7 @@ on a signed affine and their offsets; the 3 T phantom's dimensions `[197, 233, 1
 `Protocol::acquisition` sets `do_relaxation = false` and the pinned values when compat is on.
 Tests for each rule, plus a compat protocol that parses cleanly with an otherwise empty overlay.
 
-- [ ] Commit: `feat: resample grid origin and the [compat] protocol table`.
+- [x] Commit: `feat: resample grid origin and the [compat] protocol table`.
 
 ### Task 2: `series` under compat
 
@@ -119,7 +119,7 @@ row of a non-compat IR series is still spin echo; the voxel-centre grid at 2 mm 
 single-voxel M0 point source where the affine says; the noise variance formula reproduces on
 the crop; a fieldmap phantom is refused; the linearity identity holds under compat.
 
-- [ ] Commit: `feat: series — compat relaxation at the echo, SNR noise, grid origin`.
+- [x] Commit: `feat: series — compat relaxation at the echo, SNR noise, grid origin`.
 
 ### Task 3: `bids` and the CLI
 
@@ -130,7 +130,7 @@ RelaxationAtEcho: true, SliceTimingAllZero: true }`; `Resolved.T2Blood` gains
 overlay that also sets it is fine; one that sets it false while the flag is given is an
 error). Validator run on a compat dataset from the crop.
 
-- [ ] Commit: `feat: bids — the Compat sidecar block; --compat-asldro`.
+- [x] Commit: `feat: bids — the Compat sidecar block; --compat-asldro`.
 
 ### Task 4: the driver
 
@@ -171,7 +171,7 @@ parameter translation of simasl's defaults yields `PostLabelingDelay = 1.8`, `La
 PLD and `label_duration` to the cutoff; a `parameter_override` reaches `[kinetic]`; a flipped
 source affine is refused.
 
-- [ ] Commit: `tools: the ASLDRO compat driver and its tests`.
+- [x] Commit: `tools: the ASLDRO compat driver and its tests`.
 
 ### Task 5: the benchmarks and acceptance
 
@@ -186,7 +186,7 @@ which shells out to the driver's `crop` mode: it writes the crop window of the 3
 as a packed ASLDRO ground truth (5D NIfTI with the shifted affine, and the JSON) under `work/`,
 converts the same window with `hrgt_to_bids.py --crop`, and runs benchmark A on the pair.
 
-- [ ] Commit: `test: P2 benchmarks and acceptance`; tag `p2-complete`.
+- [x] Commit: `test: P2 benchmarks and acceptance`; tag `p2-complete`.
 
 ## Acceptance criteria coverage
 
@@ -201,4 +201,67 @@ converts the same window with `hrgt_to_bids.py --crop`, and runs benchmark A on 
 
 ## Measurements
 
-(filled in as the tasks complete)
+Measured 2026-10-01 with `tools/compat_asldro.py` (reports under `aslscan/work/compat/`), release
+build `cli,kspace,par`, `--t2-mode voxel`. "Max rel" is `max |aslscan - simasl| / peak(simasl)`
+on the signed real part, per volume; `control - label` against its own peak.
+
+**A and E (identity grid, criterion `1e-5`, `1e-4` for control - label): pass everywhere.**
+
+| Run | m0scan | control | label | control - label |
+|---|---|---|---|---|
+| A, 3 T | 6.2e-8 | 6.2e-8 | 6.5e-8 | 1.8e-6 |
+| A, 1.5 T | 7.0e-8 | 6.2e-8 | 6.3e-8 | 4.6e-6 |
+| E (IR, m0scan IR), 3 T | 8.3e-8 | 9.9e-8 | 8.3e-8 | 1.1e-6 |
+| E, 1.5 T | 1.1e-7 | 3.0e-8 | 5.7e-8 | 7.0e-6 |
+| A, crop (cargo test) | 6.2e-8 | 6.2e-8 | 6.5e-8 | 1.8e-6 |
+| E, crop (cargo test) | 8.3e-8 | 9.9e-8 | 8.3e-8 | 1.1e-6 |
+
+The residual is float32 storage: the oversample-1 round trip, the compat relaxation factor and the
+IR m0scan row reproduce simasl's pipeline. The P3 baseline the label-inverting IR would depart
+from is therefore exact.
+
+**B (`[64, 64, 12]`).** ICBM 3 T: pure mask **0 voxels** (no 17-voxel cube of one tissue exists;
+half-width 6 has ~3 000 GM and ~3 500 WM voxels, 8 has none), so not gated. All-voxel max rel
+0.73 / 0.71 / 0.71 (m0scan / control / label), RMS rel 0.16; control - label max 1.03, RMS 0.36.
+Ground truth all-voxel max rel: perfusion 0.92, ATT 1.00 (the CSF sentinel), T1 0.79, T2 0.83,
+M0 0.72. This is the measured cost of box averaging against a point-sampled spline at 15.75 mm
+slices. Synthetic blocks (gated): pure mask 9 572 voxels (GM 5 117, WM 4 415, CSF 40); images
+max rel **1.0e-4** on the mask (control - label 1.4e-4), pass at `1e-3`; with constant blocks
+it was 7.7e-7, the difference being the M0 ramp (aslscan box-averages piecewise-constant phantom
+voxels, simasl point-samples the interpolant). Ground truth on the mask: perfusion 4.0e-6,
+T1 4.1e-6, T2 3.6e-6, M0 1.1e-4; ATT 4.7e-3, reported not gated (simasl's spline carries the
+1000 s CSF sentinel past the 8-voxel reach: WM 1.2057 s for 1.2 s).
+
+**C (3 T, `[64, 64, 12]`, SNR 50, seeds 2..16 even): pass.**
+
+| Side | M0 ref mean | ref voxels | predicted var | var re | var im | rho re/im | adjacent rho x/y/z | Var(C-L)/Var(C) |
+|---|---|---|---|---|---|---|---|---|
+| aslscan | 56.360 | 13 282 | 1.271 | 1.270 | 1.270 | -0.0006 | +0.0007 / -0.0001 / -0.0002 | 1.999 |
+| simasl | 25.513 | 29 492 | 0.2604 | 0.2600 | 0.2599 | -0.0003 | +0.0024 / +0.0000 / +0.0004 | 1.997 |
+
+Cross-side variance ratio 0.2047 against a squared reference ratio of 0.2049: the fivefold
+difference in noise at equal `desired_snr` is the M0 reference and nothing else. All 8
+realizations distinct on both sides.
+
+**D (identity grid, pose `(2, -3, 4)` deg / `(1.5, -2, 0.5)` mm).** Synthetic blocks with the M0
+ramp (gated at `1e-4`, pure mask 1.79 M voxels): converted mixed pose 2.2e-5, single-axis
+`rot_z = 5` 1.6e-5 (pass); wrong rotation order 1.0e-3, wrong rotation centre 1.8e-3 (fail, as
+required). With constant blocks both wrong conversions had passed (2.1e-5): the ramp is what
+makes D discriminate. All-voxel max rel (kernel cost at boundaries): 0.18 mixed, 0.10
+single-axis. ICBM 3 T (not gated): pure mask 28 voxels (mixed), 0 (single-axis); on the 28,
+9.7e-7; all-voxel max rel 0.34 mixed, 0.28 single-axis, 0.64 wrong order, 1.00 wrong centre.
+
+**The motion approximation (D on `[64, 64, 12]`, reported).** Box average then trilinear on the
+acquisition grid against simasl's single spline: ICBM 3 T all-voxel max rel 0.85, RMS 0.19;
+synthetic all-voxel 0.69, on the 9 886-voxel pure mask 0.11 (trilinear reads a neighbouring
+15.75 mm slice). This is the number the deferred move-then-evaluate pipeline would have to
+beat.
+
+**Compatibility of the non-compat paths.** P1/P3 outputs are byte-identical to `5812074` (every
+NIfTI decompressed and every sidecar) for PASL cutoff on the full 3 T phantom, the crop PCASL
+fixture, and asl002 with background suppression, random motion, noise and IR on the z-cropped
+phantom. (`pcasl_single` and `pcasl_multipld` are refused identically by both builds: their
+slice timing ends after their TR under the P3 readout-in-TR check, which predates P2.) A compat
+crop dataset validates with no errors (three recommended-key warnings, as P1's). `mrsim-acq`
+source is unchanged; `cargo test` is green in the default build of both crates and in
+`aslscan --features cli,kspace,par,test-hooks` with `ASLSCAN_SIMASL_ENV=simasl`.
