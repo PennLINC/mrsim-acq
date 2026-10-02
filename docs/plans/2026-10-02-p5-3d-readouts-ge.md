@@ -728,6 +728,25 @@ nothing distinguishes partitions (`1e-9`); class and voxel modes agree to `4.2e-
 degrees; linear in the images (`1e-6`), line weights scale their shots; noise seeded and
 measured; the refusals and the uncertifiable-range report.
 
+### Task 14 (2026-10-02, aslscan a5ccff2)
+
+- `[readout] type = "spiral"`: `interleaves` and `spiral_readout_time` required (errors naming
+  them), `dwell_time` from the overlay over `DwellTime`, `NumberShots` absent meaning
+  `interleaves x kz_segments` and checked when given, a square matrix, `PhaseEncodingDirection`,
+  `TotalReadoutTime`, `EffectiveEchoSpacing`, GRAPPA, partial Fourier, ghosting and spikes refused,
+  a build without `kspace` refused naming the feature. The series certifies every slice's
+  segmentation before the acquisition and records it; the sidecar's `Readout` block carries the
+  trajectory (`tau_c`, samples, turns), the segmentation (per mode: max `L`, `m`, `B`, bound, and
+  per slice) and the reconstruction's fixed parameters; `DwellTime` and `NumberShots` are the
+  standard keys written (no phase-encode keys), on the M0 sidecar too.
+- **`asl001_p5`** (crop `0:197 0:233 15:175`, `work/phantom-3t-asl001`): resolves to
+  `64 x 64 x 20`, 8 shots, ESP `10.528` ms, 1000 samples per interleaf, `tau_c = 0.0116` ms,
+  refocusing 111 degrees (sidecar), volume duration `8 x 4.886 = 39.088` s; the phantom has no
+  fieldmap, so the segmentation is `L = 2` (exact); simulates in 7.5 s (WSL, release) and
+  validates with no errors (warnings only: authors, recommended keys).
+- End to end: linearity under spirals with every P4 part, physiology and a shot event `0.163` of
+  the tolerance, its negative control failing; the sidecar test; the non-`kspace` refusal.
+
 ## Codex review of this plan (2026-10-02)
 
 Nine findings (1 blocker, 4 major, 4 minor), all verified and applied. The blocker was in the
