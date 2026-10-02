@@ -116,7 +116,7 @@ K(kx, ky, kz_p) = sum_c  W_c(p, ky) * sum_z exp(-i 2 pi (p - pc)(z - zc) / nz) *
 - **The stack of spirals** keeps the kz structure and replaces the in-plane Cartesian EPI block
   with a spiral, which the 2D machinery cannot express (integer `kspace_index`, one time per
   line, a Cartesian x-stage). It needs a non-Cartesian forward (a time-segmented type-2 NUFFT)
-  and a gridding reconstruction. That is the one genuinely new numerical component, and it is
+  and a non-Cartesian (least-squares) reconstruction. That is the one genuinely new numerical component, and it is
   part C.
 
 The reconstruction mirrors the forward: an inverse z-DFT turns the 3D k-space into one 2D
@@ -130,7 +130,7 @@ aslscan's 3D protocol and timing (part B, with the GRASE readout); the stack-of-
 (part C); segmentation, meaning per-shot factors and per-shot motion, for both 3D readouts
 (part D). Out, with reasons under "Decisions deferred": 3D gradient-echo readouts, 3D
 inversion recovery, slab profiles and kz aliasing, through-plane oversampling, out-of-plane
-acceleration and kz partial Fourier, variable-density spirals and iterative spiral
+acceleration and kz partial Fourier, variable-density spirals and coil-coupled (SENSE) spiral
 reconstruction, and longitudinal evolution during the echo train.
 
 **Byte identity.** With no P5 input, every output is unchanged, now across two repositories:
@@ -533,7 +533,7 @@ window is applied (deferred).
 advantage (each sample carries the whole slab's signal at the same per-sample bandwidth), it is
 stated in the sidecar, and a test measures it. The statement holds for a linear Cartesian
 reconstruction (full sampling or zero-filled partial Fourier); GRAPPA's weights are calibrated on
-the data and spiral gridding has its own noise transfer, so for those the ratio is measured and
+the data and the spiral reconstruction has its own noise transfer, so for those the ratio is measured and
 recorded, not asserted.
 
 **Seeds**. The 3D path is new, so it does not need P0's per-slice seed: noise and spikes are keyed
@@ -752,7 +752,12 @@ remainder `rem(R) = 2 (R T / 4)^(m+1) (1 + B) / (m + 1)!`, every rate in the rec
 |e| <= |P e| + |e - P e| <= Lambda_m^2 max_grid |e| + rem(R_d) + Lambda_m rem(R_f)
 ```
 
-with the maxima taken over every sample time of the trajectory. `m` is the smallest degree making
+with the maxima taken over every sample time of the trajectory, plus `4 L eps (1 + B)` for the
+rounding of evaluating the interpolant (amended 2026-10-02: at a single rate the computed error
+exceeded the bound by rounding alone). The least-squares fit is solved through a factored SVD
+(one-sided Jacobi on the narrower side), never through an explicit pseudo-inverse: at these
+condition numbers (`1e11` and more) applying one loses about `eps / sigma_min`, `4.5e-6` on the
+grid, which stopped a 250 Hz range from certifying. `m` is the smallest degree making
 the remainder terms below `5e-8`; at `T = 4` ms, a 50 Hz range (`R_f T = 1.26`) and decay to
 `1100` s^-1 (`R_d T = 4.4`), `m = 20` suffices, so the grid has a few hundred points rather than
 `10^15`. `L` starts at `ceil(T (f_max - f_min)) + 2` and doubles until the bound is below `1e-7`;
@@ -762,24 +767,48 @@ mode the decay is outside the segmentation and the rectangle is the frequency in
 certification's cost (`(m+1)^2` rates times the sample count times `L`) is part of the
 feasibility benchmark, separately for `class` and `voxel` mode.
 
-**Reconstruction**: gridding, per coil. The type-1 (adjoint) NUFFT of the density-compensated
-samples onto the `nx x ny` grid, with the opposite Fourier sign of the forward, deapodized;
-density compensation by the Pipe-Menon iteration (10 iterations, fixed, recorded), which needs
-only the forward and adjoint operators. The density weights are normalized so that a constant
-object with no off-resonance and no decay reconstructs to its Cartesian value (the image scale
-then matches the Cartesian path and P1's `signal_scale` meaning is kept). Then the existing Roemer
-combine, which divides by the same sensitivities the forward applied. The trajectory, its density
-weights and the NUFFT plans depend only on the protocol and are computed once per series. GRAPPA, partial Fourier, ghosting and spikes have no spiral meaning in this model and are
-refused with `type = "spiral"`; the in-plane window applies as a radial weight on the samples, the
-same radial function `KspaceWindow` defines (`kspace.rs:120-141`).
+**Reconstruction** (amended 2026-10-02 after the feasibility benchmark; the first version was
+gridding alone): density-weighted least squares, per coil and partition, by a fixed linear
+iteration. The image `x` on the `nx x ny` grid approximately minimizes
+`sum_j w_j |(A x)_j - d_j|^2`, `A` the forward of an object on the acquired grid (the type-2 NUFFT
+in the convention above, `1/(nx ny)`), `A^H` its adjoint (the type-1 NUFFT with the opposite sign,
+deapodized), `w_j` the density weights. The solver is the **Chebyshev semi-iteration** on the
+normal equations `A^H W A x = A^H W d` from `x = 0`, over the eigenvalue interval
+`[lambda_hi / 30, lambda_hi]`, 40 iterations, `lambda_hi` 1.1 times the largest eigenvalue from 50
+power iterations on a fixed start vector: every coefficient depends only on the trajectory and
+the weights, so the reconstruction is a fixed **linear** operator on the samples, which the
+linearity identity requires (conjugate gradients, whose step sizes depend on the data, is not).
+Its residual polynomial is bounded by 1 on `[0, lambda_hi]`, so no data component is amplified.
+The density weights are Pipe and Menon's in operator form, `w <- w / |A A^H w|` (10 iterations,
+fixed, recorded), normalized so that a constant object with no off-resonance and no decay grids to
+its Cartesian value at the image centre (the scale is common to every weight, so it does not move
+the least-squares solution). Then the existing Roemer combine, which divides by the same
+sensitivities the forward applied. The trajectory, its density weights, `lambda_hi` and the NUFFT
+plans depend only on the protocol and are computed once per series. GRAPPA, partial Fourier,
+ghosting and spikes have no spiral meaning in this model and are refused with `type = "spiral"`;
+the in-plane window multiplies the samples before the reconstruction, by the same radial function
+`KspaceWindow` defines (`kspace.rs:120-141`), so the image approximates the windowed object as
+the Cartesian path's does.
+
+Why not gridding (the benchmark, plan Measurements, Task 12): the designed interleaves are
+exactly Nyquist-spaced radially, and at that spacing gridding reproduces a band-limited object to
+4 percent of peak and a uniform one to 30-50 percent, whatever the density weights (kernel and
+operator Pipe-Menon and the trajectory's exact annulus areas all give 1-6 percent on the
+band-limited object). At oversampling 1 the data of an object on the acquired grid are exactly
+`A x`, so the least squares recovers it as the iteration converges: the Chebyshev iteration
+above reaches `3e-4` on the band-limited object and `2e-3` to `5e-3` (FOV) and `5e-5` (centre) on
+the uniform one, at both `32 x 32` and `asl001`'s `64 x 64`. At higher oversampling, what the
+spiral samples of the sub-voxel structure outside the reconstruction's band is what it cannot
+represent, as with the Cartesian path's truncation.
 
 `nufft.rs` today is a 1D type-1 transform only (`nufft.rs:5`, one use site, `kspace.rs:661`). It
 gains a 2D type-1 and type-2 pair on the same exponential-of-semicircle kernel, with the
 direct-sum test pattern the 1D one already has (`matches_the_direct_sum`, `nufft.rs:141`).
 
 **Noise** is per complex sample with SD `sqrt(noise_variance / (nx ny))`, as Cartesian; after
-density-compensated gridding the image noise is not that of a Cartesian acquisition with the same
-`noise_variance`, and it is measured and recorded (the test reports the ratio), not asserted equal.
+the density-weighted least squares the image noise is not that of a Cartesian acquisition with
+the same `noise_variance`, and it is measured and recorded (the test reports the ratio), not
+asserted equal.
 
 ## Inputs
 
@@ -877,7 +906,7 @@ for 2D.
 | Echo-train timing, encoding order, the line-timing table | `mrsim-acq` `readout` |
 | EPG echo amplitudes | `mrsim-acq` `epg` (new, pure std) |
 | z-DFT, 3D noise and seeds, per-partition reconstruction | `mrsim-acq` `kspace` |
-| Spiral trajectory, 2D NUFFT pair, gridding, density compensation | `mrsim-acq` `readout`, `nufft` |
+| Spiral trajectory, 2D NUFFT pair, time segmentation, density compensation, least-squares reconstruction | `mrsim-acq` `readout`, `nufft`, `tseg`, `spiral`, `grid_recon` |
 | Gradient-echo signal equation, steady state under suppression | aslscan `mrsignal`, `longitudinal` |
 | 3D timing from BIDS, `[readout]`, activation and refusals | aslscan `protocol` |
 | Zero slice offsets, per-shot `row_start`, line weights, shot images | aslscan `series` |
@@ -938,11 +967,14 @@ per-line scalars, and knows nothing of labeling, kinetics or physiology.
   `<A x, y> = <x, A^H y>` to `1e-10`; the time-segmented forward against the exact sum on a
   complete small trajectory (all samples, `32 x 32`, oversample 2) to `1e-6` of peak, with
   independent maps of the fieldmap (50 Hz range), T2 and T2', and with a nonconstant object phase,
-  multi-coil sensitivities and `signal_scale`; gridding of a band-limited object with no
-  off-resonance reproduces it to `1e-2` of peak (declared now; if the implementation cannot meet
-  it, the spec is revisited, not the number); a uniform object reconstructs to its Cartesian
-  value to `1e-3`; with uniform off-resonance the reconstruction equals gridding of the
-  exact-sum samples to `1e-6`; the sampling bound accepts the designed trajectory, rejects a
+  multi-coil sensitivities and `signal_scale`; the reconstruction of a band-limited object with no
+  off-resonance reproduces it to `1e-2` of peak (declared before; gridding missed it at `4e-2`,
+  and the spec was revisited, not the number); a uniform object reconstructs to its Cartesian
+  value at the image centre to `1e-3` (the first version said everywhere; gridding missed both,
+  and the least squares' FOV error, `2e-3` to `5e-3`, is reported); the reconstruction is linear
+  (the sum of two data sets' reconstructions equals the reconstruction of the sum to rounding);
+  with uniform off-resonance the reconstruction equals the reconstruction of the exact-sum
+  samples to `1e-6`; the sampling bound accepts the designed trajectory, rejects a
   dwell time one percent above its bound, and rejects the second review's counterexample (one
   interleaf, `nx = 64`, 32 samples over 32 turns, which a chord check passes); the spiral forward
   at Cartesian frequency locations equals the Cartesian forward (part C). The time-segmentation
@@ -1018,7 +1050,7 @@ per-line scalars, and knows nothing of labeling, kinetics or physiology.
   excitation.
 - **A per-residue NUFFT** for interleaved GRASE timing with more than two ky segments, and the
   per-compartment NUFFT gate the main spec already defers.
-- **Variable-density and spiral-in trajectories, gradient delays, and iterative (SENSE) spiral
+- **Variable-density and spiral-in trajectories, gradient delays, and coil-coupled (SENSE) spiral
   reconstruction**.
 - **z-dependent coil sensitivities**.
 - **PASL readouts before the bolus cutoff** (`asl003`'s early delays): the refusal at
@@ -1051,7 +1083,8 @@ where a user will see why.
 **Part C may not be feasible at the stated accuracy and cost.** It is a separate milestone that
 opens with a benchmark; if the time-segmented forward needs more than `L = 64` or the gridding
 misses its declared tolerance, the spec is revisited before part C continues, and parts A, B and
-D stand on their own.
+D stand on their own. (It happened: gridding missed its tolerance, and the reconstruction became
+the linear least squares of part C; see the review record.)
 
 # Review record
 
@@ -1118,3 +1151,14 @@ The Codex review of the implementation plan (2026-10-02) found one defect in thi
 first-order time-segmentation certificate was correct but needed a grid spacing below `1.8e-5`
 s^-1 (`10^15` points with a decay range). It is replaced by the high-order Chebyshev certificate
 in part C, with the class and voxel cases separated in the feasibility benchmark.
+
+Amendment after the feasibility benchmark (plan Task 12, 2026-10-02; decided by the user, not
+yet Codex-reviewed). The time segmentation passed (`L = 6` at `asl001`, both modes; the bound held
+on every stress case) and so did the cost (one `asl001` volume: 2.8 s class, 56 s voxel), but
+gridding missed the declared tolerances (band-limited `4e-2`, uniform `0.3` to `0.5`) for a
+reason no density weighting fixes: the designed trajectory is exactly Nyquist-spaced radially.
+The reconstruction is now density-weighted least squares by a fixed Chebyshev semi-iteration
+(linear in the data, as the linearity identity needs; conjugate gradients was measured first and
+is accurate but data-dependent); the band-limited tolerance is unchanged, the uniform one is
+stated at the image centre, and linearity is tested. The certificate gained a rounding term, and
+the least-squares fit is required to be solved in factored form.

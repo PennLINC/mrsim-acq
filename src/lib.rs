@@ -45,7 +45,7 @@ pub mod kspace3d;
 pub(crate) mod spiral;
 /// Time segmentation with a certified error (feature `kspace`, P5 part C).
 pub mod tseg;
-/// Spiral gridding reconstruction with Pipe-Menon density compensation (feature `kspace`, P5 part C).
+/// The spiral reconstruction: density-weighted least squares (feature `kspace`, P5 part C).
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod grid_recon;
 /// Type-1 NUFFT (feature `kspace`): the fieldmap y-sum of the forward model as one gridded FFT.

@@ -1,23 +1,27 @@
-//! Gridding reconstruction of spiral k-space (P5 addendum, part C, "Forward and reconstruction").
+//! The spiral reconstruction (P5 addendum, part C, "Forward and reconstruction", as amended after
+//! the feasibility benchmark).
 //!
-//! Per coil, the type-1 (adjoint) NUFFT of the density-compensated samples onto the `nx x nx`
-//! acquired grid, with the opposite Fourier sign of the forward and the Cartesian inverse's centred
-//! convention (`img(X) = sum_j w_j d_j exp(-i 2 pi k_j . (X - n/2) / n)`), deapodized; then the
-//! Roemer combine of `kspace::reconstruct_coils`.
+//! Per coil and partition, density-weighted least squares on the `n x n` acquired grid,
+//! `min sum_j w_j |(A x)_j - d_j|^2`, with `A` the forward of an object on the acquired grid (the
+//! type-2 NUFFT in the Cartesian forward's convention, `1/n^2`) and `A^H` its adjoint (the type-1
+//! NUFFT with the opposite sign, `img(X) = sum_j r_j exp(-i 2 pi k_j . (X - n/2) / n)`,
+//! deapodized). The solver is the Chebyshev semi-iteration on `A^H W A x = A^H W d` from zero over
+//! `[lambda_hi / LS_KAPPA, lambda_hi]`, [`LS_ITERATIONS`] iterations, with `lambda_hi` from a
+//! fixed power iteration: every coefficient depends only on the trajectory, so the reconstruction
+//! is linear in the data (the linearity identity needs that; conjugate gradients is not), and its
+//! residual polynomial is bounded by 1 on `[0, lambda_hi]`. Then the Roemer combine of
+//! `kspace::reconstruct_coils`.
 //!
 //! The density weights are Pipe and Menon's (1999) fixed point in operator form,
-//! `w <- w / |G G^H w|` with `G^H` the gridding adjoint onto the `n x n` grid and `G` its type-2
-//! transpose (the reconstruction's own point-spread function, sampled at the samples, made flat),
-//! [`DCF_ITERATIONS`] iterations from `w = 1`, then scaled so that a constant object with no
-//! off-resonance and no decay reconstructs to its Cartesian value (`1`) at the image centre: the
-//! image scale then matches the Cartesian path's. The in-plane window multiplies each sample by
-//! `KspaceWindow::at` of its frequency, the radial function the Cartesian path applies on its grid.
+//! `w <- w / |A A^H w|`, [`DCF_ITERATIONS`] iterations from `w = 1`, scaled so that a constant
+//! object with no off-resonance and no decay grids (`A^H W d` up to the scale) to its Cartesian
+//! value at the image centre. The in-plane window multiplies the samples before the least squares
+//! by `KspaceWindow::at` of their frequency, the radial function the Cartesian path applies on its
+//! grid.
 //!
-//! Measured (Task 12): on the designed trajectories, whose interleaves are exactly Nyquist-spaced
-//! radially, gridding reproduces band-limited objects to 1-4% of peak, not the declared 1e-2,
-//! whatever the density weights (kernel or operator Pipe-Menon, or the trajectory's exact annulus
-//! areas); a few density-weighted least-squares (CG) iterations on the same NUFFT pair reach
-//! 2e-3. The plan's decision on part C is pending.
+//! Gridding alone (the first iterate, up to a scale) misses the declared accuracy on the designed
+//! trajectories, whose interleaves are exactly Nyquist-spaced radially: 4e-2 of peak on a
+//! band-limited object, 0.3-0.5 on a uniform one (plan Measurements, Task 12).
 #![cfg(feature = "kspace")]
 
 use std::f64::consts::TAU;
@@ -27,7 +31,14 @@ use crate::nufft::Nufft2;
 
 /// Pipe-Menon iterations (fixed, recorded).
 pub const DCF_ITERATIONS: usize = 10;
-/// The gridding NUFFT's tolerance.
+/// Chebyshev iterations of the least squares (fixed, recorded).
+pub const LS_ITERATIONS: usize = 40;
+/// The ratio of the Chebyshev interval's ends.
+pub const LS_KAPPA: f64 = 30.0;
+/// Power iterations for the largest eigenvalue of the normal operator, and the margin over it.
+pub const POWER_ITERATIONS: usize = 50;
+pub const LAMBDA_MARGIN: f64 = 1.1;
+/// The NUFFT's tolerance.
 const NUFFT_TOL: f64 = 1e-12;
 
 /// Pipe-Menon density weights (unnormalized) of the samples `k` for the gridding operator `nufft`.
@@ -54,41 +65,104 @@ fn dirichlet(k: f64, n: usize) -> C {
     acc.scale(1.0 / n as f64)
 }
 
-/// A spiral gridding reconstruction for one trajectory (all interleaves of one partition), built
-/// once per series.
-pub struct Gridding {
+/// The spiral reconstruction of one trajectory (all interleaves of one partition), built once per
+/// series.
+pub struct SpiralRecon {
     n: usize,
     k: Vec<[f64; 2]>,
-    /// Density weights times the window, normalized.
+    /// Density weights, normalized.
     w: Vec<f64>,
+    /// The window per sample.
+    win: Vec<f64>,
     nufft: Nufft2,
+    /// The Chebyshev interval's upper end.
+    pub lambda_hi: f64,
 }
 
-impl Gridding {
-    pub fn new(k: &[[f64; 2]], n: usize, window: KspaceWindow) -> Gridding {
+impl SpiralRecon {
+    pub fn new(k: &[[f64; 2]], n: usize, window: KspaceWindow) -> SpiralRecon {
         let h = (n / 2) as i64;
         let nufft = Nufft2::new([n, n], [-h, -h], [n, n], NUFFT_TOL);
-        let dcf = pipe_menon(&nufft, k, DCF_ITERATIONS);
-        let mut w: Vec<f64> = k.iter().zip(&dcf).map(|(p, &d)| d * window.at(p[0] / n as f64, p[1] / n as f64)).collect();
+        let mut w = pipe_menon(&nufft, k, DCF_ITERATIONS);
         // a constant object's centre pixel: sum_j w_j K(k_j), with K its exact samples
         let centre = k.iter().zip(&w).fold(C::ZERO, |acc, (p, &wj)| acc.add(dirichlet(p[0], n).mul(dirichlet(p[1], n)).scale(wj)));
         let s = 1.0 / centre.re;
         for wj in w.iter_mut() {
             *wj *= s;
         }
-        Gridding { n, k: k.to_vec(), w, nufft }
+        let win = k.iter().map(|p| window.at(p[0] / n as f64, p[1] / n as f64)).collect();
+        let mut r = SpiralRecon { n, k: k.to_vec(), w, win, nufft, lambda_hi: 0.0 };
+        // the largest eigenvalue of A^H W A, from a fixed start vector
+        let mut v: Vec<C> = (0..n * n).map(|i| C { re: 1.0 + (i % 7) as f64 * 0.1, im: (i % 3) as f64 * 0.1 }).collect();
+        let mut lam = 0.0;
+        for _ in 0..POWER_ITERATIONS {
+            let nv = norm(&v);
+            let u = r.normal(&v);
+            let nu = norm(&u);
+            lam = nu / nv;
+            v = u.into_iter().map(|c| c.scale(1.0 / nu)).collect();
+        }
+        r.lambda_hi = LAMBDA_MARGIN * lam;
+        r
     }
 
-    /// The weights actually applied (density, window, normalization).
+    /// The density weights (normalized).
     pub fn weights(&self) -> &[f64] {
         &self.w
     }
 
-    /// One coil's image on the `n x n` acquired grid (layout `x + n y`).
+    /// `A x`: the samples of an object on the acquired grid.
+    fn forward(&self, x: &[C]) -> Vec<C> {
+        let sc = 1.0 / (self.n * self.n) as f64;
+        let c: Vec<(f64, f64)> = x.iter().map(|c| (c.re, c.im)).collect();
+        self.nufft.type2(&c, &self.k, 1).into_iter().map(|(re, im)| C { re: re * sc, im: im * sc }).collect()
+    }
+
+    /// `A^H W r`.
+    fn adjoint(&self, r: &[C]) -> Vec<C> {
+        let sc = 1.0 / (self.n * self.n) as f64;
+        let wts: Vec<(f64, f64)> = r.iter().zip(&self.w).map(|(c, &w)| (c.re * w * sc, c.im * w * sc)).collect();
+        self.nufft.type1(&self.k, &wts, -1).into_iter().map(|(re, im)| C { re, im }).collect()
+    }
+
+    fn normal(&self, x: &[C]) -> Vec<C> {
+        self.adjoint(&self.forward(x))
+    }
+
+    /// The gridding image `n^2 A^H W d` (no window): the least squares' first direction, kept for
+    /// the tests that measure gridding against it.
+    pub(crate) fn gridding(&self, d: &[C]) -> Vec<C> {
+        let s = (self.n * self.n) as f64;
+        self.adjoint(d).into_iter().map(|c| c.scale(s)).collect()
+    }
+
+    /// One coil's image on the `n x n` acquired grid (layout `x + n y`): the windowed samples'
+    /// density-weighted least squares by the Chebyshev semi-iteration.
     pub(crate) fn image(&self, d: &[C]) -> Vec<C> {
         assert_eq!(d.len(), self.k.len(), "one value per sample");
-        let wts: Vec<(f64, f64)> = d.iter().zip(&self.w).map(|(c, &w)| (c.re * w, c.im * w)).collect();
-        self.nufft.type1(&self.k, &wts, -1).into_iter().map(|(re, im)| C { re, im }).collect()
+        let dw: Vec<C> = d.iter().zip(&self.win).map(|(c, &w)| c.scale(w)).collect();
+        let (hi, lo) = (self.lambda_hi, self.lambda_hi / LS_KAPPA);
+        let (theta, delta) = ((hi + lo) / 2.0, (hi - lo) / 2.0);
+        let sigma1 = theta / delta;
+        let mut rho = 1.0 / sigma1;
+        let mut x = vec![C::ZERO; self.n * self.n];
+        let mut r = self.adjoint(&dw);
+        let mut dir: Vec<C> = r.iter().map(|c| c.scale(1.0 / theta)).collect();
+        for _ in 0..LS_ITERATIONS {
+            for (xi, di) in x.iter_mut().zip(&dir) {
+                *xi = xi.add(*di);
+            }
+            let nd = self.normal(&dir);
+            for (ri, ni) in r.iter_mut().zip(&nd) {
+                *ri = C { re: ri.re - ni.re, im: ri.im - ni.im };
+            }
+            let rho1 = 1.0 / (2.0 * sigma1 - rho);
+            for (di, ri) in dir.iter_mut().zip(&r) {
+                *di = di.scale(rho1 * rho).add(ri.scale(2.0 * rho1 / delta));
+            }
+            rho = rho1;
+        }
+        x
     }
 
     /// Every coil's image, Roemer-combined with the known sensitivities as
@@ -119,6 +193,10 @@ impl Gridding {
     }
 }
 
+fn norm(v: &[C]) -> f64 {
+    v.iter().map(|c| c.re * c.re + c.im * c.im).sum::<f64>().sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,81 +217,103 @@ mod tests {
                       signal_scale: 1.0, ..Acquisition::default() }
     }
 
-    #[test]
-    fn gridding_reconstructs_a_band_limited_object_and_a_uniform_one() {
-        // Measured, not yet asserted: gridding misses both declared tolerances (spec part C,
-        // band-limited 1e-2, uniform 1e-3); GRID_STRICT=1 asserts them. The normalization is
-        // asserted.
-        // the asl001 in-plane design scaled to 32 x 32 (4 interleaves, 4 ms, 8 us), oversample 1
-        let n = 32;
-        let tr = spiral_trajectory(n, n, 4, 4.0, 0.008).unwrap();
-        let taus: Vec<f64> = (0..tr.k.len()).map(|j| tr.tau_ms[j % tr.n_samples()]).collect();
-        let g = Gridding::new(&tr.k, n, KspaceWindow::None);
-        let acq = plain();
-        let t2 = [T2Slice::Uniform(f32::INFINITY)];
-        let fmap = vec![0.0f32; n * n];
-        // band-limited: Gaussian blobs (spectrum below 1e-4 of its peak past 0.8 k_max) with a
-        // smooth phase, compared on the acquired grid
-        let mut obj = vec![0.0f32; n * n];
-        let mut ph = vec![0.0f64; n * n];
-        for y in 0..n {
-            for x in 0..n {
-                let g2 = |cx: f64, cy: f64, s: f64| (-((x as f64 - cx).powi(2) + (y as f64 - cy).powi(2)) / (2.0 * s * s)).exp();
-                obj[x + n * y] = (g2(13.0, 15.0, 2.5) + 0.7 * g2(20.0, 19.0, 3.0)) as f32;
-                ph[x + n * y] = 0.02 * x as f64 - 0.03 * y as f64;
-            }
+    /// Gaussian blobs (spectrum below 1e-13 of its peak at k_max) with a smooth phase.
+    fn blobs(n: usize) -> (Vec<f32>, Vec<f64>) {
+        let c = n as f64 / 32.0;
+        let obj = (0..n * n).map(|i| {
+            let (x, y) = ((i % n) as f64, (i / n) as f64);
+            let g = |cx: f64, cy: f64, s: f64| (-((x - cx).powi(2) + (y - cy).powi(2)) / (2.0 * s * s)).exp();
+            (g(13.0 * c, 15.0 * c, 2.5 * c) + 0.7 * g(20.0 * c, 19.0 * c, 3.0 * c)) as f32
+        }).collect();
+        let ph = (0..n * n).map(|i| 0.02 * (i % n) as f64 - 0.03 * (i / n) as f64).collect();
+        (obj, ph)
+    }
+
+    /// A deterministic uniform stream on (-1/2, 1/2).
+    fn uniform(seed: u64) -> impl FnMut() -> f64 {
+        let mut s = seed;
+        move || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5
         }
-        let comps = [obj.as_slice()];
-        let d = spiral_kspace_exact(&inp(&comps, &t2, &fmap, &ph, n, 1), &acq, 0, 1, &tr.k, &taus, None);
-        let img = g.reconstruct(&[d], &acq);
-        let peak = obj.iter().fold(0.0f32, |a, &b| a.max(b)) as f64;
-        let err = (0..n * n).fold(0.0f64, |m, i| {
-            let want = C::cis(ph[i]).scale(obj[i] as f64);
-            m.max((img[i].re - want.re).hypot(img[i].im - want.im))
-        });
-        println!("band-limited object: max error {:.3e} of peak", err / peak);
-        // the declared 1e-2 is not met (4.0e-2 here): asserted only with GRID_STRICT set,
-        // pending the plan's decision on part C
-        if std::env::var("GRID_STRICT").is_ok() {
-            assert!(err <= 1e-2 * peak, "{}", err / peak);
-        }
-        // uniform object: its Cartesian value, 1
-        let one = vec![1.0f32; n * n];
-        let zero = vec![0.0f64; n * n];
-        let comps = [one.as_slice()];
-        let d = spiral_kspace_exact(&inp(&comps, &t2, &fmap, &zero, n, 1), &acq, 0, 1, &tr.k, &taus, None);
-        let img = g.reconstruct(&[d], &acq);
-        let c = (n / 2) * (n + 1);
-        assert!((img[c].re - 1.0).abs() < 1e-9 && img[c].im.abs() < 1e-9, "the normalization: {} {}", img[c].re, img[c].im);
-        let errs: Vec<f64> = img.iter().map(|v| (v.re - 1.0).hypot(v.im)).collect();
-        let central = (0..n * n).filter(|&i| ((i % n) as i64 - 16).abs() < 8 && ((i / n) as i64 - 16).abs() < 8)
-            .fold(0.0f64, |m, i| m.max(errs[i]));
-        let all = errs.iter().fold(0.0f64, |a, &b| a.max(b));
-        println!("uniform object: max error {central:.3e} over the central half, {all:.3e} over the FOV");
-        if std::env::var("GRID_STRICT").is_ok() {
-            assert!(central <= 1e-3, "{central}");
-        }
-        // the noise transfer: image noise per unit sample noise, against the Cartesian sqrt(n^2)
-        let ratio = g.weights().iter().map(|w| w * w).sum::<f64>().sqrt() / n as f64;
-        println!("noise SD ratio gridded / Cartesian: {ratio:.4}");
     }
 
     #[test]
-    fn uniform_off_resonance_matches_gridding_of_the_exact_sum() {
-        // the whole pipeline (segmented forward, gridding) against gridding of exact-sum samples,
-        // with a uniform 30 Hz off-resonance, oversample 2
+    fn reconstructs_a_band_limited_object_and_a_uniform_one() {
+        // the declared tolerances (part C): band-limited 1e-2 of peak, uniform 1e-3 at the centre,
+        // at oversample 1 where the data are exactly A x; on asl001's in-plane design (64 x 64,
+        // 8 interleaves, 4 ms, 4 us) and a 32 x 32 one; gridding's numbers printed beside
+        for &(n, il, dw) in &[(32usize, 4usize, 0.008f64), (64, 8, 0.004)] {
+            let tr = spiral_trajectory(n, n, il, 4.0, dw).unwrap();
+            let taus: Vec<f64> = (0..tr.k.len()).map(|j| tr.tau_ms[j % tr.n_samples()]).collect();
+            let rec = SpiralRecon::new(&tr.k, n, KspaceWindow::None);
+            let acq = plain();
+            let t2 = [T2Slice::Uniform(f32::INFINITY)];
+            let fmap = vec![0.0f32; n * n];
+            let (obj, ph) = blobs(n);
+            let comps = [obj.as_slice()];
+            let d = spiral_kspace_exact(&inp(&comps, &t2, &fmap, &ph, n, 1), &acq, 0, 1, &tr.k, &taus, None);
+            let peak = obj.iter().fold(0.0f32, |a, &b| a.max(b)) as f64;
+            let err = |img: &[C]| (0..n * n).fold(0.0f64, |m, i| {
+                let want = C::cis(ph[i]).scale(obj[i] as f64);
+                m.max((img[i].re - want.re).hypot(img[i].im - want.im))
+            }) / peak;
+            let (e_ls, e_grid) = (err(&rec.reconstruct(std::slice::from_ref(&d), &acq)), err(&rec.gridding(&d)));
+            println!("{n} x {n}: band-limited: least squares {e_ls:.2e}, gridding {e_grid:.2e} of peak");
+            assert!(e_ls <= 1e-2, "{e_ls}");
+            let one = vec![1.0f32; n * n];
+            let zero = vec![0.0f64; n * n];
+            let comps = [one.as_slice()];
+            let d = spiral_kspace_exact(&inp(&comps, &t2, &fmap, &zero, n, 1), &acq, 0, 1, &tr.k, &taus, None);
+            let c = (n / 2) * (n + 1);
+            let g = rec.gridding(&d);
+            assert!((g[c].re - 1.0).abs() < 1e-9 && g[c].im.abs() < 1e-9, "the normalization: {} {}", g[c].re, g[c].im);
+            let img = rec.reconstruct(&[d], &acq);
+            let centre = (img[c].re - 1.0).hypot(img[c].im);
+            let fov = img.iter().fold(0.0f64, |m, v| m.max((v.re - 1.0).hypot(v.im)));
+            let gfov = g.iter().fold(0.0f64, |m, v| m.max((v.re - 1.0).hypot(v.im)));
+            println!("{n} x {n}: uniform: least squares {centre:.2e} at the centre, {fov:.2e} over the FOV; gridding {gfov:.2e}");
+            assert!(centre <= 1e-3, "{centre}");
+        }
+    }
+
+    #[test]
+    fn the_reconstruction_is_linear_and_reports_its_noise() {
+        let n = 32;
+        let tr = spiral_trajectory(n, n, 4, 4.0, 0.008).unwrap();
+        let rec = SpiralRecon::new(&tr.k, n, KspaceWindow::Hann);
+        let mut g = uniform(99);
+        let d1: Vec<C> = tr.k.iter().map(|_| C { re: g(), im: g() }).collect();
+        let d2: Vec<C> = tr.k.iter().map(|_| C { re: g(), im: g() }).collect();
+        let sum: Vec<C> = d1.iter().zip(&d2).map(|(a, b)| a.add(*b)).collect();
+        let (a, b, ab) = (rec.image(&d1), rec.image(&d2), rec.image(&sum));
+        let peak = ab.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+        let res = (0..n * n).fold(0.0f64, |m, i| m.max((ab[i].re - a[i].re - b[i].re).hypot(ab[i].im - a[i].im - b[i].im)));
+        assert!(res <= 1e-12 * peak, "{}", res / peak);
+        // unit-variance noise per sample component: the image noise SD against the Cartesian
+        // path's n (an unnormalized sum of n^2 such samples); measured, not asserted (part C)
+        let rec = SpiralRecon::new(&tr.k, n, KspaceWindow::None);
+        let (mut acc, trials) = (0.0, 8);
+        for _ in 0..trials {
+            let noise: Vec<C> = tr.k.iter().map(|_| C { re: (g() + g() + g() + g()) * 3f64.sqrt(), im: (g() + g() + g() + g()) * 3f64.sqrt() }).collect();
+            acc += rec.image(&noise).iter().map(|c| c.re * c.re).sum::<f64>() / (n * n) as f64;
+        }
+        println!("noise SD ratio, spiral / Cartesian: {:.4}", (acc / trials as f64).sqrt() / n as f64);
+    }
+
+    #[test]
+    fn uniform_off_resonance_matches_the_reconstruction_of_the_exact_sum() {
+        // the whole pipeline (segmented forward, reconstruction) against the reconstruction of
+        // exact-sum samples, with a uniform 30 Hz off-resonance, oversample 2
         let (n, o) = (32, 2);
         let s = n * o;
         let tr = spiral_trajectory(n, n, 4, 4.0, 0.008).unwrap();
         let ns = tr.n_samples();
         let idx: Vec<usize> = (0..tr.k.len()).map(|j| j % ns).collect();
         let taus: Vec<f64> = idx.iter().map(|&j| tr.tau_ms[j]).collect();
-        let mut obj = vec![0.0f32; s * s];
-        for y in 0..s {
-            for x in 0..s {
-                obj[x + s * y] = (-(((x as f64 - 27.0).powi(2) + (y as f64 - 33.0).powi(2)) / 60.0)).exp() as f32;
-            }
-        }
+        let obj: Vec<f32> = (0..s * s)
+            .map(|i| (-((((i % s) as f64 - 27.0).powi(2) + ((i / s) as f64 - 33.0).powi(2)) / 60.0)).exp() as f32)
+            .collect();
         let fmap = vec![30.0f32; s * s];
         let ph = vec![0.0; s * s];
         let t2 = [T2Slice::Uniform(f32::INFINITY)];
@@ -224,81 +324,10 @@ mod tests {
         let (x, r) = segment_inputs(&input, &acq, 0, 1, None, false);
         let a = fwd.apply(&x, &r);
         let b = spiral_kspace_exact(&input, &acq, 0, 1, &tr.k, &taus, None);
-        let g = Gridding::new(&tr.k, n, KspaceWindow::None);
-        let (ia, ib) = (g.reconstruct(&[a], &acq), g.reconstruct(&[b], &acq));
+        let rec = SpiralRecon::new(&tr.k, n, KspaceWindow::None);
+        let (ia, ib) = (rec.reconstruct(&[a], &acq), rec.reconstruct(&[b], &acq));
         let peak = ib.iter().fold(0.0f64, |m, c| m.max(c.abs()));
         let err = ia.iter().zip(&ib).fold(0.0f64, |m, (p, q)| m.max((p.re - q.re).hypot(p.im - q.im)));
         assert!(err <= 1e-6 * peak, "{}", err / peak);
-    }
-
-    /// Density-weighted least squares by CG on the gridding pair, from zero: the candidate
-    /// reconstruction measured against gridding for the part C decision.
-    fn cg_image(g: &Gridding, k: &[[f64; 2]], d: &[C], n: usize, iters: usize) -> Vec<C> {
-        let h = (n / 2) as i64;
-        let nu = Nufft2::new([n, n], [-h, -h], [n, n], 1e-12);
-        let sc = 1.0 / (n * n) as f64;
-        let a = |x: &[C]| -> Vec<C> {
-            nu.type2(&x.iter().map(|c| (c.re, c.im)).collect::<Vec<_>>(), k, 1).into_iter().map(|(re, im)| C { re: re * sc, im: im * sc }).collect()
-        };
-        let ah = |r: &[C]| -> Vec<C> {
-            let w: Vec<(f64, f64)> = r.iter().zip(g.weights()).map(|(c, &w)| (c.re * w * sc, c.im * w * sc)).collect();
-            nu.type1(k, &w, -1).into_iter().map(|(re, im)| C { re, im }).collect()
-        };
-        let dot = |p: &[C], q: &[C]| p.iter().zip(q).map(|(a, b)| a.re * b.re + a.im * b.im).sum::<f64>();
-        let mut x = vec![C::ZERO; n * n];
-        let mut z = ah(d);
-        let mut p = z.clone();
-        let mut zz = dot(&z, &z);
-        for _ in 0..iters {
-            let ap = a(&p);
-            let wap: f64 = ap.iter().zip(g.weights()).map(|(c, &w)| w * (c.re * c.re + c.im * c.im)).sum();
-            let alpha = zz / wap;
-            for (xi, pi) in x.iter_mut().zip(&p) {
-                *xi = xi.add(pi.scale(alpha));
-            }
-            let ax = a(&x);
-            let r: Vec<C> = d.iter().zip(&ax).map(|(p, q)| C { re: p.re - q.re, im: p.im - q.im }).collect();
-            z = ah(&r);
-            let zz2 = dot(&z, &z);
-            let beta = zz2 / zz;
-            zz = zz2;
-            for (pi, zi) in p.iter_mut().zip(&z) {
-                *pi = zi.add(pi.scale(beta));
-            }
-        }
-        x
-    }
-
-    #[test]
-    #[ignore]
-    fn least_squares_against_gridding() {
-        // the numbers behind the part C decision: band-limited and uniform objects at oversample 1
-        // (the data are then exactly A x), gridding against 5, 10 and 20 CG iterations
-        for &(n, il, dw) in &[(32usize, 4usize, 0.008f64), (64, 8, 0.004)] {
-            let tr = spiral_trajectory(n, n, il, 4.0, dw).unwrap();
-            let taus: Vec<f64> = (0..tr.k.len()).map(|j| tr.tau_ms[j % tr.n_samples()]).collect();
-            let g = Gridding::new(&tr.k, n, KspaceWindow::None);
-            let acq = plain();
-            let t2 = [T2Slice::Uniform(f32::INFINITY)];
-            let fmap = vec![0.0f32; n * n];
-            let c = n as f64 / 32.0;
-            let blob: Vec<f32> = (0..n * n).map(|i| {
-                let (x, y) = ((i % n) as f64, (i / n) as f64);
-                let g2 = |cx: f64, cy: f64, s: f64| (-((x - cx).powi(2) + (y - cy).powi(2)) / (2.0 * s * s)).exp();
-                (g2(13.0 * c, 15.0 * c, 2.5 * c) + 0.7 * g2(20.0 * c, 19.0 * c, 3.0 * c)) as f32
-            }).collect();
-            let one = vec![1.0f32; n * n];
-            let ph = vec![0.0; n * n];
-            for (name, obj) in [("band-limited", &blob), ("uniform", &one)] {
-                let comps = [obj.as_slice()];
-                let d = spiral_kspace_exact(&inp(&comps, &t2, &fmap, &ph, n, 1), &acq, 0, 1, &tr.k, &taus, None);
-                let err = |img: &[C]| (0..n * n).fold(0.0f64, |m, i| m.max((img[i].re - obj[i] as f64).hypot(img[i].im)));
-                let t0 = std::time::Instant::now();
-                let x10 = cg_image(&g, &tr.k, &d, n, 10);
-                let t10 = t0.elapsed();
-                println!("n {n}: {name}: gridding {:.2e}, CG 5 {:.2e}, CG 10 {:.2e} ({t10:.1?}), CG 20 {:.2e}", err(&g.image(&d)),
-                         err(&cg_image(&g, &tr.k, &d, n, 5)), err(&x10), err(&cg_image(&g, &tr.k, &d, n, 20)));
-            }
-        }
     }
 }

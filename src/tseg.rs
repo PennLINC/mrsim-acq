@@ -124,10 +124,10 @@ impl Lsq {
             for p in 0..n {
                 for q in p + 1..n {
                     let (mut alpha, mut beta, mut gamma) = (0.0, 0.0, 0.0);
-                    for i in 0..m {
-                        alpha += u[p][i] * u[p][i];
-                        beta += u[q][i] * u[q][i];
-                        gamma += u[p][i] * u[q][i];
+                    for (a, b) in u[p].iter().zip(&u[q]) {
+                        alpha += a * a;
+                        beta += b * b;
+                        gamma += a * b;
                     }
                     if gamma == 0.0 || gamma.abs() <= 1e-15 * alpha.sqrt() * beta.sqrt() {
                         continue;
@@ -137,15 +137,13 @@ impl Lsq {
                     let t = zeta.signum() / (zeta.abs() + (1.0 + zeta * zeta).sqrt());
                     let c = 1.0 / (1.0 + t * t).sqrt();
                     let s = c * t;
-                    for i in 0..m {
-                        let (a, b) = (u[p][i], u[q][i]);
-                        u[p][i] = c * a - s * b;
-                        u[q][i] = s * a + c * b;
-                    }
-                    for i in 0..n {
-                        let (a, b) = (v[p][i], v[q][i]);
-                        v[p][i] = c * a - s * b;
-                        v[q][i] = s * a + c * b;
+                    for w in [&mut u, &mut v] {
+                        let (lo, hi) = w.split_at_mut(q);
+                        for (a, b) in lo[p].iter_mut().zip(hi[0].iter_mut()) {
+                            let (x, y) = (*a, *b);
+                            *a = c * x - s * y;
+                            *b = s * x + c * y;
+                        }
                     }
                 }
             }

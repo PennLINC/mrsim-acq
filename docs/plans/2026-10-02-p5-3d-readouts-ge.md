@@ -698,10 +698,36 @@ segmentation), the time-segmented forward (`spiral.rs`, `SegmentedForward`) and 
   4 s per coil per volume.
 - **Decision (per the plan's rule)**: `L <= 64` certifies at `1e-7` and the volume time passes in
   both modes, but the gridding error does not, in either mode, so neither mode passes. The plan
-  says: stop, revisit part C. **Pending the user's decision**: the candidate revision replaces
-  gridding with per-coil density-weighted least squares (CG, a fixed iteration count, gridding's
-  weights), keeps the band-limited `1e-2`, and either keeps the uniform `1e-3` with enough
-  iterations or restates it at the centre. Milestone AB stands regardless.
+  says: stop, revisit part C. The user chose (2026-10-02) to revise part C: per-coil
+  density-weighted least squares, the band-limited `1e-2` kept, the uniform `1e-3` restated at
+  the image centre.
+- **The revision** (spec part C, "Reconstruction", amended; not yet Codex-reviewed): conjugate
+  gradients is accurate but its step sizes depend on the data, so it is not linear, and the
+  linearity identity (`I_C - I_L - I_B`) needs a linear reconstruction. The solver is therefore
+  the Chebyshev semi-iteration on the density-weighted normal equations over
+  `[lambda_hi / 30, lambda_hi]`, 40 iterations, `lambda_hi` 1.1 times 50 power iterations: fixed
+  coefficients, linear, residual polynomial at most 1. Measured against the declared tolerances:
+  band-limited `3.4e-4` (`32 x 32`) and `3.1e-4` (`64 x 64`) of peak; uniform `5.2e-5` and
+  `7.0e-7` at the centre, `2.2e-3` and `5.5e-3` over the FOV; linearity to `1e-12`; noise SD
+  ratio to Cartesian `1.01` (2D), `0.98` (3D). One `asl001` volume's reconstruction: setup 0.49 s
+  once per series, 20 partitions 6.2 s per coil. (Chebyshev at `kappa = 10`/`100` and 20
+  iterations measured too: `kappa = 100` needs the 40.)
+
+### Task 13 (2026-10-02)
+
+`kspace3d` dispatches `Readout3d::Spiral` (a non-`kspace` build panics naming the feature):
+per-slice certified segmentations (class: the slice's fieldmap interval; voxel: its decay x
+frequency rectangle), the z-DFT, per-sample echo-amplitude and in-echo decay weights (class),
+per-echo `ln A` maps (voxel), per-shot line weights and shot sets, noise per (volume, partition,
+coil) on the 3D path's seeds, the inverse z-DFT and the least squares per partition, Roemer.
+`spiral_segmentation` reports every slice's `L`, `m`, `B` and bound (or the error naming the
+rectangle) for the caller to check and record. GRAPPA, partial Fourier, ghosting and spikes
+panic with spirals. The decay-mode resolution moved out of the GRASE `plan()` verbatim
+(`resolve_modes`), shared by both paths. Tests: 3D equals the 2D spiral pipeline per slice when
+nothing distinguishes partitions (`1e-9`); class and voxel modes agree to `4.2e-12` at 130
+degrees; linear in the images (`1e-6`), line weights scale their shots; noise seeded and
+measured; the refusals and the uncertifiable-range report.
+
 ## Codex review of this plan (2026-10-02)
 
 Nine findings (1 blocker, 4 major, 4 minor), all verified and applied. The blocker was in the

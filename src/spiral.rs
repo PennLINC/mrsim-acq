@@ -410,15 +410,15 @@ mod tests {
         println!("voxel: rect {rect:?} L {} m {} B {:.2} bound {:.2e}; certification {:.2?}; one forward {:.2?}, volume {:.1?} \
                   ({} echoes x {} slices x {} compartments)", fwd.plan.l, fwd.plan.m, fwd.plan.b_sum, fwd.plan.bound, cert_voxel,
                  one, one * (etl * nz * ncomp) as u32, etl, nz, ncomp);
-        // reconstruction: density weights once, then one gridding per partition
+        // reconstruction: density weights and the eigenvalue bound once, then one least squares per partition
         let t0 = Instant::now();
-        let g = crate::grid_recon::Gridding::new(&tr.k, n, crate::kspace::KspaceWindow::None);
+        let g = crate::grid_recon::SpiralRecon::new(&tr.k, n, crate::kspace::KspaceWindow::None);
         let dcf = t0.elapsed();
         let dd = vec![C { re: 1.0, im: 0.0 }; tr.k.len()];
         let t1 = Instant::now();
         for _ in 0..nz {
             std::hint::black_box(g.image(&dd));
         }
-        println!("gridding: density weights {:.2?}, {} partitions {:.2?}", dcf, nz, t1.elapsed());
+        println!("reconstruction: setup (density weights, eigenvalue bound) {:.2?}, {} partitions {:.2?}", dcf, nz, t1.elapsed());
     }
 }

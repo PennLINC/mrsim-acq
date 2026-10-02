@@ -266,6 +266,19 @@ fn plan<'a>(
             }
         }
     }
+    let (modes, ln_a_maps) = resolve_modes(t2, t1, t_inhom, acq, train, nvox);
+    Plan {
+        snx, sny, nz, nx, ny, o, ncomp, acq, table, within, modes, ln_a_maps, t2, t_inhom, fmap, phase,
+        zk: zkernel(nz), mask: sampling_mask(nx, ny, acq),
+    }
+}
+
+/// Each compartment's decay mode and the voxel-mode `ln A_e` maps (per echo, simulation grid),
+/// shared by the GRASE and spiral paths; panics name the offending input.
+#[allow(clippy::type_complexity)]
+fn resolve_modes(t2: &[T2Volume], t1: Option<&[T2Volume]>, t_inhom: Option<&[T2Volume]>, acq: &Acquisition,
+                 train: &EchoTrain, nvox: usize) -> (Vec<Mode>, Vec<Option<Vec<Vec<f64>>>>) {
+    let ncomp = t2.len();
     let needs_t1 = acq.do_relaxation && train.refocusing_deg != 180.0;
     assert!(!needs_t1 || t1.is_some(), "refocusing below 180 degrees needs T1 (stimulated echoes)");
     if let Some(t1) = t1 {
@@ -306,10 +319,7 @@ fn plan<'a>(
             }
         }
     }
-    Plan {
-        snx, sny, nz, nx, ny, o, ncomp, acq, table, within, modes, ln_a_maps, t2, t_inhom, fmap, phase,
-        zk: zkernel(nz), mask: sampling_mask(nx, ny, acq),
-    }
+    (modes, ln_a_maps)
 }
 
 /// The acquired 3D k-space per coil of volume `g`, after the line weights and the sampling mask
@@ -341,6 +351,13 @@ pub(crate) fn simulate_acquisition_3d_complex(
     readout: &Readout3d, line_weights: Option<&LineWeights>, shot_images: Option<&[Vec<ShotSet>]>, phase: &PhaseModel,
     seed: u64,
 ) -> Vec<Vec<(f64, f64)>> {
+    if let Readout3d::Spiral { .. } = readout {
+        #[cfg(feature = "kspace")]
+        return spiral_volumes(sim_dims, acq_dims, n_volumes, images, t2, t1, fmap, t_inhom, acq, train, readout,
+                              line_weights, shot_images, phase, seed);
+        #[cfg(not(feature = "kspace"))]
+        panic!("spiral readouts need the `kspace` feature (the time-segmented NUFFT forward)");
+    }
     let pl = plan(sim_dims, acq_dims, n_volumes, images, t2, t1, fmap, t_inhom, acq, train, readout, line_weights,
                   shot_images, phase);
     let (nz, nx, ny) = (pl.nz, pl.nx, pl.ny);
@@ -440,6 +457,333 @@ pub fn simulate_acquisition_3d(
         }
     }
     (mag, ph)
+}
+
+// ---- the stack of spirals (P5 addendum, part C) ----
+
+/// One slice's certified time segmentation, as the spiral path plans it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpiralSegmentation {
+    pub z: usize,
+    /// `true` for the voxel-mode plan (decay inside), `false` for the class-mode one.
+    pub voxel: bool,
+    pub l: usize,
+    pub m: usize,
+    pub b_sum: f64,
+    pub bound: f64,
+}
+
+/// Per slice, the off-resonance interval (Hz) the spiral forward must cover, and the decay interval
+/// (1/ms) of its voxel-mode compartments (`None` when there are none).
+#[cfg(feature = "kspace")]
+#[allow(clippy::too_many_arguments)]
+fn spiral_rects(snx: usize, sny: usize, nz: usize, fmap: &[f32], t2: &[T2Volume], t_inhom: Option<&[T2Volume]>,
+                acq: &Acquisition, modes: &[Mode]) -> Vec<([f64; 2], Option<[f64; 2]>)> {
+    let nplane = snx * sny;
+    let at = |v: &T2Volume, i: usize| match v { T2Volume::Uniform(s) => *s as f64, T2Volume::Map(m) => m[i] as f64 };
+    (0..nz)
+        .map(|z| {
+            let sl = &fmap[z * nplane..(z + 1) * nplane];
+            let f = if acq.do_distortions {
+                [sl.iter().fold(f32::MAX, |a, &b| a.min(b)) as f64, sl.iter().fold(f32::MIN, |a, &b| a.max(b)) as f64]
+            } else {
+                [0.0, 0.0]
+            };
+            let mut d: Option<[f64; 2]> = None;
+            for (c, mode) in modes.iter().enumerate() {
+                if !matches!(mode, Mode::Voxel) {
+                    continue;
+                }
+                for i in z * nplane..(z + 1) * nplane {
+                    // as `spiral::decay_rate` forms it
+                    let tp = t_inhom.map_or(acq.t_inhom, |ti| at(&ti[c], i));
+                    let r = 1.0 / at(&t2[c], i) + 1.0 / tp;
+                    d = Some(d.map_or([r, r], |[a, b]| [a.min(r), b.max(r)]));
+                }
+            }
+            (f, d)
+        })
+        .collect()
+}
+
+/// Everything the spiral path needs, resolved once per series.
+#[cfg(feature = "kspace")]
+struct SpiralPlan<'a> {
+    snx: usize,
+    sny: usize,
+    nz: usize,
+    n: usize,
+    o: usize,
+    ncomp: usize,
+    acq: &'a Acquisition,
+    table: crate::readout::Spiral3dTable,
+    modes: Vec<Mode>,
+    ln_a_maps: Vec<Option<Vec<Vec<f64>>>>,
+    t2: &'a [T2Volume<'a>],
+    t_inhom: Option<&'a [T2Volume<'a>]>,
+    fmap: &'a [f32],
+    phase: &'a PhaseModel,
+    zk: Vec<C>,
+    /// Samples per partition (all interleaves) and per interleaf.
+    nsamp: usize,
+    ns: usize,
+    class_fwd: Vec<Option<crate::spiral::SegmentedForward>>,
+    voxel_fwd: Vec<Option<crate::spiral::SegmentedForward>>,
+    recon: crate::grid_recon::SpiralRecon,
+}
+
+#[cfg(feature = "kspace")]
+impl SpiralPlan<'_> {
+    /// Every compartment's 3D samples from one set of images (`img(c, vox)`), coil `q`, weighted by
+    /// the echo amplitude and in-echo decay but not by the line weights: `out[c][p * nsamp + j]`.
+    fn compartments<F: Fn(usize, usize) -> f32>(&self, img: F, q: usize, ncoils: usize) -> Vec<Vec<C>> {
+        use crate::spiral::segment_inputs;
+        let (snx, sny, nz, n) = (self.snx, self.sny, self.nz, self.n);
+        let nplane = snx * sny;
+        let zero_shot = ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] };
+        let phis: Vec<Vec<f64>> = (0..nz).map(|z| phase_slice(self.phase, &zero_shot, snx, sny, self.o, z, nz)).collect();
+        let mut out = vec![vec![C::ZERO; nz * self.nsamp]; self.ncomp];
+        for (c, oc) in out.iter_mut().enumerate() {
+            let planes: Vec<Vec<f32>> = (0..nz).map(|z| (0..nplane).map(|i| img(c, z * nplane + i)).collect()).collect();
+            let one = |z: usize, la: Option<&[f64]>, voxel: bool| -> Vec<C> {
+                let refs = [planes[z].as_slice()];
+                let t2s = [slice_of(&self.t2[c], z, nplane)];
+                let tis = self.t_inhom.map(|ti| [slice_of(&ti[c], z, nplane)]);
+                let inp = SliceInput {
+                    compartments: &refs, t2: &t2s, t_inhom: tis.as_ref().map(|a| a.as_slice()),
+                    fmap: &self.fmap[z * nplane..(z + 1) * nplane], phase0: Some(&phis[z]), sim: [snx, sny],
+                    acq_matrix: [n, n], z, nz, eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None,
+                };
+                let (x, r) = segment_inputs(&inp, self.acq, q, ncoils, la, voxel);
+                let fwd = if voxel { &self.voxel_fwd[z] } else { &self.class_fwd[z] };
+                fwd.as_ref().expect("a plan for every slice of the mode").apply(&x, &r)
+            };
+            let zsum = |k2: &[Vec<C>], p: usize, j: usize| {
+                let mut acc = C::ZERO;
+                for (z, k2z) in k2.iter().enumerate() {
+                    acc = acc.add(k2z[j].mul(self.zk[p * nz + z]));
+                }
+                acc
+            };
+            match &self.modes[c] {
+                Mode::Class { ln_a, t2_ms, t2p_ms } => {
+                    let k2: Vec<Vec<C>> = (0..nz).map(|z| one(z, None, false)).collect();
+                    for p in 0..nz {
+                        let e = self.table.echo[p];
+                        for j in 0..self.nsamp {
+                            let w = if self.acq.do_relaxation {
+                                line_weight(ln_a[e - 1], self.table.traj.tau_ms[j % self.ns], *t2_ms, *t2p_ms)
+                            } else {
+                                1.0
+                            };
+                            oc[p * self.nsamp + j] = zsum(&k2, p, j).scale(w);
+                        }
+                    }
+                }
+                Mode::Voxel => {
+                    let maps = self.ln_a_maps[c].as_ref().expect("voxel compartments carry their maps");
+                    for e in 1..=self.table.echo.iter().copied().max().unwrap_or(0) {
+                        let ps: Vec<usize> = (0..nz).filter(|&p| self.table.echo[p] == e).collect();
+                        if ps.is_empty() {
+                            continue;
+                        }
+                        let k2: Vec<Vec<C>> =
+                            (0..nz).map(|z| one(z, Some(&maps[e - 1][z * nplane..(z + 1) * nplane]), true)).collect();
+                        for &p in &ps {
+                            for j in 0..self.nsamp {
+                                oc[p * self.nsamp + j] = zsum(&k2, p, j);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The acquired 3D samples of volume `g`, coil `q`, before noise: the compartment sum with the
+    /// line weights, each sample from the images its shot saw. Layout `p * nsamp + j`.
+    #[allow(clippy::too_many_arguments)]
+    fn samples(&self, images: &[Vec<f32>], n_volumes: usize, g: usize, q: usize, ncoils: usize,
+               lw: Option<&LineWeights>, sets: &[ShotSet]) -> Vec<C> {
+        let base = self.compartments(|c, v| images[c][v * n_volumes + g], q, ncoils);
+        let moved: Vec<Vec<Vec<C>>> = sets.iter().map(|s| self.compartments(|c, v| s.images[c][v], q, ncoils)).collect();
+        let mut k = vec![C::ZERO; self.nz * self.nsamp];
+        for p in 0..self.nz {
+            for j in 0..self.nsamp {
+                let shot = self.table.shot(p, j / self.ns);
+                let src = sets.iter().position(|s| s.shots.contains(&shot)).map_or(&base, |i| &moved[i]);
+                let i = p * self.nsamp + j;
+                for (c, kc) in src.iter().enumerate() {
+                    let w = lw.map_or(1.0, |lw| lw.at(g, shot, c));
+                    k[i] = k[i].add(kc[i].scale(w));
+                }
+            }
+        }
+        k
+    }
+}
+
+/// The spiral path's checks and resolution; panics name the offending input.
+#[cfg(feature = "kspace")]
+#[allow(clippy::too_many_arguments)]
+fn spiral_plan<'a>(
+    sim_dims: [usize; 3], acq_dims: [usize; 3], n_volumes: usize, images: &[Vec<f32>], t2: &'a [T2Volume<'a>],
+    t1: Option<&'a [T2Volume<'a>]>, fmap: &'a [f32], t_inhom: Option<&'a [T2Volume<'a>]>, acq: &'a Acquisition,
+    train: &EchoTrain, readout: &Readout3d, line_weights: Option<&LineWeights>, shot_images: Option<&[Vec<ShotSet>]>,
+    phase: &'a PhaseModel,
+) -> SpiralPlan<'a> {
+    use crate::tseg::RateRect;
+    let [snx, sny, nz] = sim_dims;
+    let [nx, ny, nzo] = acq_dims;
+    assert_eq!(nz, nzo, "partition count must match; z is never oversampled");
+    assert!(snx % nx == 0 && sny % ny == 0, "sim grid must be an integer multiple of the acquired matrix");
+    let o = snx / nx;
+    assert_eq!(o, sny / ny, "oversampling must match on both axes");
+    let nvox = snx * sny * nz;
+    let ncomp = images.len();
+    for im in images {
+        assert_eq!(im.len(), nvox * n_volumes, "compartment image is not on the simulation grid");
+    }
+    assert_eq!(fmap.len(), nvox, "fieldmap is not on the simulation grid");
+    assert_eq!(t2.len(), ncomp, "t2 has {} entries for {ncomp} compartments", t2.len());
+    assert_eq!(acq.echo, EchoFormation::Spin, "the 3D echo trains are spin-echo trains");
+    assert!(acq.eddy_strength == 0.0 && acq.eddy_quad == 0.0 && acq.eddy_phase == 0.0,
+            "the eddy model is not available in 3D (an echo-dependent eddy evolution breaks the z factorization)");
+    assert!(acq.accel <= 1, "GRAPPA has no spiral meaning in this model");
+    assert!(acq.partial_fourier >= 1.0, "partial Fourier has no spiral meaning in this model");
+    assert!(acq.ghost_offset == 0.0, "Nyquist ghosting has no spiral meaning in this model");
+    assert!(acq.n_spikes == 0, "spikes have no spiral meaning in this model");
+    let table = crate::readout::spiral_lines(train, readout, nx, ny, nz).unwrap_or_else(|e| panic!("{e}"));
+    if let Some(lw) = line_weights {
+        assert!(lw.n_shots == table.n_shots && lw.n_compartments == ncomp && lw.w.len() == n_volumes * table.n_shots * ncomp,
+                "line weights are not (volume, shot, compartment)");
+    }
+    if let Some(si) = shot_images {
+        assert_eq!(si.len(), n_volumes, "shot images per volume");
+        for sets in si {
+            for s in sets {
+                assert!(s.images.len() == ncomp && s.images.iter().all(|i| i.len() == nvox), "shot images are not per compartment");
+                assert!(s.shots.iter().all(|&x| x < table.n_shots), "a shot index beyond the train's {}", table.n_shots);
+            }
+        }
+    }
+    let (modes, ln_a_maps) = resolve_modes(t2, t1, t_inhom, acq, train, nvox);
+    let ns = table.traj.n_samples();
+    let nsamp = table.traj.k.len();
+    let tau_idx: Vec<usize> = (0..nsamp).map(|j| j % ns).collect();
+    let t_ms = table.traj.readout_ms;
+    let rects = spiral_rects(snx, sny, nz, fmap, t2, t_inhom, acq, &modes);
+    let any_class = modes.iter().any(|m| matches!(m, Mode::Class { .. }));
+    let mk = |rect: RateRect| {
+        crate::spiral::SegmentedForward::new(&table.traj.k, &tau_idx, &table.traj.tau_ms, t_ms, [snx, sny], [nx, ny], rect)
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
+    let class_fwd = rects.iter().map(|(f, _)| any_class.then(|| mk(RateRect { d: [0.0, 0.0], f: *f }))).collect();
+    let voxel_fwd = rects.iter().map(|(f, d)| d.map(|d| mk(RateRect { d, f: *f }))).collect();
+    let recon = crate::grid_recon::SpiralRecon::new(&table.traj.k, nx, acq.window);
+    SpiralPlan {
+        snx, sny, nz, n: nx, o, ncomp, acq, table, modes, ln_a_maps, t2, t_inhom, fmap, phase, zk: zkernel(nz), nsamp, ns,
+        class_fwd, voxel_fwd, recon,
+    }
+}
+
+/// The certified segmentations a spiral series will use, per slice and mode, or the error naming
+/// the rate rectangle that cannot be certified: what a caller checks and records before
+/// simulating. The arguments are [`simulate_acquisition_3d`]'s (images are not needed).
+#[cfg(feature = "kspace")]
+#[allow(clippy::too_many_arguments)]
+pub fn spiral_segmentation(
+    sim_dims: [usize; 3], acq_dims: [usize; 3], t2: &[T2Volume], t1: Option<&[T2Volume]>, fmap: &[f32],
+    t_inhom: Option<&[T2Volume]>, acq: &Acquisition, train: &EchoTrain, readout: &Readout3d,
+) -> Result<Vec<SpiralSegmentation>, String> {
+    use crate::tseg::RateRect;
+    let [snx, sny, nz] = sim_dims;
+    let [nx, ny, _] = acq_dims;
+    let table = crate::readout::spiral_lines(train, readout, nx, ny, nz)?;
+    let (modes, _) = resolve_modes(t2, t1, t_inhom, acq, train, snx * sny * nz);
+    let rects = spiral_rects(snx, sny, nz, fmap, t2, t_inhom, acq, &modes);
+    let any_class = modes.iter().any(|m| matches!(m, Mode::Class { .. }));
+    let mut out = Vec::new();
+    for (z, (f, d)) in rects.iter().enumerate() {
+        let mut add = |voxel: bool, rect: RateRect| -> Result<(), String> {
+            let p = crate::tseg::plan(&table.traj.tau_ms, table.traj.readout_ms, rect).map_err(|e| format!("slice {z}: {e}"))?;
+            out.push(SpiralSegmentation { z, voxel, l: p.l, m: p.m, b_sum: p.b_sum, bound: p.bound });
+            Ok(())
+        };
+        if any_class {
+            add(false, RateRect { d: [0.0, 0.0], f: *f })?;
+        }
+        if let Some(d) = d {
+            add(true, RateRect { d: *d, f: *f })?;
+        }
+    }
+    Ok(out)
+}
+
+/// The spiral path of [`simulate_acquisition_3d_complex`].
+#[cfg(feature = "kspace")]
+#[allow(clippy::too_many_arguments)]
+fn spiral_volumes(
+    sim_dims: [usize; 3], acq_dims: [usize; 3], n_volumes: usize, images: &[Vec<f32>], t2: &[T2Volume],
+    t1: Option<&[T2Volume]>, fmap: &[f32], t_inhom: Option<&[T2Volume]>, acq: &Acquisition, train: &EchoTrain,
+    readout: &Readout3d, line_weights: Option<&LineWeights>, shot_images: Option<&[Vec<ShotSet>]>, phase: &PhaseModel,
+    seed: u64,
+) -> Vec<Vec<(f64, f64)>> {
+    let pl = spiral_plan(sim_dims, acq_dims, n_volumes, images, t2, t1, fmap, t_inhom, acq, train, readout, line_weights,
+                         shot_images, phase);
+    let (nz, n, nsamp) = (pl.nz, pl.n, pl.nsamp);
+    let ncoils = acq.n_coils.max(1);
+    let sigma = (acq.noise_variance / (n * n) as f64).sqrt();
+    let per_vol = |g: usize| -> Vec<(f64, f64)> {
+        let sets = shot_images.map_or(&[][..], |si| &si[g][..]);
+        let mut coil_parts: Vec<Vec<Vec<C>>> = Vec::with_capacity(ncoils);
+        for q in 0..ncoils {
+            let mut k = pl.samples(images, n_volumes, g, q, ncoils, line_weights, sets);
+            if acq.noise_variance > 0.0 {
+                for p in 0..nz {
+                    let pseed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(p as u64).wrapping_mul(0x9E37) ^ seed ^ SEED_SALT_3D;
+                    let mut rng = Rng((pseed ^ (q as u64).wrapping_mul(0x9E37_79B9)) | 1);
+                    for c in k[p * nsamp..(p + 1) * nsamp].iter_mut() {
+                        c.re += rng.gauss() * sigma;
+                        c.im += rng.gauss() * sigma;
+                    }
+                }
+            }
+            // inverse z-DFT, normalized by 1/nz: per slice z, its spiral samples
+            let mut slices = vec![vec![C::ZERO; nsamp]; nz];
+            for (z, sl) in slices.iter_mut().enumerate() {
+                for p in 0..nz {
+                    let kc = pl.zk[p * nz + z];
+                    let conj = C { re: kc.re, im: -kc.im };
+                    for (s, kv) in sl.iter_mut().zip(&k[p * nsamp..(p + 1) * nsamp]) {
+                        *s = s.add(kv.mul(conj));
+                    }
+                }
+                for c in sl.iter_mut() {
+                    *c = c.scale(1.0 / nz as f64);
+                }
+            }
+            coil_parts.push(slices);
+        }
+        let mut out = vec![(0.0, 0.0); n * n * nz];
+        for z in 0..nz {
+            let coils: Vec<Vec<C>> = coil_parts.iter().map(|cp| cp[z].clone()).collect();
+            let img = pl.recon.reconstruct(&coils, acq);
+            for (i, c) in img.iter().enumerate() {
+                out[i + n * n * z] = (c.re, c.im);
+            }
+        }
+        out
+    };
+    #[cfg(feature = "par")]
+    let vols: Vec<Vec<(f64, f64)>> = {
+        use rayon::prelude::*;
+        (0..n_volumes).into_par_iter().map(per_vol).collect()
+    };
+    #[cfg(not(feature = "par"))]
+    let vols: Vec<Vec<(f64, f64)>> = (0..n_volumes).map(per_vol).collect();
+    vols
 }
 
 #[cfg(test)]
@@ -824,5 +1168,198 @@ mod tests {
         let pk = peak(&a);
         let d = maxdiff(&a, &b);
         assert!(d <= 1e-6 * pk, "{d:e} of {pk:e}");
+    }
+
+    // ---- spirals ----
+
+    #[cfg(feature = "kspace")]
+    fn spiral_ro() -> Readout3d {
+        Readout3d::Spiral { interleaves: 2, readout_ms: 4.0, dwell_ms: 0.01 }
+    }
+
+    #[cfg(feature = "kspace")]
+    fn spiral_fmap(snx: usize, sny: usize, nz: usize) -> Vec<f32> {
+        (0..snx * sny * nz).map(|v| {
+            let (x, y, z) = (v % snx, (v / snx) % sny, v / (snx * sny));
+            (-15.0 + 30.0 * x as f64 / snx as f64 + 5.0 * z as f64 - 3.0 * y as f64 / sny as f64) as f32
+        }).collect()
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn spiral_with_nothing_to_distinguish_partitions_3d_is_the_2d_spiral() {
+        // relaxation off: every partition's weights are 1, so the z-DFT and its inverse cancel and
+        // each slice's image is the 2D spiral pipeline's (segmented forward, least squares) on that
+        // slice, fieldmap and coils included
+        use crate::grid_recon::SpiralRecon;
+        use crate::readout::spiral_trajectory;
+        use crate::spiral::{segment_inputs, SegmentedForward};
+        use crate::tseg::RateRect;
+        let (n, nz, o, ncomp) = (16usize, 4usize, 2usize, 2usize);
+        let s = n * o;
+        let images = blobs(s, s, nz, 1, ncomp);
+        let fmap = spiral_fmap(s, s, nz);
+        let t2 = vec![T2Volume::Uniform(80.0); ncomp];
+        let acq = Acquisition { do_relaxation: false, do_distortions: true, n_coils: 2, signal_scale: 100.0, ..Acquisition::default() };
+        let tr = train(nz, 1, KzOrder::Centric, 12.0, 180.0);
+        let phase = PhaseModel::none();
+        let out = simulate_acquisition_3d_complex([s, s, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq, &tr,
+                                                  &spiral_ro(), None, None, &phase, 3);
+        let traj = spiral_trajectory(n, n, 2, 4.0, 0.01).unwrap();
+        let idx: Vec<usize> = (0..traj.k.len()).map(|j| j % traj.n_samples()).collect();
+        let rec = SpiralRecon::new(&traj.k, n, acq.window);
+        let nplane = s * s;
+        let mut want = vec![(0.0, 0.0); n * n * nz];
+        for z in 0..nz {
+            let sl = &fmap[z * nplane..(z + 1) * nplane];
+            let f = [sl.iter().fold(f32::MAX, |a, &b| a.min(b)) as f64, sl.iter().fold(f32::MIN, |a, &b| a.max(b)) as f64];
+            let fwd = SegmentedForward::new(&traj.k, &idx, &traj.tau_ms, 4.0, [s, s], [n, n], RateRect { d: [0.0, 0.0], f }).unwrap();
+            let phi = phase_slice(&phase, &zero_shot(), s, s, o, z, nz);
+            let coils: Vec<Vec<C>> = (0..2).map(|q| {
+                let mut acc = vec![C::ZERO; traj.k.len()];
+                for im in &images {
+                    let pl: Vec<f32> = im[z * nplane..(z + 1) * nplane].to_vec();
+                    let refs = [pl.as_slice()];
+                    let t2s = [T2Slice::Uniform(80.0)];
+                    let inp = SliceInput { compartments: &refs, t2: &t2s, t_inhom: None, fmap: sl, phase0: Some(&phi), sim: [s, s],
+                                           acq_matrix: [n, n], z, nz, eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None };
+                    let (x, r) = segment_inputs(&inp, &acq, q, 2, None, false);
+                    for (a, b) in acc.iter_mut().zip(fwd.apply(&x, &r)) {
+                        *a = a.add(b);
+                    }
+                }
+                acc
+            }).collect();
+            for (i, c) in rec.reconstruct(&coils, &acq).iter().enumerate() {
+                want[i + n * n * z] = (c.re, c.im);
+            }
+        }
+        let pk = peak(&want);
+        let d = maxdiff(&out[0], &want);
+        assert!(d <= 1e-9 * pk, "{d:e} of {pk:e}");
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn spiral_class_and_voxel_modes_agree() {
+        // the same uniform relaxation as uniform volumes (class: decay outside the segmentation)
+        // and as maps (voxel: decay inside, ln A per echo), refocusing below 180 degrees
+        let (n, nz, o, ncomp) = (16usize, 4usize, 2usize, 2usize);
+        let s = n * o;
+        let nvox = s * s * nz;
+        let images = blobs(s, s, nz, 1, ncomp);
+        let fmap = spiral_fmap(s, s, nz);
+        let acq = Acquisition { do_relaxation: true, do_distortions: true, signal_scale: 100.0, t_inhom: 50.0, ..Acquisition::default() };
+        let tr = train(nz, 2, KzOrder::Centric, 12.0, 130.0);
+        let phase = PhaseModel::none();
+        let (t2a, t2b, t1a, t1b) = (vec![80.0f32; nvox], vec![120.0f32; nvox], vec![1300.0f32; nvox], vec![1600.0f32; nvox]);
+        let tpm = vec![50.0f32; nvox];
+        let class_t2 = [T2Volume::Uniform(80.0), T2Volume::Uniform(120.0)];
+        let class_t1 = [T2Volume::Uniform(1300.0), T2Volume::Uniform(1600.0)];
+        let vox_t2 = [T2Volume::Map(&t2a), T2Volume::Map(&t2b)];
+        let vox_t1 = [T2Volume::Map(&t1a), T2Volume::Map(&t1b)];
+        let vox_ti = [T2Volume::Map(&tpm), T2Volume::Map(&tpm)];
+        let a = simulate_acquisition_3d_complex([s, s, nz], [n, n, nz], 1, &images, &class_t2, Some(&class_t1), &fmap, None,
+                                                &acq, &tr, &spiral_ro(), None, None, &phase, 3);
+        let b = simulate_acquisition_3d_complex([s, s, nz], [n, n, nz], 1, &images, &vox_t2, Some(&vox_t1), &fmap, Some(&vox_ti),
+                                                &acq, &tr, &spiral_ro(), None, None, &phase, 3);
+        let pk = peak(&a[0]);
+        let d = maxdiff(&a[0], &b[0]);
+        println!("spiral class vs voxel: {:.2e} of peak", d / pk);
+        assert!(d <= 1e-6 * pk, "{d:e} of {pk:e}");
+        let segs = spiral_segmentation([s, s, nz], [n, n, nz], &vox_t2, Some(&vox_t1), &fmap, Some(&vox_ti), &acq, &tr,
+                                       &spiral_ro()).unwrap();
+        assert_eq!(segs.len(), nz);
+        assert!(segs.iter().all(|g| g.voxel && g.bound < 1e-7 && g.l <= 64));
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn spiral_3d_is_linear_and_line_weights_scale_their_shots() {
+        let (n, nz, o, ncomp) = (16usize, 4usize, 2usize, 2usize);
+        let s = n * o;
+        let nvox = s * s * nz;
+        let images = blobs(s, s, nz, 1, ncomp);
+        let fmap = spiral_fmap(s, s, nz);
+        let t2 = vec![T2Volume::Uniform(80.0), T2Volume::Uniform(110.0)];
+        let t1 = vec![T2Volume::Uniform(1400.0); ncomp];
+        let acq = Acquisition { do_relaxation: true, do_distortions: true, n_coils: 2, signal_scale: 100.0, ..Acquisition::default() };
+        let tr = train(nz, 2, KzOrder::Centric, 12.0, 150.0);
+        let phase = PhaseModel::none();
+        let run = |ims: &[Vec<f32>], lw: Option<&LineWeights>| {
+            simulate_acquisition_3d_complex([s, s, nz], [n, n, nz], 1, ims, &t2, Some(&t1), &fmap, None, &acq, &tr, &spiral_ro(),
+                                            lw, None, &phase, 3).remove(0)
+        };
+        // linearity in the images
+        let half: Vec<Vec<f32>> = images.iter().map(|v| v.iter().map(|x| x * 0.3).collect()).collect();
+        let rest: Vec<Vec<f32>> = images.iter().zip(&half).map(|(v, h)| v.iter().zip(h).map(|(a, b)| a - b).collect()).collect();
+        let (full, a, b) = (run(&images, None), run(&half, None), run(&rest, None));
+        let sum: Vec<(f64, f64)> = a.iter().zip(&b).map(|(p, q)| (p.0 + q.0, p.1 + q.1)).collect();
+        let pk = peak(&full);
+        assert!(maxdiff(&full, &sum) <= 1e-6 * pk, "{:e}", maxdiff(&full, &sum) / pk);
+        // 2 interleaves x 2 kz segments = 4 shots; weight 3 on every shot is three times the image
+        let lw = LineWeights { n_shots: 4, n_compartments: ncomp, w: vec![3.0; 4 * ncomp] };
+        let tripled = run(&images, Some(&lw));
+        let want: Vec<(f64, f64)> = full.iter().map(|p| (3.0 * p.0, 3.0 * p.1)).collect();
+        assert!(maxdiff(&tripled, &want) <= 1e-9 * peak(&want));
+        // a weight on one shot only changes the image
+        let mut w1 = vec![1.0; 4 * ncomp];
+        w1[2 * ncomp] = 0.5;
+        let one = run(&images, Some(&LineWeights { n_shots: 4, n_compartments: ncomp, w: w1 }));
+        assert!(maxdiff(&one, &full) > 1e-3 * pk);
+        let _ = nvox;
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn spiral_noise_is_seeded_and_measured() {
+        let (n, nz, o) = (16usize, 4usize, 2usize);
+        let s = n * o;
+        let images = vec![vec![0.0f32; s * s * nz]];
+        let fmap = vec![0.0f32; s * s * nz];
+        let t2 = [T2Volume::Uniform(80.0)];
+        let acq = Acquisition { do_relaxation: false, noise_variance: 4.0, ..Acquisition::default() };
+        let tr = train(nz, 1, KzOrder::Centric, 12.0, 180.0);
+        let phase = PhaseModel::none();
+        let run = |seed| simulate_acquisition_3d_complex([s, s, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq, &tr,
+                                                         &spiral_ro(), None, None, &phase, seed).remove(0);
+        let (a, b, c) = (run(5), run(5), run(6));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        let sd = (a.iter().map(|p| p.0 * p.0).sum::<f64>() / a.len() as f64).sqrt();
+        // Cartesian 3D: per-sample SD sqrt(var / n^2), an unnormalized n^2 sum, 1/sqrt(nz) from the z-DFT
+        let cart = (acq.noise_variance / (n * n) as f64).sqrt() * n as f64 / (nz as f64).sqrt();
+        println!("spiral 3D noise SD {sd:.4}, Cartesian 3D {cart:.4}, ratio {:.4}", sd / cart);
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn spiral_refusals() {
+        let (n, nz, o) = (16usize, 4usize, 2usize);
+        let s = n * o;
+        let images = vec![vec![0.0f32; s * s * nz]];
+        let fmap = vec![0.0f32; s * s * nz];
+        let t2 = [T2Volume::Uniform(80.0)];
+        let tr = train(nz, 1, KzOrder::Centric, 12.0, 180.0);
+        let phase = PhaseModel::none();
+        for (acq, msg) in [
+            (Acquisition { n_spikes: 2, ..Acquisition::default() }, "spikes"),
+            (Acquisition { accel: 2, ..Acquisition::default() }, "GRAPPA"),
+            (Acquisition { partial_fourier: 0.75, ..Acquisition::default() }, "partial Fourier"),
+            (Acquisition { ghost_offset: 0.1, ..Acquisition::default() }, "ghosting"),
+        ] {
+            let r = std::panic::catch_unwind(|| {
+                simulate_acquisition_3d_complex([s, s, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq, &tr,
+                                                &spiral_ro(), None, None, &phase, 1)
+            });
+            let e = r.expect_err(msg);
+            let text = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap();
+            assert!(text.contains(msg), "{text}");
+        }
+        // a fieldmap range no segmentation within 64 can certify is reported by name
+        let wild: Vec<f32> = (0..s * s * nz).map(|v| if v % 2 == 0 { -9000.0 } else { 9000.0 }).collect();
+        let acq = Acquisition { do_distortions: true, ..Acquisition::default() };
+        let e = spiral_segmentation([s, s, nz], [n, n, nz], &t2, None, &wild, None, &acq, &tr, &spiral_ro()).unwrap_err();
+        assert!(e.contains("slice 0") && e.contains("64 segments"), "{e}");
     }
 }
