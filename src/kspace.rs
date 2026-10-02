@@ -249,6 +249,39 @@ fn line_times(epi: &SingleShotEpi) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     (t, trf, tread)
 }
 
+/// Per-phase-encode-line timing and readout polarity, the table the forward model reads (P5
+/// addendum, "Generalizing the 2D forward"). Indexed by `ky`. `t_ms` from the echo centre (fieldmap
+/// phase, `T2'`), `trf_ms` from the RF (T2), `tread_ms` from the last prep gradient (eddy decay),
+/// `polarity` `+1`/`-1` the readout direction of the line (the Nyquist ghost's sign).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineTiming {
+    pub t_ms: Vec<f64>,
+    pub trf_ms: Vec<f64>,
+    pub tread_ms: Vec<f64>,
+    pub polarity: Vec<i8>,
+}
+
+impl LineTiming {
+    /// The single-shot EPI's table: [`line_times`] unchanged, and the polarity alternating with
+    /// `ky`, which is what the ghost has always used.
+    pub fn from_epi(epi: &SingleShotEpi) -> LineTiming {
+        let (t_ms, trf_ms, tread_ms) = line_times(epi);
+        let polarity = (0..t_ms.len()).map(|ky| if ky % 2 == 1 { -1 } else { 1 }).collect();
+        LineTiming { t_ms, trf_ms, tread_ms, polarity }
+    }
+
+    /// The table [`build_coil_kspace`] uses for an [`Acquisition`] on an `nx x ny` matrix.
+    pub fn for_acquisition(acq: &Acquisition, nx: usize, ny: usize) -> LineTiming {
+        LineTiming::from_epi(&SingleShotEpi {
+            kx_max: nx,
+            ky_max: ny,
+            t_line: acq.t_line,
+            t_echo: acq.t_echo,
+            reverse_phase: acq.reverse_phase,
+        })
+    }
+}
+
 /// Per-compartment T2 (or T2') for ONE slice. Goes in [`SliceInput`].
 #[derive(Debug, Clone, Copy)]
 pub enum T2Slice<'a> {
@@ -282,16 +315,9 @@ pub fn validate_t2_map(m: &[f32]) -> Result<(), String> {
 /// that begins before the excitation, and the forward model answers it with signal growth.
 /// Partial Fourier does not help: it drops low-ky lines, which this trajectory reads LAST.
 pub fn validate_acquisition_timing(acq: &Acquisition, nx: usize, ny: usize) -> Result<(), String> {
-    // Build the literal exactly as `build_coil_kspace` does, or the timing this validates is not
-    // the timing that runs.
-    let epi = SingleShotEpi {
-        kx_max: nx,
-        ky_max: ny,
-        t_line: acq.t_line,
-        t_echo: acq.t_echo,
-        reverse_phase: acq.reverse_phase,
-    };
-    let (_t_ms, trf_ms, _) = line_times(&epi);
+    // The same table `build_coil_kspace` reads, or the timing this validates is not the timing
+    // that runs.
+    let trf_ms = LineTiming::for_acquisition(acq, nx, ny).trf_ms;
     let mask = sampling_mask(nx, ny, acq);
     let mut worst = f64::INFINITY;
     for ky in 0..ny {
@@ -473,22 +499,25 @@ pub(crate) fn eddy_enabled(acq: &Acquisition, drive: Option<[f64; 3]>) -> bool {
 }
 
 fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: usize) -> Vec<C> {
+    let [nx, ny] = inp.acq_matrix;
+    build_coil_kspace_timed(inp, acq, coil, ncoils, &LineTiming::for_acquisition(acq, nx, ny))
+}
+
+/// [`build_coil_kspace`] with the line-timing table given.
+fn build_coil_kspace_timed(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: usize, timing: &LineTiming) -> Vec<C> {
     let [snx, sny] = inp.sim;
     let [nx, ny] = inp.acq_matrix;
     assert!(
         snx % nx == 0 && sny % ny == 0,
         "sim grid must be an integer multiple of the acquired matrix"
     );
+    assert!(
+        timing.t_ms.len() == ny && timing.trf_ms.len() == ny && timing.tread_ms.len() == ny && timing.polarity.len() == ny,
+        "line-timing table must have one entry per phase-encode line"
+    );
     let (z, nz) = (inp.z, inp.nz);
     let (compartments, t2, fmap) = (inp.compartments, inp.t2, inp.fmap);
-    let epi = SingleShotEpi {
-        kx_max: nx,
-        ky_max: ny,
-        t_line: acq.t_line,
-        t_echo: acq.t_echo,
-        reverse_phase: acq.reverse_phase,
-    };
-    let (t_ms, trf_ms, tread_ms) = line_times(&epi);
+    let (t_ms, trf_ms, tread_ms) = (&timing.t_ms, &timing.trf_ms, &timing.tread_ms);
     let gradient = inp.eddy_drive.unwrap_or([0.0; 3]);
     // eddy currents affect volumes with a prep gradient only (`None` = the old b0 branch)
     let do_eddy = eddy_enabled(acq, inp.eddy_drive);
@@ -648,9 +677,10 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
         let t0 = t_ms[0];
         let delta = t_ms[1] - (tau + t0);
         let tmax = t_ms.iter().fold(0.0f64, |m, t| m.max(t.abs())).max(1e-300);
+        // the per-parity weights below also assume the readout polarity is the line parity's
         let affine = (0..ny).all(|k| {
             let pred = tau * k as f64 + t0 + if k % 2 == 1 { delta } else { 0.0 };
-            (t_ms[k] - pred).abs() <= 1e-9 * tmax
+            (t_ms[k] - pred).abs() <= 1e-9 * tmax && timing.polarity[k] == if k % 2 == 1 { -1 } else { 1 }
         });
         if !affine {
             return None;
@@ -843,7 +873,7 @@ fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: u
         }
         // x-DFT evaluated only at the acquired kx band, with the Nyquist (N/2) ghost: an
         // alternating readout-line kx offset (gradient-delay mismatch).
-        let ghost_shift = if kyi % 2 == 1 { -acq.ghost_offset } else { acq.ghost_offset };
+        let ghost_shift = if timing.polarity[kyi] < 0 { -acq.ghost_offset } else { acq.ghost_offset };
         xstage.run(&g_re, &g_im, ghost_shift, &mut kspace[nx * kyi..nx * (kyi + 1)]);
     }
     let n_inv = 1.0 / nvox as f64;
@@ -2711,6 +2741,27 @@ mod tests {
             "contiguous mode must leave no gaps, got {kept:?}"
         );
     }
+    /// The line-timing table the forward reads is exactly what `line_times` gave it before P5,
+    /// bit for bit, and its polarity is the line parity the ghost always used.
+    #[test]
+    fn line_timing_table_is_line_times_bit_for_bit() {
+        for &(nx, ny) in &[(17usize, 70usize), (16, 40), (8, 9), (64, 64), (1, 1)] {
+            for reverse_phase in [false, true] {
+                for (t_line, t_echo) in [(1.0, 90.0), (0.5, 30.0), (0.37, 12.0)] {
+                    let acq = Acquisition { t_line, t_echo, reverse_phase, ..Acquisition::default() };
+                    let epi = SingleShotEpi { kx_max: nx, ky_max: ny, t_line, t_echo, reverse_phase };
+                    let (t, trf, tread) = line_times(&epi);
+                    let tab = LineTiming::for_acquisition(&acq, nx, ny);
+                    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&tab.t_ms), bits(&t));
+                    assert_eq!(bits(&tab.trf_ms), bits(&trf));
+                    assert_eq!(bits(&tab.tread_ms), bits(&tread));
+                    assert!(tab.polarity.iter().enumerate().all(|(k, &p)| p == if k % 2 == 1 { -1 } else { 1 }));
+                }
+            }
+        }
+    }
+
     /// The production forward is the literal per-line sum reorganised (static factors hoisted,
     /// the affine phase advanced by memoised rotors, the eddy polynomial factored per axis, the
     /// x-DFT done by FFT / twiddle table). Every effect, alone and combined, must reproduce the

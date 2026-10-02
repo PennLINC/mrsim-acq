@@ -150,7 +150,7 @@ fn outputs_match_the_golden_record_bit_for_bit() {
     assert!(all.len() >= 40, "{} cases", all.len());
     for (name, bits) in all {
         let bytes = std::fs::read(path(&name)).unwrap_or_else(|e| panic!("{name}: {e} (no golden record for this build)"));
-        let want: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let want: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
         assert_eq!(want.len(), bits.len(), "{name}: length");
         if let Some(i) = (0..bits.len()).find(|&i| bits[i] != want[i]) {
             panic!("{name}: first difference at {i}: {:e} vs golden {:e}", f32::from_bits(bits[i]), f32::from_bits(want[i]));
