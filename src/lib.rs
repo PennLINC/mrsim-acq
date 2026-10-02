@@ -38,6 +38,8 @@ pub mod noise;
 pub mod motion;
 /// Per-slice k-space forward model and reconstruction.
 pub mod kspace;
+/// The 3D echo-train acquisition (P5): kz encoding by echo, per-partition reconstruction.
+pub mod kspace3d;
 /// Type-1 NUFFT (feature `kspace`): the fieldmap y-sum of the forward model as one gridded FFT.
 pub mod nufft;
 /// Simulation config (feature `config`). `load` is a `todo!()` stub.

@@ -27,31 +27,31 @@ use crate::readout::{Readout, SingleShotEpi};
 use std::f64::consts::TAU;
 
 #[derive(Clone, Copy)]
-struct C {
-    re: f64,
-    im: f64,
+pub(crate) struct C {
+    pub(crate) re: f64,
+    pub(crate) im: f64,
 }
 impl C {
-    const ZERO: C = C { re: 0.0, im: 0.0 };
+    pub(crate) const ZERO: C = C { re: 0.0, im: 0.0 };
     #[inline]
     #[cfg_attr(feature = "kspace", allow(dead_code))]
     fn cis(theta: f64) -> C {
         C { re: theta.cos(), im: theta.sin() }
     }
     #[inline]
-    fn add(self, o: C) -> C {
+    pub(crate) fn add(self, o: C) -> C {
         C { re: self.re + o.re, im: self.im + o.im }
     }
     #[inline]
-    fn mul(self, o: C) -> C {
+    pub(crate) fn mul(self, o: C) -> C {
         C { re: self.re * o.re - self.im * o.im, im: self.re * o.im + self.im * o.re }
     }
     #[inline]
-    fn scale(self, s: f64) -> C {
+    pub(crate) fn scale(self, s: f64) -> C {
         C { re: self.re * s, im: self.im * s }
     }
     #[inline]
-    fn abs(self) -> f64 {
+    pub(crate) fn abs(self) -> f64 {
         (self.re * self.re + self.im * self.im).sqrt()
     }
 }
@@ -203,7 +203,7 @@ pub enum EchoFormation {
 /// starting at it. Sub-voxel and negligible for these very smooth Gaussians — and exactly zero for
 /// the canonical Gibbs benchmark, which forces `n_coils = 1` — but wrong, and it would stop being
 /// negligible the moment anyone supplied a sharper sensitivity map.
-fn coil_sensitivity(coil: usize, n_coils: usize, x: f64, y: f64, nx: usize, ny: usize) -> f64 {
+pub(crate) fn coil_sensitivity(coil: usize, n_coils: usize, x: f64, y: f64, nx: usize, ny: usize) -> f64 {
     if n_coils <= 1 {
         return 1.0;
     }
@@ -514,11 +514,17 @@ pub(crate) fn eddy_enabled(acq: &Acquisition, drive: Option<[f64; 3]>) -> bool {
 
 fn build_coil_kspace(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: usize) -> Vec<C> {
     let [nx, ny] = inp.acq_matrix;
-    build_coil_kspace_timed(inp, acq, coil, ncoils, &LineTiming::for_acquisition(acq, nx, ny))
+    build_coil_kspace_timed(inp, acq, coil, ncoils, &LineTiming::for_acquisition(acq, nx, ny), None)
 }
 
-/// [`build_coil_kspace`] with the line-timing table given.
-fn build_coil_kspace_timed(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: usize, timing: &LineTiming) -> Vec<C> {
+/// [`build_coil_kspace`] with the line-timing table given. `log_amp` (the 3D path's voxel mode,
+/// `kspace3d`) is a per-voxel log-amplitude on the simulation slice, added inside each
+/// compartment's decay exponent so the echo amplitude and the within-echo decay are one
+/// exponential (P5 addendum, "Echo amplitudes"); it forces the per-voxel path. The 2D path passes
+/// `None` and computes exactly what it computed before.
+pub(crate) fn build_coil_kspace_timed(
+    inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: usize, timing: &LineTiming, log_amp: Option<&[f64]>,
+) -> Vec<C> {
     let [snx, sny] = inp.sim;
     let [nx, ny] = inp.acq_matrix;
     assert!(
@@ -673,7 +679,11 @@ fn build_coil_kspace_timed(inp: &SliceInput, acq: &Acquisition, coil: usize, nco
     // therefore the NUFFT path — to survive. One Map anywhere takes the whole slice to the rotor
     // path with per-voxel relaxation; Uniform compartments in a mixed slice keep their scalar.
     let uniform = t2.iter().all(|s| matches!(s, T2Slice::Uniform(_)))
-        && inp.t_inhom.is_none_or(|ti| ti.iter().all(|s| matches!(s, T2Slice::Uniform(_))));
+        && inp.t_inhom.is_none_or(|ti| ti.iter().all(|s| matches!(s, T2Slice::Uniform(_))))
+        && log_amp.is_none();
+    if let Some(la) = log_amp {
+        assert_eq!(la.len(), snx * sny, "log-amplitude map is not on the simulation slice");
+    }
     // Compartment relaxation weights for this line (uniform case only).
     let mut rel = vec![1.0f64; compartments.len()];
     // Separable gradient-model eddy factors.
@@ -873,9 +883,11 @@ fn build_coil_kspace_timed(inp: &SliceInput, acq: &Acquisition, coil: usize, nco
                             Some(T2Slice::Uniform(v)) => v as f64,
                             Some(T2Slice::Map(m)) => m[i] as f64,
                         };
-                        match acq.echo {
-                            EchoFormation::Spin => (-trf / t2c - t.abs() * 1000.0 / tic).exp(),
-                            EchoFormation::Gradient => (-trf / t2c - trf / tic).exp(),
+                        match (acq.echo, log_amp) {
+                            (EchoFormation::Spin, None) => (-trf / t2c - t.abs() * 1000.0 / tic).exp(),
+                            (EchoFormation::Gradient, None) => (-trf / t2c - trf / tic).exp(),
+                            (EchoFormation::Spin, Some(la)) => (la[i] - trf / t2c - t.abs() * 1000.0 / tic).exp(),
+                            (EchoFormation::Gradient, Some(la)) => (la[i] - trf / t2c - trf / tic).exp(),
                         }
                     } else {
                         1.0
@@ -1101,17 +1113,29 @@ pub fn phase_slice(
 /// grid's k-space is evaluated, so truncation to the nominal band happens during the forward
 /// transform rather than by discarding a computed k-space (spec 3.1).
 pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
-    let [nx, ny] = inp.acq_matrix;
-    let (xs, ys) = (nx / 2, ny / 2);
-    let kat = |kx: usize, ky: usize| kx + nx * ky; // acquired k-space / acquired-image index
-
     // Build each coil's k-space (undersampled for GRAPPA when accel>1), reconstruct, then combine.
     let ncoils = acq.n_coils.max(1);
-    let accel = acq.accel.max(1);
     let mut coil_kspace: Vec<Vec<C>> = Vec::with_capacity(ncoils);
     for coil in 0..ncoils {
         coil_kspace.push(build_coil_kspace(inp, acq, coil, ncoils));
     }
+    reconstruct_coils(coil_kspace, acq, inp.acq_matrix)
+        .into_iter()
+        .map(|c| (c.re as f32, c.im as f32))
+        .collect()
+}
+
+/// One slice's (or partition's) reconstruction from its coils' acquired k-spaces: GRAPPA, the
+/// window, the inverse transform and the Roemer combine, returning the combined complex image
+/// on the acquired matrix in `f64`. [`simulate_slice`]'s reconstruction, moved here unchanged so
+/// the 3D path (`kspace3d`) reconstructs each partition by the same code.
+pub(crate) fn reconstruct_coils(mut coil_kspace: Vec<Vec<C>>, acq: &Acquisition, acq_matrix: [usize; 2]) -> Vec<C> {
+    let [nx, ny] = acq_matrix;
+    let (xs, ys) = (nx / 2, ny / 2);
+    let kat = |kx: usize, ky: usize| kx + nx * ky; // acquired k-space / acquired-image index
+    let ncoils = acq.n_coils.max(1);
+    let accel = acq.accel.max(1);
+    assert_eq!(coil_kspace.len(), ncoils, "one k-space per coil");
 
     // GRAPPA: fill the un-acquired PE lines with a kernel calibrated on the ACS band across coils.
     if accel > 1 {
@@ -1161,7 +1185,7 @@ pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
     (0..nx * ny)
         .map(|i| {
             let s = ssum[i].max(1e-12);
-            ((wsum[i].re / s) as f32, (wsum[i].im / s) as f32)
+            C { re: wsum[i].re / s, im: wsum[i].im / s }
         })
         .collect()
 }
