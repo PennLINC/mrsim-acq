@@ -259,7 +259,9 @@ below `v_max`. That is a model assumption, recorded, not a computed bound; for a
 `VascularCrushing: true` with part B on turns part C on. `VascularCrushingVENC` is then required:
 a number for every volume, or an array of one per volume, `0` meaning crushing off for that
 volume (BIDS), so a QUASAR-style alternation is one series. `[vascular_crushing]
-arterial_velocity` gives `v_max` per label (cm/s, keys as in part B). `VascularCrushing: true`
+arterial_velocity` gives `v_max` per label (cm/s, keys as in part B; finite, `0` to `1000` cm/s, far
+above any arterial speed, which keeps `pi v_max / VENC` within the range the sine integral is
+evaluated on: an implementation-review addition). `VascularCrushing: true`
 **without** part B is refused, naming `[macrovascular]`, unless `[vascular_crushing]
 no_arterial_compartment = true` says the user accepts that the crushers act on nothing modeled;
 that flag is recorded and the run is then P1-P3's, plus the echo of the standard fields.
@@ -391,7 +393,11 @@ Both are global (one value per time, the same in every voxel); spatially structu
 physiological noise is a different model, deferred. The six amplitudes (`tissue_cardiac`,
 `tissue_respiratory`, `tissue_drift`, `label_cardiac`, `label_respiratory`, `label_drift`)
 default to zero, and a `[physio]` table whose six are all zero is an error, as a motion mode with
-zero amplitudes is (P3). Part E is on when `[physio]` is present.
+zero amplitudes is (P3). Within each factor, `|cardiac| + |respiratory|` must be below 1 (an
+implementation-review addition): at 1 or more the periodic terms alone can take the factor to zero
+or below, flipping the sign of the magnetization it scales. The drift is unbounded in principle
+(an OU process); its amplitude is the user's, recorded in the sidecar. Part E is on when
+`[physio]` is present.
 
 ## Ground truth
 
