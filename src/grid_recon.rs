@@ -1,17 +1,18 @@
 //! The spiral reconstruction (P5 addendum, part C, "Forward and reconstruction", as amended after
 //! the feasibility benchmark).
 //!
-//! Per coil and partition, density-weighted least squares on the `n x n` acquired grid,
+//! Per coil and partition, density-weighted least squares on the image band: the `n x n` images
+//! whose DFT vanishes outside the disc the trajectory reaches (`Q` the projection onto them),
 //! `min sum_j w_j |(A x)_j - d_j|^2`, with `A` the forward of an object on the acquired grid (the
 //! type-2 NUFFT in the Cartesian forward's convention, `1/n^2`) and `A^H` its adjoint (the type-1
 //! NUFFT with the opposite sign, `img(X) = sum_j r_j exp(-i 2 pi k_j . (X - n/2) / n)`,
-//! deapodized). The solver is the Chebyshev semi-iteration on `A^H W A x = A^H W d` from zero over
-//! `[lambda_hi / LS_KAPPA, lambda_hi]`, [`LS_ITERATIONS`] iterations, with `lambda_hi` from a
+//! deapodized). The solver is the Chebyshev semi-iteration on `Q A^H W A Q x = Q A^H W d` from zero
+//! over `[lambda_hi / LS_KAPPA, lambda_hi]`, [`LS_ITERATIONS`] iterations, with `lambda_hi` from a
 //! power iteration on a fixed pseudo-random start: every coefficient depends only on the
 //! trajectory, so the reconstruction is linear in the data (the linearity identity needs that;
-//! conjugate gradients is not). It is a regularized approximate inverse (eigencomponents below
-//! `lambda_hi / LS_KAPPA` are only partly recovered), accurate to 1e-2 of peak on objects
-//! band-limited to `|k| <= 0.625 k_max` anywhere in the field of view. Its residual polynomial is
+//! conjugate gradients is not). On the spec's radially oversampled spirals (`c = 1.2`) the band's
+//! spectrum lies in the interval and every in-band mode is recovered to rounding; at `c = 1`
+//! (exactly Nyquist) it does not, and some modes were 16-66% wrong. Its residual polynomial is
 //! bounded by 1 on `[0, lambda_hi]`; the power iteration certifies nothing, so every image checks
 //! that its residual did not grow. Then the Roemer combine of `kspace::reconstruct_coils`.
 //!
@@ -35,13 +36,15 @@ use crate::nufft::Nufft2;
 /// Pipe-Menon iterations (fixed, recorded).
 pub const DCF_ITERATIONS: usize = 10;
 /// Chebyshev iterations of the least squares (fixed, recorded).
-pub const LS_ITERATIONS: usize = 80;
+pub const LS_ITERATIONS: usize = 40;
 /// The ratio of the Chebyshev interval's ends.
-pub const LS_KAPPA: f64 = 100.0;
+pub const LS_KAPPA: f64 = 10.0;
 /// The cap on the power iterations for the largest eigenvalue of the normal operator (they stop
 /// at convergence), and the margin over the estimate.
 pub const POWER_ITERATIONS: usize = 1000;
 pub const LAMBDA_MARGIN: f64 = 1.1;
+/// Whether the image is restricted to the frequencies the trajectory reaches.
+pub const BAND_LIMITED: bool = true;
 /// The NUFFT's tolerance.
 const NUFFT_TOL: f64 = 1e-12;
 
@@ -84,16 +87,68 @@ pub struct SpiralRecon {
     /// Chebyshev iterations and interval ratio.
     iterations: usize,
     kappa: f64,
+    /// The image band: the frequencies (centred, `x + n y`) inside the disc the trajectory reaches,
+    /// with the FFT plans of the projection onto them (`None`: the full `n x n` grid).
+    band: Option<Band>,
+}
+
+/// The projection onto images whose frequencies lie in a disc.
+struct Band {
+    keep: Vec<bool>,
+    fwd: std::sync::Arc<dyn rustfft::Fft<f64>>,
+    inv: std::sync::Arc<dyn rustfft::Fft<f64>>,
+}
+
+impl Band {
+    fn new(n: usize, radius: f64) -> Band {
+        let mut planner = rustfft::FftPlanner::<f64>::new();
+        let signed = |i: usize| if i < n / 2 { i as f64 } else { i as f64 - n as f64 };
+        let keep = (0..n * n).map(|i| signed(i % n).hypot(signed(i / n)) <= radius).collect();
+        Band { keep, fwd: planner.plan_fft_forward(n), inv: planner.plan_fft_inverse(n) }
+    }
+
+    /// The 2D transform of a `n x n` grid (layout `x + n y`), unnormalized.
+    fn fft2(n: usize, g: &mut [rustfft::num_complex::Complex<f64>], plan: &std::sync::Arc<dyn rustfft::Fft<f64>>) {
+        for row in g.chunks_exact_mut(n) {
+            plan.process(row);
+        }
+        let mut col = vec![rustfft::num_complex::Complex::new(0.0, 0.0); n];
+        for x in 0..n {
+            for y in 0..n {
+                col[y] = g[x + n * y];
+            }
+            plan.process(&mut col);
+            for y in 0..n {
+                g[x + n * y] = col[y];
+            }
+        }
+    }
+
+    fn project(&self, n: usize, x: &mut [C]) {
+        let mut g: Vec<rustfft::num_complex::Complex<f64>> = x.iter().map(|c| rustfft::num_complex::Complex::new(c.re, c.im)).collect();
+        Band::fft2(n, &mut g, &self.fwd);
+        for (v, &k) in g.iter_mut().zip(&self.keep) {
+            if !k {
+                *v = rustfft::num_complex::Complex::new(0.0, 0.0);
+            }
+        }
+        Band::fft2(n, &mut g, &self.inv);
+        let s = 1.0 / (n * n) as f64;
+        for (c, v) in x.iter_mut().zip(g) {
+            *c = C { re: v.re * s, im: v.im * s };
+        }
+    }
 }
 
 impl SpiralRecon {
     pub fn new(k: &[[f64; 2]], n: usize, window: KspaceWindow) -> SpiralRecon {
-        SpiralRecon::with_params(k, n, window, LS_ITERATIONS, LS_KAPPA)
+        SpiralRecon::with_params(k, n, window, LS_ITERATIONS, LS_KAPPA, BAND_LIMITED)
     }
 
-    /// [`SpiralRecon::new`] with the Chebyshev iteration count and interval ratio given (for the
-    /// measurements that choose them).
-    pub fn with_params(k: &[[f64; 2]], n: usize, window: KspaceWindow, iterations: usize, kappa: f64) -> SpiralRecon {
+    /// [`SpiralRecon::new`] with the Chebyshev iteration count, the interval ratio and the image
+    /// band given (for the measurements that choose them).
+    pub fn with_params(k: &[[f64; 2]], n: usize, window: KspaceWindow, iterations: usize, kappa: f64, band_limited: bool)
+                       -> SpiralRecon {
         let h = (n / 2) as i64;
         let nufft = Nufft2::new([n, n], [-h, -h], [n, n], NUFFT_TOL);
         let mut w = pipe_menon(&nufft, k, DCF_ITERATIONS);
@@ -104,7 +159,9 @@ impl SpiralRecon {
             *wj *= s;
         }
         let win = k.iter().map(|p| window.at(p[0] / n as f64, p[1] / n as f64)).collect();
-        let mut r = SpiralRecon { n, k: k.to_vec(), w, win, nufft, lambda_hi: 0.0, iterations, kappa };
+        let radius = k.iter().fold(0.0f64, |m, p| m.max(p[0].hypot(p[1])));
+        let band = band_limited.then(|| Band::new(n, radius));
+        let mut r = SpiralRecon { n, k: k.to_vec(), w, win, nufft, lambda_hi: 0.0, iterations, kappa, band };
         // The largest eigenvalue of A^H W A by power iteration from a pseudo-random start (a fixed
         // seed, so the reconstruction stays independent of the data), run to convergence. Power
         // iteration estimates from below and certifies nothing: the margin covers its slow last
@@ -152,8 +209,19 @@ impl SpiralRecon {
         self.nufft.type1(&self.k, &wts, -1).into_iter().map(|(re, im)| C { re, im }).collect()
     }
 
+    /// `Q A^H W A Q` on the image band (`Q` the projection; the identity without a band).
     fn normal(&self, x: &[C]) -> Vec<C> {
-        self.adjoint(&self.forward(x))
+        let mut xq = x.to_vec();
+        self.project(&mut xq);
+        let mut y = self.adjoint(&self.forward(&xq));
+        self.project(&mut y);
+        y
+    }
+
+    fn project(&self, x: &mut [C]) {
+        if let Some(b) = &self.band {
+            b.project(self.n, x);
+        }
     }
 
     /// The gridding image `n^2 A^H W d` (no window): the least squares' first direction, kept for
@@ -174,6 +242,7 @@ impl SpiralRecon {
         let mut rho = 1.0 / sigma1;
         let mut x = vec![C::ZERO; self.n * self.n];
         let mut r = self.adjoint(&dw);
+        self.project(&mut r);
         let r0 = norm(&r);
         let mut dir: Vec<C> = r.iter().map(|c| c.scale(1.0 / theta)).collect();
         for _ in 0..self.iterations {
@@ -268,7 +337,7 @@ mod tests {
         // centre; at oversample 1, where the data are exactly A x; on asl001's in-plane design
         // (64 x 64, 8 interleaves, 4 ms, 4 us) and a 32 x 32 one; gridding's numbers beside
         for &(n, il, dw, sigma, kb) in &[(32usize, 4usize, 0.008f64, 3.0f64, 10.0f64), (64, 8, 0.004, 6.0, 20.0)] {
-            let tr = spiral_trajectory(n, n, il, 4.0, dw).unwrap();
+            let tr = spiral_trajectory(n, n, il, 4.0, dw, 1.2).unwrap();
             let taus: Vec<f64> = (0..tr.k.len()).map(|j| tr.tau_ms[j % tr.n_samples()]).collect();
             let rec = SpiralRecon::new(&tr.k, n, KspaceWindow::None);
             let acq = plain();
@@ -303,7 +372,7 @@ mod tests {
     #[test]
     fn the_reconstruction_is_linear_and_reports_its_noise() {
         let n = 32;
-        let tr = spiral_trajectory(n, n, 4, 4.0, 0.008).unwrap();
+        let tr = spiral_trajectory(n, n, 4, 4.0, 0.008, 1.2).unwrap();
         let rec = SpiralRecon::new(&tr.k, n, KspaceWindow::Hann);
         let mut g = uniform(99);
         let d1: Vec<C> = tr.k.iter().map(|_| C { re: g(), im: g() }).collect();
@@ -330,7 +399,7 @@ mod tests {
         // exact-sum samples, with a uniform 30 Hz off-resonance, oversample 2
         let (n, o) = (32, 2);
         let s = n * o;
-        let tr = spiral_trajectory(n, n, 4, 4.0, 0.008).unwrap();
+        let tr = spiral_trajectory(n, n, 4, 4.0, 0.008, 1.2).unwrap();
         let ns = tr.n_samples();
         let idx: Vec<usize> = (0..tr.k.len()).map(|j| j % ns).collect();
         let taus: Vec<f64> = idx.iter().map(|&j| tr.tau_ms[j]).collect();
@@ -383,7 +452,7 @@ mod tests {
     #[ignore]
     fn sweep_iterations_and_interval() {
         for &(n, il, dw, sigma, kb) in &[(32usize, 4usize, 0.008f64, 3.0f64, 10.0f64), (64, 8, 0.004, 6.0, 20.0)] {
-            let tr = spiral_trajectory(n, n, il, 4.0, dw).unwrap();
+            let tr = spiral_trajectory(n, n, il, 4.0, dw, 1.2).unwrap();
             let taus: Vec<f64> = (0..tr.k.len()).map(|j| tr.tau_ms[j % tr.n_samples()]).collect();
             let acq = plain();
             let t2 = [T2Slice::Uniform(f32::INFINITY)];
@@ -399,7 +468,7 @@ mod tests {
             }).collect();
             for &kappa in &[30.0, 100.0, 300.0] {
                 for &it in &[40usize, 60, 80, 120] {
-                    let rec = SpiralRecon::with_params(&tr.k, n, KspaceWindow::None, it, kappa);
+                    let rec = SpiralRecon::with_params(&tr.k, n, KspaceWindow::None, it, kappa, true);
                     let t0 = std::time::Instant::now();
                     let errs: Vec<String> = objs.iter().zip(&data).map(|((name, o), d)| {
                         let img = rec.image(d);
@@ -409,6 +478,80 @@ mod tests {
                     println!("n {n} kappa {kappa} it {it}: {} ({:.0?} per image)", errs.join(", "), t0.elapsed() / 3);
                 }
             }
+        }
+    }
+
+    /// The worst single Fourier mode `cos` / `sin(2 pi k . x / n)` over `ks`: the hardest objects of
+    /// a band-limited domain, the reconstruction being linear (the final review's
+    /// `cos(2 pi 5 x / 32)` among them). Data `A x` through the reconstruction's own forward
+    /// (exactly `A x` at oversample 1). Returns the error (of a unit peak) and where.
+    fn worst_single_mode(rec: &SpiralRecon, n: usize, ks: &[(i64, i64)]) -> (f64, (i64, i64, &'static str)) {
+        let (mut worst, mut at) = (0.0f64, (0, 0, ""));
+        for &(kx, ky) in ks {
+            for (phase, name) in [(0, "cos"), (1, "sin")] {
+                let x: Vec<C> = (0..n * n).map(|i| {
+                    let a = TAU * (kx as f64 * (i % n) as f64 + ky as f64 * (i / n) as f64) / n as f64;
+                    C { re: if phase == 0 { a.cos() } else { a.sin() }, im: 0.0 }
+                }).collect();
+                if x.iter().all(|c| c.re.abs() < 1e-12) {
+                    continue;
+                }
+                let img = rec.image(&rec.forward(&x));
+                let e = img.iter().zip(&x).fold(0.0f64, |m, (a, b)| m.max((a.re - b.re).hypot(a.im - b.im)));
+                if e > worst {
+                    (worst, at) = (e, (kx, ky, name));
+                }
+            }
+        }
+        (worst, at)
+    }
+
+    /// Every frequency of the half-disc `|k| <= kb` (the other half are the same real modes).
+    fn half_disc(kb: i64) -> Vec<(i64, i64)> {
+        let mut v = Vec::new();
+        for ky in 0..=kb {
+            for kx in -kb..=kb {
+                if kx * kx + ky * ky <= kb * kb && !(ky == 0 && kx < 0) {
+                    v.push((kx, ky));
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn every_single_mode_of_the_declared_domain_is_reconstructed() {
+        // the declared domain, |k| <= 0.625 k_max, mode by mode on a 16 x 16 design (the whole
+        // half-disc) and, on the 32 x 32 one, the final review's mode and the worst modes of the
+        // Nyquist design (16% to 66% error there)
+        let n = 16;
+        let tr = spiral_trajectory(n, n, 2, 4.0, 0.01, 1.2).unwrap();
+        let rec = SpiralRecon::new(&tr.k, n, KspaceWindow::None);
+        let (e, at) = worst_single_mode(&rec, n, &half_disc(5));
+        println!("16 x 16: worst single mode {e:.2e} at {at:?}");
+        assert!(e <= 1e-2, "{e} at {at:?}");
+        let n = 32;
+        let tr = spiral_trajectory(n, n, 4, 4.0, 0.008, 1.2).unwrap();
+        let rec = SpiralRecon::new(&tr.k, n, KspaceWindow::None);
+        let (e, at) = worst_single_mode(&rec, n, &[(5, 0), (7, 7), (-7, 7), (6, 8), (10, 0), (0, 10)]);
+        println!("32 x 32: worst of the named modes {e:.2e} at {at:?}");
+        assert!(e <= 1e-2, "{e} at {at:?}");
+    }
+
+    /// The numbers behind the trajectory's radial oversampling and the reconstruction's parameters
+    /// (plan Measurements): the worst single mode over the whole half-disc `|k| <= 10` at
+    /// `32 x 32`, for the design's radial oversampling `OVS` (default 1.2; 1 is the spec's first,
+    /// exactly Nyquist, design).
+    #[test]
+    #[ignore]
+    fn sweep_worst_single_mode() {
+        let n = 32usize;
+        let ovs: f64 = std::env::var("OVS").ok().and_then(|v| v.parse().ok()).unwrap_or(1.2);
+        let tr = spiral_trajectory(n, n, 4, 4.0, 0.004, ovs).unwrap();
+        for &(kappa, it, band) in &[(100.0, 80usize, false), (10.0, 40, true), (30.0, 40, true), (100.0, 80, true)] {
+            let rec = SpiralRecon::with_params(&tr.k, n, KspaceWindow::None, it, kappa, band);
+            let (e, at) = worst_single_mode(&rec, n, &half_disc(10));
+            println!("OVS {ovs} band {band} kappa {kappa} it {it}: worst single mode {e:.3e} at {at:?}");
         }
     }
 }

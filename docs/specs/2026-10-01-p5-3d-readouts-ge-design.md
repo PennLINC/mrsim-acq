@@ -656,11 +656,17 @@ An Archimedean constant-density spiral-out, interleaf `s` of `N` (`N` = `interle
 per field of view, as a function of a normalized parameter `u` in `[0, 1]`:
 
 ```
-k_s(u) = k_max u exp(i (2 pi n_turns u + 2 pi s / N)),     k_max = nx / 2,   n_turns = nx / (2 N)
+k_s(u) = k_max u exp(i (2 pi n_turns u + 2 pi s / N)),     k_max = nx / 2,   n_turns = c nx / (2 N)
 ```
 
-so turns of one interleaf are `N` cycles/FOV apart radially and the `N` interleaves together are
-`1` apart. Time enters through `u(tau)`: constant linear velocity, `u = sqrt(tau/T)`, outside a
+so turns of one interleaf are `N / c` cycles/FOV apart radially and the `N` interleaves together
+are `1 / c` apart, `c >= 1` the **radial oversampling** (`[readout] radial_oversampling`, default
+1.2; amended 2026-10-02). The first version had `c = 1`, turns exactly Nyquist-spaced; at that
+critical spacing some in-band image directions are barely determined by the samples, and no fixed
+reconstruction recovered them: single Fourier modes inside `|k| <= 0.625 k_max` came back with up
+to 16 percent error even with the band restriction below (66 percent without it; the final
+implementation review's case, `cos(2 pi 5 x / 32)`, at `1.2e-2`). With `c = 1.2` every such mode is
+recovered to rounding (plan Measurements). Time enters through `u(tau)`: constant linear velocity, `u = sqrt(tau/T)`, outside a
 centre region, and constant angular velocity, `u = tau / sqrt(tau_c T)`, inside `tau < tau_c`
 (continuous at `tau_c`), because the pure square root has infinite speed at the centre. Samples
 are at `tau_j = (j + 1/2) dwell`, `j = 0..n_samples`, `n_samples = floor(T / dwell)`. `nx = ny`
@@ -775,26 +781,28 @@ feasibility benchmark, separately for `class` and `voxel` mode.
 
 **Reconstruction** (amended 2026-10-02 after the feasibility benchmark; the first version was
 gridding alone): density-weighted least squares, per coil and partition, by a fixed linear
-iteration. The image `x` on the `nx x ny` grid approximately minimizes
+iteration, on the image **band** the trajectory reaches. The image `x` lies in the band: the
+`nx x ny` images whose DFT is zero outside the disc of the largest sample radius (the spiral's
+analogue of the Cartesian square band; the corners of the grid's frequency square are never
+sampled, and leaving them free let them mimic in-band directions). It approximately minimizes
 `sum_j w_j |(A x)_j - d_j|^2`, `A` the forward of an object on the acquired grid (the type-2 NUFFT
 in the convention above, `1/(nx ny)`), `A^H` its adjoint (the type-1 NUFFT with the opposite sign,
-deapodized), `w_j` the density weights. The solver is the **Chebyshev semi-iteration** on the
-normal equations `A^H W A x = A^H W d` from `x = 0`, over the eigenvalue interval
-`[lambda_hi / 100, lambda_hi]`, 80 iterations, `lambda_hi` 1.1 times the largest eigenvalue
-estimated by power iteration from a pseudo-random start (fixed seed) run to convergence: every
-coefficient depends only on the trajectory and the weights, so the reconstruction is a fixed
-**linear** operator on the samples, which the linearity identity requires (conjugate gradients,
-whose step sizes depend on the data, is not). It is a **regularized approximate inverse**, not the
-least-squares solution: components with eigenvalues below `lambda_hi / 100` are only partly
-recovered. Its residual polynomial is bounded by 1 on `[0, lambda_hi]`; power iteration estimates
-the top of the spectrum from below and certifies nothing, so every reconstruction checks that its
-normal-equation residual did not grow (it can only grow if an eigenvalue lies above `lambda_hi`)
-and panics if it did. The supported domain, and what the tests assert: objects band-limited to
-`|k| <= 0.625 k_max`, anywhere in the field of view, to `1e-2` of peak. The parameters were chosen
-on a sweep (plan Measurements): `[lambda/30, lambda]` with 40 iterations met `1e-2` at the centre
-but not at the edge (`1.5e-2`, the second review's case); `kappa = 300` meets it with more margin
-but doubles the image noise, `kappa = 100` with 80 iterations meets it (worst `6.8e-3`) at 1.6
-times the Cartesian noise.
+deapodized), `w_j` the density weights, `Q` the projection onto the band (FFT, mask, inverse
+FFT). The solver is the **Chebyshev semi-iteration** on the normal equations
+`Q A^H W A Q x = Q A^H W d` from `x = 0`, over the eigenvalue interval `[lambda_hi / 10, lambda_hi]`,
+40 iterations, `lambda_hi` 1.1 times the largest eigenvalue estimated by power iteration from a
+pseudo-random start (fixed seed) run to convergence: every coefficient depends only on the
+trajectory and the weights, so the reconstruction is a fixed **linear** operator on the samples,
+which the linearity identity requires (conjugate gradients, whose step sizes depend on the data,
+is not). It is an approximate inverse on the band, exact only as far as the band's spectrum lies
+in the interval; with `c = 1.2` it does. Its residual polynomial is bounded by 1 on
+`[0, lambda_hi]`; power iteration estimates the top of the spectrum from below and certifies
+nothing, so every reconstruction checks that its normal-equation residual did not grow (it can
+only grow if an eigenvalue lies above `lambda_hi`) and panics if it did. What the tests assert:
+every single Fourier mode with `|k| <= 0.625 k_max` (the whole half-disc at `16 x 16`; the
+reviewed and formerly worst modes at `32 x 32`), and band-limited objects at the centre, edge and
+corner of the field of view, to `1e-2` of peak (measured: `1e-7` to `1e-4`). The earlier
+parameters (80 iterations over `[lambda/100, lambda]`, no band, `c = 1`) are recorded in the plan.
 The density weights are Pipe and Menon's in operator form, `w <- w / |A A^H w|` (10 iterations,
 fixed, recorded), normalized so that a constant object with no off-resonance and no decay grids to
 its Cartesian value at the image centre (the scale is common to every weight, so it does not move
@@ -812,10 +820,11 @@ exactly Nyquist-spaced radially, and at that spacing gridding reproduces a band-
 operator Pipe-Menon and the trajectory's exact annulus areas all give 1-6 percent on the
 band-limited object). At oversampling 1 the data of an object on the acquired grid are exactly
 `A x`, so the least squares recovers it as the iteration converges: the Chebyshev iteration
-above reaches, on exactly band-limited objects (`|k| <= 0.625 k_max`), `1.4e-4` (centre),
-`5.7e-3` (edge) and `6.8e-3` (corner) of peak at `32 x 32`, and `4.3e-5`, `2.7e-3` and `3.5e-3`
-at `asl001`'s `64 x 64`; on the uniform object, under `1e-4` at the centre and `1.0e-3` to
-`1.7e-3` over the FOV. At higher oversampling, what the
+above, with `c = 1.2`, reaches `4e-8` to `3e-5` of peak on exactly band-limited objects
+(`|k| <= 0.625 k_max`) at the centre, edge and corner at `32 x 32` and `asl001`'s `64 x 64`, and
+under `1.2e-5` on the uniform object over the whole FOV. Its image noise is below the Cartesian
+path's at the same `noise_variance` (about 0.5 to 0.6: more samples, and the band is the disc, not
+the square); measured, not asserted. At higher (simulation-grid) oversampling, what the
 spiral samples of the sub-voxel structure outside the reconstruction's band is what it cannot
 represent, as with the Cartesian path's truncation.
 
@@ -836,6 +845,7 @@ Overlay `[readout]` for spirals:
 |---|---|---|
 | `interleaves` | none: required | `N` |
 | `spiral_readout_time` | none: required | `T`, ms |
+| `radial_oversampling` | 1.2 | `c >= 1`: the turns `1/c` cycle/FOV apart (amended: `c = 1` leaves image directions unrecoverable) |
 | `dwell_time` | sidecar `DwellTime`, else required | s |
 | `kz_segments`, `kz_order`, `echo_spacing`, `refocusing_time`, `refocusing_flip_angle` | as part B | |
 
@@ -989,7 +999,9 @@ per-line scalars, and knows nothing of labeling, kinetics or physiology.
   band-limited to `|k| <= 0.625 k_max`, with no off-resonance, reproduces it to `1e-2` of peak at
   the centre, the edge and the corner of the field of view (declared before; gridding missed it at
   `4e-2`, and the spec was revisited, not the number; the edge and corner cases are the second
-  implementation review's); a uniform object reconstructs to its Cartesian value at the image
+  implementation review's), and so does every single Fourier mode of that domain (the whole
+  half-disc at `16 x 16`; the final review's `cos(2 pi 5 x / 32)` and the Nyquist design's worst
+  modes at `32 x 32`); a uniform object reconstructs to its Cartesian value at the image
   centre to `1e-3` (the first version said everywhere; gridding missed both, and the FOV error is
   reported); the shots select exactly their samples (a zeroed shot, a shot set with doubled images,
   on the acquired samples with unequal interleaf and kz-segment counts); the reconstruction is linear
@@ -1197,3 +1209,13 @@ a sweep over objects at the centre, edge and corner (80 iterations, `kappa = 100
 covers all three. The shot test now asserts on the acquired samples. The aslscan minors (an
 overridden `PulseSequenceType`, a non-string `PhaseEncodingDirection` with a spiral, the separate
 M0's `DwellTime` provenance) are fixed in aslscan.
+
+Ordinary Codex final review of those fixes, 2026-10-02: every fix confirmed but one, the
+band-limited accuracy domain, still false for a single mode (`cos(2 pi 5 x / 32)` at `1.16e-2`).
+Checked and extended: over the whole half-disc `|k| <= 10` at `32 x 32` single modes came back
+with up to 66 percent error, 16 percent with the image restricted to the sampled disc, and no
+iteration count or interval fixed it; the cause is the trajectory, exactly Nyquist-spaced
+radially. Decided by the user: the turns gain a radial oversampling `c` (`[readout]
+radial_oversampling`, default 1.2), and the reconstruction works on the disc band (40 iterations
+over `[lambda/10, lambda]`). Every in-band mode is then recovered to rounding; the tests cover
+single modes.

@@ -1179,7 +1179,7 @@ mod tests {
 
     #[cfg(feature = "kspace")]
     fn spiral_ro() -> Readout3d {
-        Readout3d::Spiral { interleaves: 2, readout_ms: 4.0, dwell_ms: 0.01 }
+        Readout3d::Spiral { interleaves: 2, readout_ms: 4.0, dwell_ms: 0.01, radial_oversampling: 1.2 }
     }
 
     #[cfg(feature = "kspace")]
@@ -1210,7 +1210,7 @@ mod tests {
         let phase = PhaseModel::none();
         let out = simulate_acquisition_3d_complex([s, s, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq, &tr,
                                                   &spiral_ro(), None, None, &phase, 3);
-        let traj = spiral_trajectory(n, n, 2, 4.0, 0.01).unwrap();
+        let traj = spiral_trajectory(n, n, 2, 4.0, 0.01, 1.2).unwrap();
         let idx: Vec<usize> = (0..traj.k.len()).map(|j| j % traj.n_samples()).collect();
         let rec = SpiralRecon::new(&traj.k, n, acq.window);
         let nplane = s * s;
@@ -1338,7 +1338,7 @@ mod tests {
         let t2 = vec![T2Volume::Uniform(80.0), T2Volume::Uniform(110.0)];
         let acq = Acquisition { do_relaxation: true, do_distortions: true, signal_scale: 100.0, ..Acquisition::default() };
         let tr = train(nz, 2, KzOrder::Centric, 12.0, 180.0);
-        let ro = Readout3d::Spiral { interleaves: 3, readout_ms: 4.0, dwell_ms: 0.01 };
+        let ro = Readout3d::Spiral { interleaves: 3, readout_ms: 4.0, dwell_ms: 0.01, radial_oversampling: 1.2 };
         let phase = PhaseModel::none();
         let pl = spiral_plan([s, s, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq, &tr, &ro, None, None, &phase);
         assert_eq!(pl.table.n_shots, 6);

@@ -308,7 +308,7 @@ mod tests {
         use crate::tseg::RateRect;
         let (n, o) = (32usize, 2usize);
         let s = n * o;
-        let tr = crate::readout::spiral_trajectory(n, n, 4, 4.0, 0.008).unwrap();
+        let tr = crate::readout::spiral_trajectory(n, n, 4, 4.0, 0.008, 1.2).unwrap();
         let ns = tr.n_samples();
         let tau_idx: Vec<usize> = (0..tr.k.len()).map(|j| j % ns).collect();
         let taus: Vec<f64> = tau_idx.iter().map(|&j| tr.tau_ms[j]).collect();
@@ -364,7 +364,7 @@ mod tests {
         use std::time::Instant;
         let (n, o, nz, ncomp, etl) = (64usize, 2usize, 20usize, 6usize, 20usize);
         let s = n * o;
-        let tr = crate::readout::spiral_trajectory(n, n, 8, 4.0, 0.004).unwrap();
+        let tr = crate::readout::spiral_trajectory(n, n, 8, 4.0, 0.004, 1.2).unwrap();
         let ns = tr.n_samples();
         let idx: Vec<usize> = (0..tr.k.len()).map(|j| j % ns).collect();
         let (img, _, t2m, tpm, ph, la) = smooth_maps(n, o);

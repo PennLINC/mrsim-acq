@@ -97,11 +97,12 @@ pub struct EchoTrain {
 /// (segment `sy` reads `ky = sy + ky_segments j`), centred on the spin echo, at the actual line
 /// spacing `t_line_ms`; `reverse_phase` as [`SingleShotEpi`]'s (false: the block starts at its
 /// highest `ky` and descends). Spiral: one spiral-out interleaf of `interleaves` per echo, starting
-/// at the spin echo, `readout_ms` long, sampled every `dwell_ms` ([`spiral_trajectory`]).
+/// at the spin echo, `readout_ms` long, sampled every `dwell_ms`, its turns `radial_oversampling`
+/// times denser than the Nyquist spacing ([`spiral_trajectory`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Readout3d {
     Grase { ky_segments: usize, t_line_ms: f64, reverse_phase: bool },
-    Spiral { interleaves: usize, readout_ms: f64, dwell_ms: f64 },
+    Spiral { interleaves: usize, readout_ms: f64, dwell_ms: f64, radial_oversampling: f64 },
 }
 
 /// Partitions in the order the train reads them: `kz_order(nz, order)[n]` is the `n`-th read.
@@ -296,13 +297,16 @@ pub fn check_grase_timing(train: &EchoTrain, table: &Grase3dTable, t_exc_ms: f64
 
 /// An Archimedean constant-density spiral-out design on a square `nx x nx` matrix, in cycles/FOV:
 /// interleaf `s` of `N` is `k_s(u) = k_max u exp(i (2 pi n_turns u + 2 pi s / N))`, `k_max = nx/2`,
-/// `n_turns = nx / (2N)`, with `u(tau)` constant angular velocity inside `tau_c` and constant
+/// `n_turns = c nx / (2N)` with `c >= 1` the radial oversampling (turns `1/c` cycle/FOV apart
+/// across the interleaves; `c = 1` is exactly Nyquist, which leaves image directions the
+/// reconstruction cannot recover), with `u(tau)` constant angular velocity inside `tau_c` and constant
 /// linear velocity (`u = sqrt(tau / T)`) outside. `tau_c` is the smallest centre region keeping the
 /// speed times the dwell time at most one cycle/FOV everywhere on the continuous trajectory (a
 /// sampling bound, not a gradient or slew limit).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpiralTrajectory {
     pub interleaves: usize,
+    pub radial_oversampling: f64,
     pub readout_ms: f64,
     pub dwell_ms: f64,
     pub k_max: f64,
@@ -350,14 +354,18 @@ impl SpiralTrajectory {
 /// `nx` matrix: the speed is largest at `tau_c` (inside), `v = k_max sqrt(1/(tau_c T) +
 /// 4 pi^2 n_turns^2 / T^2)`, and `v dwell = 1` solves to
 /// `tau_c = 1 / (T (1/(k_max dwell)^2 - 4 pi^2 n_turns^2 / T^2))`.
-pub fn spiral_tau_c(nx: usize, interleaves: usize, readout_ms: f64, dwell_ms: f64) -> Result<f64, String> {
+pub fn spiral_tau_c(nx: usize, interleaves: usize, readout_ms: f64, dwell_ms: f64, radial_oversampling: f64)
+                    -> Result<f64, String> {
     let pos = |v: f64| v.is_finite() && v > 0.0;
     if interleaves == 0 || !pos(readout_ms) || !pos(dwell_ms) {
         return Err(format!("a spiral needs interleaves > 0, a positive readout time and a positive dwell time \
                             (got {interleaves}, {readout_ms} ms, {dwell_ms} ms)"));
     }
+    if !(radial_oversampling.is_finite() && radial_oversampling >= 1.0) {
+        return Err(format!("a spiral's radial oversampling must be at least 1 (got {radial_oversampling})"));
+    }
     let k_max = nx as f64 / 2.0;
-    let n_turns = nx as f64 / (2.0 * interleaves as f64);
+    let n_turns = radial_oversampling * nx as f64 / (2.0 * interleaves as f64);
     let t = readout_ms;
     let pi = std::f64::consts::PI;
     let dwell_max = t / (2.0 * pi * n_turns * k_max);
@@ -379,16 +387,17 @@ pub fn spiral_tau_c(nx: usize, interleaves: usize, readout_ms: f64, dwell_ms: f6
 }
 
 /// The sampled spiral of [`Readout3d::Spiral`] on an `nx x ny` matrix (`nx = ny` required).
-pub fn spiral_trajectory(nx: usize, ny: usize, interleaves: usize, readout_ms: f64, dwell_ms: f64)
-                         -> Result<SpiralTrajectory, String> {
+pub fn spiral_trajectory(nx: usize, ny: usize, interleaves: usize, readout_ms: f64, dwell_ms: f64,
+                         radial_oversampling: f64) -> Result<SpiralTrajectory, String> {
     if nx != ny {
         return Err(format!("a spiral readout needs a square in-plane matrix, not {nx} x {ny}"));
     }
-    let tau_c_ms = spiral_tau_c(nx, interleaves, readout_ms, dwell_ms)?;
+    let tau_c_ms = spiral_tau_c(nx, interleaves, readout_ms, dwell_ms, radial_oversampling)?;
     // floor(T / dwell), robust to T / dwell landing a rounding error below an integer
     let n = (readout_ms / dwell_ms * (1.0 + 1e-12)).floor() as usize;
     let mut tr = SpiralTrajectory {
-        interleaves, readout_ms, dwell_ms, k_max: nx as f64 / 2.0, n_turns: nx as f64 / (2.0 * interleaves as f64),
+        interleaves, radial_oversampling, readout_ms, dwell_ms, k_max: nx as f64 / 2.0,
+        n_turns: radial_oversampling * nx as f64 / (2.0 * interleaves as f64),
         tau_c_ms, tau_ms: (0..n).map(|j| (j as f64 + 0.5) * dwell_ms).collect(), k: Vec::with_capacity(n * interleaves),
     };
     for s in 0..interleaves {
@@ -430,10 +439,10 @@ impl Spiral3dTable {
 
 /// The table of a [`Readout3d::Spiral`] train.
 pub fn spiral_lines(train: &EchoTrain, readout: &Readout3d, nx: usize, ny: usize, nz: usize) -> Result<Spiral3dTable, String> {
-    let Readout3d::Spiral { interleaves, readout_ms, dwell_ms } = *readout else {
+    let Readout3d::Spiral { interleaves, readout_ms, dwell_ms, radial_oversampling } = *readout else {
         return Err("a GRASE readout has no spiral table (grase_lines)".to_string());
     };
-    let traj = spiral_trajectory(nx, ny, interleaves, readout_ms, dwell_ms)?;
+    let traj = spiral_trajectory(nx, ny, interleaves, readout_ms, dwell_ms, radial_oversampling)?;
     if train.kz_segments == 0 || !nz.is_multiple_of(train.kz_segments) {
         return Err(format!("{nz} partitions do not divide into {} kz segments", train.kz_segments));
     }
@@ -619,10 +628,11 @@ mod tests {
     fn spiral_speed_bound_holds_on_the_continuous_trajectory() {
         // the asl001 design and a spread of others: max speed x dwell <= 1 on a fine sampling of
         // tau, and the bound is tight (reached just inside tau_c)
-        for &(nx, n, t, frac) in &[(64usize, 8usize, 4.0f64, 0.8f64), (32, 1, 10.0, 0.5), (32, 4, 2.0, 0.95), (128, 16, 6.0, 0.3)] {
-            let dmax = t / (std::f64::consts::TAU * (nx as f64 / (2.0 * n as f64)) * (nx as f64 / 2.0));
+        for &(nx, n, t, frac, c) in &[(64usize, 8usize, 4.0f64, 0.8f64, 1.2f64), (64, 8, 4.0, 0.8, 1.0), (32, 1, 10.0, 0.5, 1.0),
+                                      (32, 4, 2.0, 0.95, 1.5), (128, 16, 6.0, 0.3, 1.2)] {
+            let dmax = t / (std::f64::consts::TAU * (c * nx as f64 / (2.0 * n as f64)) * (nx as f64 / 2.0));
             let dwell = frac * dmax;
-            let tr = match spiral_trajectory(nx, nx, n, t, dwell) {
+            let tr = match spiral_trajectory(nx, nx, n, t, dwell, c) {
                 Ok(tr) => tr,
                 Err(e) => { assert!(e.contains("too short"), "{e}"); continue; }
             };
@@ -665,24 +675,25 @@ mod tests {
     fn spiral_sampling_bound_rejects_undersampled_designs() {
         // the second review's counterexample: one interleaf, nx = 64, 32 samples over 32 turns,
         // every sample on the x-axis one cycle/FOV apart, which a chord check passes
-        let e = spiral_trajectory(64, 64, 1, 3.2, 0.1).unwrap_err();
+        let e = spiral_trajectory(64, 64, 1, 3.2, 0.1, 1.0).unwrap_err();
         assert!(e.contains("dwell time must be below"), "{e}");
         // a dwell one percent above the bound
-        let dmax = 4.0 / (std::f64::consts::TAU * 4.0 * 32.0);
-        assert!(spiral_trajectory(64, 64, 8, 4.0, 1.01 * dmax).unwrap_err().contains("dwell time must be below"));
+        let dmax = 4.0 / (std::f64::consts::TAU * 1.2 * 4.0 * 32.0);
+        assert!(spiral_trajectory(64, 64, 8, 4.0, 1.01 * dmax, 1.2).unwrap_err().contains("dwell time must be below"));
         // a dwell just below the bound needs a centre region longer than the readout
-        assert!(spiral_trajectory(64, 64, 8, 4.0, 0.9999 * dmax).unwrap_err().contains("too short"));
+        assert!(spiral_trajectory(64, 64, 8, 4.0, 0.9999 * dmax, 1.2).unwrap_err().contains("too short"));
         // rectangular matrices and nonsense inputs
-        assert!(spiral_trajectory(64, 48, 8, 4.0, 0.004).unwrap_err().contains("square"));
-        assert!(spiral_trajectory(64, 64, 0, 4.0, 0.004).is_err());
-        assert!(spiral_trajectory(64, 64, 8, 4.0, 0.0).is_err());
+        assert!(spiral_trajectory(64, 48, 8, 4.0, 0.004, 1.2).unwrap_err().contains("square"));
+        assert!(spiral_trajectory(64, 64, 0, 4.0, 0.004, 1.2).is_err());
+        assert!(spiral_trajectory(64, 64, 8, 4.0, 0.004, 0.9).unwrap_err().contains("at least 1"));
+        assert!(spiral_trajectory(64, 64, 8, 4.0, 0.0, 1.2).is_err());
     }
 
     #[test]
     fn spiral_asl001_numbers() {
         // asl001 with the committed overlay: 64 x 64 x 20, 8 interleaves, T = 4 ms, dwell 4 us,
         // TE 10.528 ms, excitation at LD + PLD = 3.475 s, TR 4.886 s, refocusing time 2 ms
-        let ro = Readout3d::Spiral { interleaves: 8, readout_ms: 4.0, dwell_ms: 0.004 };
+        let ro = Readout3d::Spiral { interleaves: 8, readout_ms: 4.0, dwell_ms: 0.004, radial_oversampling: 1.2 };
         let train = EchoTrain { etl: 20, esp_ms: 0.0, refocusing_deg: 111.0, kz_order: KzOrder::Centric, kz_segments: 1,
                                 refocusing_time_ms: 2.0 };
         let tab = spiral_lines(&train, &ro, 64, 64, 20).unwrap();
@@ -697,7 +708,7 @@ mod tests {
         assert!((end - 3689.56).abs() < 1e-9, "{end}");
         // tau_c from the closed form
         let pi = std::f64::consts::PI;
-        let want = 1.0 / (4.0 * (1.0 / (32.0f64 * 0.004).powi(2) - 4.0 * pi * pi * 16.0 / 16.0));
+        let want = 1.0 / (4.0 * (1.0 / (32.0f64 * 0.004).powi(2) - 4.0 * pi * pi * 4.8 * 4.8 / 16.0));
         assert!((tab.traj.tau_c_ms - want).abs() < 1e-15, "{}", tab.traj.tau_c_ms);
         // every partition read once, the centre first; shots s kz_segments + sz
         assert_eq!(tab.echo[10], 1);
@@ -707,7 +718,7 @@ mod tests {
         assert_eq!(tab.shot(3, 5), 5);
         assert!((tab.trf_ms(10, 0) - (10.528 + 0.002)).abs() < 1e-12);
         // Codex's example: an 8 ms spiral at this ESP would run through the next pulse
-        let ro8 = Readout3d::Spiral { interleaves: 4, readout_ms: 8.0, dwell_ms: 0.004 };
+        let ro8 = Readout3d::Spiral { interleaves: 4, readout_ms: 8.0, dwell_ms: 0.004, radial_oversampling: 1.2 };
         let tab8 = spiral_lines(&train, &ro8, 64, 64, 20).unwrap();
         assert!(check_spiral_timing(&train, &tab8, 3475.0, 4886.0).unwrap_err().contains("next refocusing pulse"));
         // two kz segments: shots interleave x segment; past the repetition is refused
