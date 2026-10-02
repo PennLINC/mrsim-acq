@@ -40,6 +40,9 @@ pub mod motion;
 pub mod kspace;
 /// The 3D echo-train acquisition (P5): kz encoding by echo, per-partition reconstruction.
 pub mod kspace3d;
+/// The stack-of-spirals forward (P5 part C): the exact-sum oracle.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod spiral;
 /// Type-1 NUFFT (feature `kspace`): the fieldmap y-sum of the forward model as one gridded FFT.
 pub mod nufft;
 /// Simulation config (feature `config`). `load` is a `todo!()` stub.

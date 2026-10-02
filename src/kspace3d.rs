@@ -247,7 +247,9 @@ fn plan<'a>(
     assert_eq!(acq.echo, EchoFormation::Spin, "the 3D echo trains are spin-echo trains");
     assert!(acq.eddy_strength == 0.0 && acq.eddy_quad == 0.0 && acq.eddy_phase == 0.0,
             "the eddy model is not available in 3D (an echo-dependent eddy evolution breaks the z factorization)");
-    let Readout3d::Grase { reverse_phase, .. } = *readout;
+    let Readout3d::Grase { reverse_phase, .. } = *readout else {
+        panic!("the spiral path is not implemented yet (P5 milestone C, Task 13)");
+    };
     assert_eq!(reverse_phase, acq.reverse_phase, "the readout's phase-encode sign must be the acquisition's");
     let table = grase_lines(train, readout, ny, nz).unwrap_or_else(|e| panic!("{e}"));
     let within = table.within_echo_timing();
