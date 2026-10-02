@@ -128,7 +128,9 @@ Properties, each a test:
   per-sub-bolus fraction did not, by 0.2%; this one cannot fail that way). A pulse of zero
   efficiency, which only creates a cut, changes neither part.
 - **Bounded**: `0 <= exp(-s/tau_ex) <= 1` per parcel, so `0 <= dM_iv <= delta_m` wherever
-  `delta_m >= 0`, and both are zero before arrival. There is no fraction and no 0/0.
+  `delta_m >= 0`, and both are zero before arrival. There is no fraction and no 0/0. For PASL the
+  computed part is also clamped to `[0, delta_m]` (final review): near `1/T1b = 1/T1'` `delta_m`'s
+  own difference of exponentials cancels to zero or noise, and it stays as simasl computes it.
 - **Limits**, stated at a residence: `tau_ex -> infinity` gives `dM_iv = delta_m` (P1: all
   blood T2); `tau_ex -> 0` gives `dM_iv -> 0` except for label that has just arrived, which
   correctly has not exchanged yet (at `t = ATT + 1e-7` with `tau_ex = 1e-6` the intravascular
