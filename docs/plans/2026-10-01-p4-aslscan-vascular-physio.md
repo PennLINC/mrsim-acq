@@ -238,7 +238,8 @@ table) are representable; plus `t2_arterial: (f64, Source)`, defaulting to the *
 Numeric checks, before any object is built: `exchange_time`, `t2_arterial`, `drift_time` finite
 and positive; numeric `slab_entry_time` finite and non-negative; table values as above;
 frequencies positive, `cv` in `[0, 0.3]`, amplitudes finite with `|cardiac| + |respiratory| < 1` per
-factor, `arterial_velocity` in `[0, 1000]` cm/s (both implementation-review additions; spec, parts
+factor, `arterial_velocity` in `[0, 1000]` cm/s, `exchange_time >= 1e-6` s, frequencies in
+`[0.01, 10]` Hz (implementation-review additions; spec, parts A,
 C and E).
 
 Activation and refusal, in `parse`, in this order (the combination matrix; every row not listed

@@ -158,7 +158,8 @@ two compartments' T2 differ.
 
 ## Inputs
 
-`[kinetic] exchange_time` (s, finite, positive) turns part A on. There is no default: published
+`[kinetic] exchange_time` (s, finite, at least `1e-6`, below which its reciprocal can overflow:
+a final-review addition) turns part A on. There is no default: published
 values for brain water exchange span a range wide enough that any one would be a claim this
 simulator cannot back, and the sidecar records the value given.
 
@@ -393,7 +394,9 @@ Both are global (one value per time, the same in every voxel); spatially structu
 physiological noise is a different model, deferred. The six amplitudes (`tissue_cardiac`,
 `tissue_respiratory`, `tissue_drift`, `label_cardiac`, `label_respiratory`, `label_drift`)
 default to zero, and a `[physio]` table whose six are all zero is an error, as a motion mode with
-zero amplitudes is (P3). Within each factor, `|cardiac| + |respiratory|` must be below 1 (an
+zero amplitudes is (P3). The cardiac and respiratory frequencies are in `[0.01, 10]` Hz (a
+final-review addition: an infinite period gave NaN, a vanishing one an unbounded period list).
+Within each factor, `|cardiac| + |respiratory|` must be below 1 (an
 implementation-review addition): at 1 or more the periodic terms alone can take the factor to zero
 or below, flipping the sign of the magnetization it scales. The drift is unbounded in principle
 (an OU process); its amplitude is the user's, recorded in the sidecar. Part E is on when
