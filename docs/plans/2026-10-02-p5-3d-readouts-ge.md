@@ -600,7 +600,61 @@ uniform off-resonance equals gridding of exact-sum samples to `1e-6`; noise rati
 
 ## Measurements
 
-(Filled in as tasks complete.)
+### Milestone AB (2026-10-02)
+
+- **Gates at the pre-P5 heads** (aslscan `p4-complete`, mrsim-acq `054bfdf`, TRXScan `130d62b`):
+  TRXScan P0 diff clean (62 checksums, 7 min 22 s); `regress_identity.sh` 38 runs identical (19
+  cases x 2 feature sets); `--self-test` detected the 1e-4 perturbation in all 38; golden record
+  written (44 outputs per build, identical across debug/release and with or without `par`).
+- **After each mrsim-acq task**: TRXScan P0 clean after Tasks 1, 2 and 5; golden record unchanged
+  throughout; `regress_identity.sh` 38 identical after Tasks 1, 2 and 6 (the Task 6 run also
+  covers Task 5's mrsim-acq).
+- **Task 3**: the EPG and an independent 2001-isochromat Bloch simulation agree within `1e-11`
+  (asserted at `1e-9`) for 111, 130 and 160 degrees, GM/WM/CSF/blood, 30 echoes.
+- **Task 5**: 3D noise SD `0.2517` of the 2D value at `nz = 16` (want `0.25`); class `1.7 ms`,
+  voxel `4.3 ms` on the 12 x 12 x 6 cross-check; GRASE under 62.5 Hz moves exactly one voxel, in
+  the 2D EPI's direction. Deviation from the plan: each compartment's k-space is its own call of
+  the 2D forward rather than a private accumulator (same result, 2D path untouched).
+- **Task 6**: simasl's gradient-echo form matches its fixtures at `1e-12`, the spoiled form on
+  every voxel with `E2 < 1e-16`; the row propagation reproduces the review's alternation
+  (`-0.254639`, `-0.089888`); linearity under `"ge"` `0.118` of the tolerance; compat benchmark G
+  passes (crop and full 3 T: `5e-8` per volume, `4.5e-6` control - label); `p5_ge` validates.
+- **Tasks 7-9**: the acceptance fixtures resolve to the reviewed numbers; a 3D series's compartment
+  images equal its 2D twin's at zero slice offset bit for bit; linearity under GRASE with physio and
+  exchange `0.113`, its extravascular-into-tissue control `2312x`; `p5_grase` validates.
+- **Task 10**: `asl005` (64 x 64 x 30, 4 shots, ESP 13.3824 ms, 0.2048 ms lines from DwellTime,
+  130 degrees) simulates in 8.2 s and validates; the `asl003` derivative (24 x 20 x 30, 2 shots,
+  ESP 12.42 ms, 1 ms lines) in 1.6 s and validates; linearity with every P4 part, physio and a
+  shot event `0.157`. Class vs voxel on `asl005` (mixed cells, 130 degrees; measured, not
+  asserted): max `9.7e-2` of peak over all volumes and `0.31%` median over brain; control - label
+  max `0.114` of its peak, median `6.3e-5`; voxel mode 80 s against class 6.6 s. P2 benchmarks
+  A-E on 3 T unchanged from P4's log (G added), the synthetic-block gates and A, E on 1.5 T pass.
+- **Reviews**: the Codex adversarial review of milestone AB died for lack of credits (2026-10-02,
+  no findings produced); the user chose to continue with milestone C and tag later. Open: that
+  review, the ordinary final review, and the `p5-grase-complete` tag.
+
+### Milestone C preflight (2026-10-02, before Task 11)
+
+For the `asl001_p5` geometry: `64 x 64 x 20` at oversample 2 (`128 x 128` simulation slices), 8
+interleaves of `floor(4 ms / 4 us) = 1000` samples (8000 per partition), 20 partitions, one coil,
+six compartments in class mode. The ASLDRO phantoms carry no fieldmap, so the benchmark uses a
+synthetic one of 50 Hz range, as Task 12 says.
+
+- **Certificate degree** (spec, part C): `R_f T = 2 pi 50 x 0.004 = 1.257`; the remainder
+  `2 (R T / 4)^(m+1) (1 + B)/(m+1)!` is `5.3e-9 (1 + B)` at `m = 7` and `9.2e-11 (1 + B)` at `m = 8`,
+  so `m = 8` for `B` up to about 500. The decay range in voxel mode (`1/T2 + 1/T2'` up to about
+  70 s^-1, `R_d T = 0.28`) needs less. Grid: 9 rates (class), 81 (voxel).
+- **Certification cost**: grid x 1000 sample times x `L` (start `ceil(T x 50 Hz) + 2 = 3`, at most
+  64): under `5e6` complex exponentials even at `L = 64`, plus one small least-squares solve per
+  sample time. Negligible.
+- **Forward cost**: one type-2 NUFFT on the `256 x 256` fine grid (FFT about `5e6` flops) plus
+  spreading `8000 x 8^2` (kernel width 8 for `1e-7`): about `6e6` flops; per volume
+  `20 slices x 6 compartments x L` NUFFTs, `7e8 L` flops, a few seconds for `L <= 8`; voxel mode
+  `x 20` echoes, about a minute.
+- **Reconstruction**: one type-1 NUFFT per partition per coil, and the Pipe-Menon density weights
+  once per series (10 iterations of a type-1/type-2 pair): about `2e8` flops. Negligible.
+- **Verdict**: both the certification and the forward are well within an order of magnitude of
+  the ten-minute budget (they are seconds to a minute), in both modes. Proceed to Task 11.
 
 ## Codex review of this plan (2026-10-02)
 
