@@ -35,7 +35,7 @@ impl C {
     pub(crate) const ZERO: C = C { re: 0.0, im: 0.0 };
     #[inline]
     #[cfg_attr(feature = "kspace", allow(dead_code))]
-    fn cis(theta: f64) -> C {
+    pub(crate) fn cis(theta: f64) -> C {
         C { re: theta.cos(), im: theta.sin() }
     }
     #[inline]

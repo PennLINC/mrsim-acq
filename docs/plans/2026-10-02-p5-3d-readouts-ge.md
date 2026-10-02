@@ -656,6 +656,52 @@ synthetic one of 50 Hz range, as Task 12 says.
 - **Verdict**: both the certification and the forward are well within an order of magnitude of
   the ten-minute budget (they are seconds to a minute), in both modes. Proceed to Task 11.
 
+### Task 12: the feasibility benchmark and decision (2026-10-02)
+
+Built: the spiral trajectory and sampling bound, the exact-sum oracle (pinned against the
+Cartesian forward at Cartesian frequencies, oversample 1 and 2, to `1e-12`), and, as the
+benchmark's prototype, Task 13's pieces themselves: `tseg.rs` (the certified least-squares
+segmentation), the time-segmented forward (`spiral.rs`, `SegmentedForward`) and `grid_recon.rs`
+(operator-form Pipe-Menon, 10 iterations, gridding). All in WSL, release.
+
+- **Segmentation**: the least-squares fit is solved by a factored one-sided Jacobi SVD (an explicit
+  pseudo-inverse loses `4.5e-6` to cancellation at these condition numbers, `1e11` and more, and
+  failed to certify a 250 Hz range at all). The certified bound includes `4 L eps (1 + B)` for
+  rounding. Stress cases at `T = 4` ms (bound / actual error on a 24 x 38 off-grid sampling of the
+  rectangle): 50 Hz, `L 6 m 7 B 3.1`, `2.6e-8 / 2.9e-9`; 250 Hz, `L 12 m 15 B 49`,
+  `6.6e-9 / 1.3e-12`; decay `100..1100 s^-1`, `L 8 m 12 B 17`, `1.8e-8 / 5.0e-9`; the same with
+  `+-50` Hz, `L 12 m 12 B 136`, `4.4e-8 / 1.1e-11`. The actual error never exceeded the bound. A
+  4000 Hz range at `T = 20` ms is refused naming the rectangle.
+- **Forward**: against the exact sum on a complete `32 x 32`, oversample 2 trajectory with
+  independent fieldmap (50 Hz), T2, T2' and `ln A` maps, nonconstant phase, two coils and
+  `signal_scale` 3: `1.2e-9` of peak (voxel), `6.0e-10` (class); declared `1e-6`.
+- **One `asl001` volume** (`64 x 64 x 20`, oversample 2, 8 interleaves of 1000 samples, six
+  compartments, one coil, 50 Hz, decay `0.019..0.058 /ms`): class `L 6 m 7`, certification 4 ms,
+  forward 2.8 s; voxel `L 6 m 7`, certification 3 ms, forward 56 s (20 echoes x 20 slices x 6
+  compartments at 23 ms); density weights 83 ms, gridding 20 partitions 79 ms. Both modes are far
+  inside ten minutes.
+- **Gridding accuracy fails the declared tolerances**, in both modes (the reconstruction is
+  mode-independent). Band-limited object (Gaussian blobs, spectrum below `1e-13` at `k_max`, at
+  oversample 1 so the data are exact): `4.1e-2` of peak (`32 x 32`, 4 interleaves), `4.3e-2`
+  (`asl001`'s `64 x 64`, 8 interleaves); declared `1e-2`. Uniform object: `0.34` and `0.50` over
+  the FOV (`0.25` over the central half); declared `1e-3`. The density weights are not the cause:
+  kernel Pipe-Menon, operator Pipe-Menon and the trajectory's exact annulus areas all give 1-6%,
+  and more iterations or an oversampled density grid do not help. The cause is the design's
+  sampling, radially exactly Nyquist (interleaves 1 cycle/FOV apart), at which gridding's
+  quadrature is a few percent; the uniform object fills the FOV, so its spectrum has the box's
+  Dirichlet tails outside the sampled disc.
+- **What does meet them**: density-weighted least squares by conjugate gradients on the same NUFFT
+  pair, per coil (not SENSE), from zero. Band-limited: `4.6e-3` (5 iterations), `2.7e-3` (10),
+  `4.1e-4` (20) at `32 x 32`; `8.9e-3`, `1.8e-3`, `4.9e-4` at `64 x 64`. Uniform: `8.4e-2`, `1.3e-2`,
+  `2.7e-3` at `32 x 32`; `0.12`, `1.6e-2`, `8.2e-3` at `64 x 64` (still short of `1e-3` at 20). Cost
+  about 11 ms per iteration per partition per coil at `64 x 64`: 20 iterations x 20 partitions,
+  4 s per coil per volume.
+- **Decision (per the plan's rule)**: `L <= 64` certifies at `1e-7` and the volume time passes in
+  both modes, but the gridding error does not, in either mode, so neither mode passes. The plan
+  says: stop, revisit part C. **Pending the user's decision**: the candidate revision replaces
+  gridding with per-coil density-weighted least squares (CG, a fixed iteration count, gridding's
+  weights), keeps the band-limited `1e-2`, and either keeps the uniform `1e-3` with enough
+  iterations or restates it at the centre. Milestone AB stands regardless.
 ## Codex review of this plan (2026-10-02)
 
 Nine findings (1 blocker, 4 major, 4 minor), all verified and applied. The blocker was in the
