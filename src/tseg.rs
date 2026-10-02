@@ -23,7 +23,10 @@
 //! |e| <= |P e| + |e - P e| <= Lambda_m^2 max_grid |e| + rem(R_d) + Lambda_m rem(R_f)
 //! ```
 //!
-//! over every sample time, plus `4 L eps (1 + B)` for the rounding of evaluating the interpolant. `m` is the smallest degree making the remainder terms below
+//! over every sample time, plus a floating-point model term for rounding,
+//! `(Lambda_m^2 + 1)(1 + B)(4 eps (1 + theta) + 2 L eps)` with `theta = max |z| T` (forming and
+//! evaluating each exponential, then the L-term sums; plans past `theta = 1e4` are refused). It is
+//! a model bound, not interval arithmetic. `m` is the smallest degree making the remainder terms below
 //! [`REMAINDER_TARGET`]; `L` starts at `ceil(T (f_max - f_min)) + 2` and doubles until the bound is
 //! below [`BOUND_TARGET`], past [`L_MAX`] an error. An axis of zero length has one grid point, no
 //! remainder and no Lebesgue factor; `class` mode's rectangle is the frequency interval alone (its
@@ -39,6 +42,8 @@ pub const REMAINDER_TARGET: f64 = 5e-8;
 /// The largest `L` before the segmentation is refused.
 pub const L_MAX: usize = 64;
 const M_MAX: usize = 80;
+/// The largest phase `|z| T` (rad) a plan accepts (about 400 kHz over a 4 ms readout).
+pub const MAX_PHASE: f64 = 1e4;
 /// Singular values below this fraction of the largest are dropped from the least-squares fit
 /// (the bound is computed from the fit actually made, so this affects only efficiency).
 const RCOND: f64 = 1e-13;
@@ -227,6 +232,16 @@ pub fn plan(tau: &[f64], t_ms: f64, rect: RateRect) -> Result<TsegPlan, String> 
     assert!(tau.iter().all(|&x| (0.0..=t_ms).contains(&x)), "sample times outside [0, T]");
     let r_d = rect.d[1] - rect.d[0];
     let r_f = TAU * (rect.f[1] - rect.f[0]) / 1000.0; // rad/ms
+    // the largest |z t| the plan evaluates, which sets the rounding of every exponential; past
+    // MAX_PHASE radians the rounding model is no longer meaningful against the target
+    let w_max = TAU * rect.f[0].abs().max(rect.f[1].abs()) / 1000.0;
+    let theta = t_ms * rect.d[1].hypot(w_max);
+    if theta.is_nan() || theta > MAX_PHASE {
+        return Err(format!(
+            "the time segmentation's rates (decay up to {:.4} 1/ms, off-resonance {:.2}..{:.2} Hz) reach {theta:.3e} rad \
+             over the {t_ms} ms readout, past {MAX_PHASE:e}: not a fieldmap this model certifies",
+            rect.d[1], rect.f[0], rect.f[1]));
+    }
     let mut l = ((t_ms / 1000.0) * (rect.f[1] - rect.f[0])).ceil() as usize + 2;
     loop {
         if l > L_MAX {
@@ -256,8 +271,14 @@ pub fn plan(tau: &[f64], t_ms: f64, rect: RateRect) -> Result<TsegPlan, String> 
             }
             let lam_d = if r_d > 0.0 { lebesgue(m) } else { 1.0 };
             let lam_f = if r_f > 0.0 { lebesgue(m) } else { 1.0 };
-            // plus the rounding of evaluating the interpolant itself (L terms of size up to B)
-            let bound = lam_d * lam_f * err + rem + 4.0 * (l as f64) * f64::EPSILON * (1.0 + b_sum);
+            // Rounding (a floating-point model bound, not interval arithmetic): every computed
+            // exp(z t) is off by at most delta = 4 eps (1 + theta) (forming z t, then exp/cos/sin),
+            // and an L-term combination with coefficients summing to B adds 2 L eps (1 + B). The
+            // measured grid residual is therefore uncertain by (1 + B)(delta + 2 L eps), which the
+            // Lebesgue factors amplify, and evaluating the interpolant anywhere adds it once more.
+            let delta = 4.0 * f64::EPSILON * (1.0 + theta);
+            let rounding = (lam_d * lam_f + 1.0) * (1.0 + b_sum) * (delta + 2.0 * l as f64 * f64::EPSILON);
+            let bound = lam_d * lam_f * err + rem + rounding;
             if bound < BOUND_TARGET {
                 return Ok(TsegPlan { l, m, tau_l, b, b_sum, grid_err: err, bound });
             }
@@ -360,5 +381,48 @@ mod tests {
         let tau: Vec<f64> = (0..50).map(|j| (j as f64 + 0.5) * 0.4).collect();
         let e = plan(&tau, 20.0, RateRect { d: [0.0, 0.0], f: [-2000.0, 2000.0] }).unwrap_err();
         assert!(e.contains("64 segments") && e.contains("-2000"), "{e}");
+        // and a phase past the rounding model's range
+        let e = plan(&tau, 20.0, RateRect { d: [0.0, 0.0], f: [1e12, 1e12] }).unwrap_err();
+        assert!(e.contains("not a fieldmap"), "{e}");
+    }
+
+    /// `exp(i w t)` with the phase formed and reduced in double-double, so its error (about 1e-16
+    /// absolute) is independent of the size of `w t`: the oracle the floating-point evaluation is
+    /// measured against.
+    fn cis_dd(w: f64, t: f64) -> (f64, f64) {
+        const TAU_LO: f64 = 2.449_293_598_294_706_4e-16; // 2 pi - TAU
+        let (p, e) = (w * t, w.mul_add(t, -(w * t)));
+        let k = (p / TAU).round();
+        let (kh, ke) = (k * TAU, k.mul_add(TAU, -(k * TAU)));
+        let r = ((p - kh) - ke) - k * TAU_LO + e;
+        (r.cos(), r.sin())
+    }
+
+    #[test]
+    fn the_bound_holds_against_a_double_double_oracle() {
+        // the review's counterexample (a constant 10 kHz, sample times up to 3.998 ms), a large
+        // offset with a range, and the 50 Hz design case: the plan's interpolation error against
+        // exponentials whose phases are reduced in double-double, never above the bound
+        let tau = [0.002, 0.006, 1.234, 3.998];
+        for rect in [RateRect { d: [0.0, 0.0], f: [1e4, 1e4] }, RateRect { d: [0.0, 0.0], f: [950.0, 1050.0] },
+                     RateRect { d: [0.0, 0.0], f: [-25.0, 25.0] }] {
+            let p = plan(&tau, 4.0, rect).unwrap();
+            let mut worst = 0.0f64;
+            for c in 0..=40 {
+                let w = TAU * (rect.f[0] + (rect.f[1] - rect.f[0]) * c as f64 / 40.0) / 1000.0;
+                for (j, &t) in tau.iter().enumerate() {
+                    let (mut re, mut im) = cis_dd(w, t);
+                    for (i, &tl) in p.tau_l.iter().enumerate() {
+                        let (br, bi) = p.b[j * p.l + i];
+                        let (cr, ci) = cis_dd(w, tl);
+                        re -= br * cr - bi * ci;
+                        im -= br * ci + bi * cr;
+                    }
+                    worst = worst.max(re.hypot(im));
+                }
+            }
+            println!("{rect:?}: L {} bound {:.2e} oracle error {worst:.2e}", p.l, p.bound);
+            assert!(worst <= p.bound, "{rect:?}: {worst:e} above {:e}", p.bound);
+        }
     }
 }

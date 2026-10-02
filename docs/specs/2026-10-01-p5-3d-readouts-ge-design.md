@@ -752,9 +752,15 @@ remainder `rem(R) = 2 (R T / 4)^(m+1) (1 + B) / (m + 1)!`, every rate in the rec
 |e| <= |P e| + |e - P e| <= Lambda_m^2 max_grid |e| + rem(R_d) + Lambda_m rem(R_f)
 ```
 
-with the maxima taken over every sample time of the trajectory, plus `4 L eps (1 + B)` for the
-rounding of evaluating the interpolant (amended 2026-10-02: at a single rate the computed error
-exceeded the bound by rounding alone). The least-squares fit is solved through a factored SVD
+with the maxima taken over every sample time of the trajectory, plus a floating-point model term
+for rounding, `(Lambda_m^2 + 1)(1 + B)(4 eps (1 + theta) + 2 L eps)` with `theta = max |rate| T`:
+forming and evaluating each exponential (an error growing with the phase), the uncertainty of the
+measured grid residual (amplified by the Lebesgue factors), and evaluating the interpolant once
+more. Rectangles with `theta > 1e4` rad (about 400 kHz over 4 ms) are refused. This is a model
+bound, not interval arithmetic, and the tests compare it with exponentials whose phases are
+reduced in double-double (amended twice on 2026-10-02: a first rounding term, `4 L eps (1 + B)`,
+ignored the phase and was exceeded by `8.2e-15` against `3.8e-15` at a constant 10 kHz, the second
+review's case). The least-squares fit is solved through a factored SVD
 (one-sided Jacobi on the narrower side), never through an explicit pseudo-inverse: at these
 condition numbers (`1e11` and more) applying one loses about `eps / sigma_min`, `4.5e-6` on the
 grid, which stopped a 250 Hz range from certifying. `m` is the smallest degree making
@@ -774,11 +780,21 @@ iteration. The image `x` on the `nx x ny` grid approximately minimizes
 in the convention above, `1/(nx ny)`), `A^H` its adjoint (the type-1 NUFFT with the opposite sign,
 deapodized), `w_j` the density weights. The solver is the **Chebyshev semi-iteration** on the
 normal equations `A^H W A x = A^H W d` from `x = 0`, over the eigenvalue interval
-`[lambda_hi / 30, lambda_hi]`, 40 iterations, `lambda_hi` 1.1 times the largest eigenvalue from 50
-power iterations on a fixed start vector: every coefficient depends only on the trajectory and
-the weights, so the reconstruction is a fixed **linear** operator on the samples, which the
-linearity identity requires (conjugate gradients, whose step sizes depend on the data, is not).
-Its residual polynomial is bounded by 1 on `[0, lambda_hi]`, so no data component is amplified.
+`[lambda_hi / 100, lambda_hi]`, 80 iterations, `lambda_hi` 1.1 times the largest eigenvalue
+estimated by power iteration from a pseudo-random start (fixed seed) run to convergence: every
+coefficient depends only on the trajectory and the weights, so the reconstruction is a fixed
+**linear** operator on the samples, which the linearity identity requires (conjugate gradients,
+whose step sizes depend on the data, is not). It is a **regularized approximate inverse**, not the
+least-squares solution: components with eigenvalues below `lambda_hi / 100` are only partly
+recovered. Its residual polynomial is bounded by 1 on `[0, lambda_hi]`; power iteration estimates
+the top of the spectrum from below and certifies nothing, so every reconstruction checks that its
+normal-equation residual did not grow (it can only grow if an eigenvalue lies above `lambda_hi`)
+and panics if it did. The supported domain, and what the tests assert: objects band-limited to
+`|k| <= 0.625 k_max`, anywhere in the field of view, to `1e-2` of peak. The parameters were chosen
+on a sweep (plan Measurements): `[lambda/30, lambda]` with 40 iterations met `1e-2` at the centre
+but not at the edge (`1.5e-2`, the second review's case); `kappa = 300` meets it with more margin
+but doubles the image noise, `kappa = 100` with 80 iterations meets it (worst `6.8e-3`) at 1.6
+times the Cartesian noise.
 The density weights are Pipe and Menon's in operator form, `w <- w / |A A^H w|` (10 iterations,
 fixed, recorded), normalized so that a constant object with no off-resonance and no decay grids to
 its Cartesian value at the image centre (the scale is common to every weight, so it does not move
@@ -796,8 +812,10 @@ exactly Nyquist-spaced radially, and at that spacing gridding reproduces a band-
 operator Pipe-Menon and the trajectory's exact annulus areas all give 1-6 percent on the
 band-limited object). At oversampling 1 the data of an object on the acquired grid are exactly
 `A x`, so the least squares recovers it as the iteration converges: the Chebyshev iteration
-above reaches `3e-4` on the band-limited object and `2e-3` to `5e-3` (FOV) and `5e-5` (centre) on
-the uniform one, at both `32 x 32` and `asl001`'s `64 x 64`. At higher oversampling, what the
+above reaches, on exactly band-limited objects (`|k| <= 0.625 k_max`), `1.4e-4` (centre),
+`5.7e-3` (edge) and `6.8e-3` (corner) of peak at `32 x 32`, and `4.3e-5`, `2.7e-3` and `3.5e-3`
+at `asl001`'s `64 x 64`; on the uniform object, under `1e-4` at the centre and `1.0e-3` to
+`1.7e-3` over the FOV. At higher oversampling, what the
 spiral samples of the sub-voxel structure outside the reconstruction's band is what it cannot
 represent, as with the Cartesian path's truncation.
 
@@ -967,11 +985,14 @@ per-line scalars, and knows nothing of labeling, kinetics or physiology.
   `<A x, y> = <x, A^H y>` to `1e-10`; the time-segmented forward against the exact sum on a
   complete small trajectory (all samples, `32 x 32`, oversample 2) to `1e-6` of peak, with
   independent maps of the fieldmap (50 Hz range), T2 and T2', and with a nonconstant object phase,
-  multi-coil sensitivities and `signal_scale`; the reconstruction of a band-limited object with no
-  off-resonance reproduces it to `1e-2` of peak (declared before; gridding missed it at `4e-2`,
-  and the spec was revisited, not the number); a uniform object reconstructs to its Cartesian
-  value at the image centre to `1e-3` (the first version said everywhere; gridding missed both,
-  and the least squares' FOV error, `2e-3` to `5e-3`, is reported); the reconstruction is linear
+  multi-coil sensitivities and `signal_scale`; the reconstruction of an object exactly
+  band-limited to `|k| <= 0.625 k_max`, with no off-resonance, reproduces it to `1e-2` of peak at
+  the centre, the edge and the corner of the field of view (declared before; gridding missed it at
+  `4e-2`, and the spec was revisited, not the number; the edge and corner cases are the second
+  implementation review's); a uniform object reconstructs to its Cartesian value at the image
+  centre to `1e-3` (the first version said everywhere; gridding missed both, and the FOV error is
+  reported); the shots select exactly their samples (a zeroed shot, a shot set with doubled images,
+  on the acquired samples with unequal interleaf and kz-segment counts); the reconstruction is linear
   (the sum of two data sets' reconstructions equals the reconstruction of the sum to rounding);
   with uniform off-resonance the reconstruction equals the reconstruction of the exact-sum
   samples to `1e-6`; the sampling bound accepts the designed trajectory, rejects a
@@ -980,7 +1001,8 @@ per-line scalars, and knows nothing of labeling, kinetics or physiology.
   at Cartesian frequency locations equals the Cartesian forward (part C). The time-segmentation
   certificate is stress-tested on decay ranges as well as fieldmap ranges (the second review's
   `100` to `1100` s^-1 case among them), and the certified bound is compared with the actual error
-  against the exact sum at rates between grid points, which must not exceed it.
+  against the exact sum at rates between grid points, which must not exceed it, and with
+  exponentials whose phases are reduced in double-double (a constant 10 kHz, a 950-1050 Hz range).
 
 **aslscan**
 
@@ -1162,3 +1184,16 @@ The reconstruction is now density-weighted least squares by a fixed Chebyshev se
 is accurate but data-dependent); the band-limited tolerance is unchanged, the uniform one is
 stated at the image centre, and linearity is tested. The certificate gained a rounding term, and
 the least-squares fit is required to be solved in factored form.
+
+Codex adversarial implementation review of milestone C and of the amendment above, 2026-10-02:
+3 majors, 4 minors, each checked against the code and found valid. The rounding term ignored the
+phase (exceeded at a constant 10 kHz) and is now the model term above, with a phase limit and a
+double-double oracle test. `lambda_hi` was claimed as an upper bound; power iteration only
+estimates it, so the start is now pseudo-random, the iteration runs to convergence, the claim is
+withdrawn and every reconstruction checks that its residual did not grow. The band-limited claim
+held only for centred objects (`1.5e-2` at the edge with 40 iterations over `[lambda/30, lambda]`);
+the reconstruction is now described as a regularized approximate inverse, its parameters chosen on
+a sweep over objects at the centre, edge and corner (80 iterations, `kappa = 100`), and the test
+covers all three. The shot test now asserts on the acquired samples. The aslscan minors (an
+overridden `PulseSequenceType`, a non-string `PhaseEncodingDirection` with a spiral, the separate
+M0's `DwellTime` provenance) are fixed in aslscan.

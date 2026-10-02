@@ -223,6 +223,13 @@ impl Plan<'_> {
     }
 }
 
+/// The acquired samples one partition's spikes overwrite, on the stream of `(volume, partition)`
+/// (`pseed`) and coil `q` (part B, "Seeds").
+fn spike_picks(pseed: u64, q: usize, acquired: &[usize], n_spikes: usize) -> Vec<usize> {
+    let mut rng = Rng(pseed ^ 0xA5A5_1234_5678_9ABC ^ (q as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+    (0..n_spikes).map(|_| acquired[(rng.next_u64() as usize) % acquired.len()]).collect()
+}
+
 /// The checks and resolution shared by the entry points; panics name the offending input.
 #[allow(clippy::too_many_arguments)]
 fn plan<'a>(
@@ -381,9 +388,7 @@ pub(crate) fn simulate_acquisition_3d_complex(
                         }
                     }
                     let acquired: Vec<usize> = (0..nx * ny).filter(|&i| pl.mask[i]).collect();
-                    let mut rng = Rng(pseed ^ 0xA5A5_1234_5678_9ABC);
-                    for _ in 0..acq.n_spikes {
-                        let pick = acquired[(rng.next_u64() as usize) % acquired.len()];
+                    for pick in spike_picks(pseed, q, &acquired, acq.n_spikes) {
                         part[pick] = peak.scale(acq.spike_amplitude);
                     }
                 }
@@ -1308,6 +1313,61 @@ mod tests {
         let one = run(&images, Some(&LineWeights { n_shots: 4, n_compartments: ncomp, w: w1 }));
         assert!(maxdiff(&one, &full) > 1e-3 * pk);
         let _ = nvox;
+    }
+
+    #[test]
+    fn spike_streams_are_per_coil() {
+        // (volume, partition, coil) streams: the same seed and coil repeat, another coil differs
+        let acquired: Vec<usize> = (0..256).collect();
+        let (a, b, c) = (spike_picks(77, 0, &acquired, 8), spike_picks(77, 0, &acquired, 8), spike_picks(77, 1, &acquired, 8));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn spiral_shots_select_exactly_their_samples() {
+        // on the acquired samples, with 3 interleaves x 2 kz segments (unequal, so a swapped
+        // shot formula would show): a zero weight on one shot removes exactly that shot's samples
+        // (interleaf s at the partitions of kz segment sz), and a shot set with doubled images
+        // doubles exactly its own
+        let (n, nz, o, ncomp) = (16usize, 4usize, 2usize, 2usize);
+        let s = n * o;
+        let images = blobs(s, s, nz, 1, ncomp);
+        let fmap = spiral_fmap(s, s, nz);
+        let t2 = vec![T2Volume::Uniform(80.0), T2Volume::Uniform(110.0)];
+        let acq = Acquisition { do_relaxation: true, do_distortions: true, signal_scale: 100.0, ..Acquisition::default() };
+        let tr = train(nz, 2, KzOrder::Centric, 12.0, 180.0);
+        let ro = Readout3d::Spiral { interleaves: 3, readout_ms: 4.0, dwell_ms: 0.01 };
+        let phase = PhaseModel::none();
+        let pl = spiral_plan([s, s, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq, &tr, &ro, None, None, &phase);
+        assert_eq!(pl.table.n_shots, 6);
+        let base = pl.samples(&images, 1, 0, 0, 1, None, &[]);
+        let shot_of = |i: usize| pl.table.shot(i / pl.nsamp, (i % pl.nsamp) / pl.ns);
+        // zero shot 3 = interleaf 1, kz segment 1
+        let mut w = vec![1.0; 6 * ncomp];
+        w[3 * ncomp] = 0.0;
+        w[3 * ncomp + 1] = 0.0;
+        let zeroed = pl.samples(&images, 1, 0, 0, 1, Some(&LineWeights { n_shots: 6, n_compartments: ncomp, w }), &[]);
+        let mut hit = 0;
+        for i in 0..base.len() {
+            if shot_of(i) == 3 {
+                hit += 1;
+                assert!(zeroed[i].re == 0.0 && zeroed[i].im == 0.0, "sample {i}");
+                assert!((i % pl.nsamp) / pl.ns == 1 && pl.table.kz_segment[i / pl.nsamp] == 1);
+            } else {
+                assert!(zeroed[i].re == base[i].re && zeroed[i].im == base[i].im, "sample {i}");
+            }
+        }
+        assert_eq!(hit, pl.ns * nz / 2, "one interleaf over half the partitions");
+        // shot 4 (interleaf 2, kz segment 0) sees doubled images
+        let doubled: Vec<Vec<f32>> = images.iter().map(|v| v.iter().map(|x| 2.0 * x).collect()).collect();
+        let sets = [ShotSet { shots: vec![4], images: doubled }];
+        let moved = pl.samples(&images, 1, 0, 0, 1, None, &sets);
+        for i in 0..base.len() {
+            let f = if shot_of(i) == 4 { 2.0 } else { 1.0 };
+            assert!(moved[i].re == f * base[i].re && moved[i].im == f * base[i].im, "sample {i}");
+        }
     }
 
     #[cfg(feature = "kspace")]

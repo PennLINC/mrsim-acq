@@ -7,10 +7,13 @@
 //! NUFFT with the opposite sign, `img(X) = sum_j r_j exp(-i 2 pi k_j . (X - n/2) / n)`,
 //! deapodized). The solver is the Chebyshev semi-iteration on `A^H W A x = A^H W d` from zero over
 //! `[lambda_hi / LS_KAPPA, lambda_hi]`, [`LS_ITERATIONS`] iterations, with `lambda_hi` from a
-//! fixed power iteration: every coefficient depends only on the trajectory, so the reconstruction
-//! is linear in the data (the linearity identity needs that; conjugate gradients is not), and its
-//! residual polynomial is bounded by 1 on `[0, lambda_hi]`. Then the Roemer combine of
-//! `kspace::reconstruct_coils`.
+//! power iteration on a fixed pseudo-random start: every coefficient depends only on the
+//! trajectory, so the reconstruction is linear in the data (the linearity identity needs that;
+//! conjugate gradients is not). It is a regularized approximate inverse (eigencomponents below
+//! `lambda_hi / LS_KAPPA` are only partly recovered), accurate to 1e-2 of peak on objects
+//! band-limited to `|k| <= 0.625 k_max` anywhere in the field of view. Its residual polynomial is
+//! bounded by 1 on `[0, lambda_hi]`; the power iteration certifies nothing, so every image checks
+//! that its residual did not grow. Then the Roemer combine of `kspace::reconstruct_coils`.
 //!
 //! The density weights are Pipe and Menon's (1999) fixed point in operator form,
 //! `w <- w / |A A^H w|`, [`DCF_ITERATIONS`] iterations from `w = 1`, scaled so that a constant
@@ -32,11 +35,12 @@ use crate::nufft::Nufft2;
 /// Pipe-Menon iterations (fixed, recorded).
 pub const DCF_ITERATIONS: usize = 10;
 /// Chebyshev iterations of the least squares (fixed, recorded).
-pub const LS_ITERATIONS: usize = 40;
+pub const LS_ITERATIONS: usize = 80;
 /// The ratio of the Chebyshev interval's ends.
-pub const LS_KAPPA: f64 = 30.0;
-/// Power iterations for the largest eigenvalue of the normal operator, and the margin over it.
-pub const POWER_ITERATIONS: usize = 50;
+pub const LS_KAPPA: f64 = 100.0;
+/// The cap on the power iterations for the largest eigenvalue of the normal operator (they stop
+/// at convergence), and the margin over the estimate.
+pub const POWER_ITERATIONS: usize = 1000;
 pub const LAMBDA_MARGIN: f64 = 1.1;
 /// The NUFFT's tolerance.
 const NUFFT_TOL: f64 = 1e-12;
@@ -77,10 +81,19 @@ pub struct SpiralRecon {
     nufft: Nufft2,
     /// The Chebyshev interval's upper end.
     pub lambda_hi: f64,
+    /// Chebyshev iterations and interval ratio.
+    iterations: usize,
+    kappa: f64,
 }
 
 impl SpiralRecon {
     pub fn new(k: &[[f64; 2]], n: usize, window: KspaceWindow) -> SpiralRecon {
+        SpiralRecon::with_params(k, n, window, LS_ITERATIONS, LS_KAPPA)
+    }
+
+    /// [`SpiralRecon::new`] with the Chebyshev iteration count and interval ratio given (for the
+    /// measurements that choose them).
+    pub fn with_params(k: &[[f64; 2]], n: usize, window: KspaceWindow, iterations: usize, kappa: f64) -> SpiralRecon {
         let h = (n / 2) as i64;
         let nufft = Nufft2::new([n, n], [-h, -h], [n, n], NUFFT_TOL);
         let mut w = pipe_menon(&nufft, k, DCF_ITERATIONS);
@@ -91,16 +104,30 @@ impl SpiralRecon {
             *wj *= s;
         }
         let win = k.iter().map(|p| window.at(p[0] / n as f64, p[1] / n as f64)).collect();
-        let mut r = SpiralRecon { n, k: k.to_vec(), w, win, nufft, lambda_hi: 0.0 };
-        // the largest eigenvalue of A^H W A, from a fixed start vector
-        let mut v: Vec<C> = (0..n * n).map(|i| C { re: 1.0 + (i % 7) as f64 * 0.1, im: (i % 3) as f64 * 0.1 }).collect();
+        let mut r = SpiralRecon { n, k: k.to_vec(), w, win, nufft, lambda_hi: 0.0, iterations, kappa };
+        // The largest eigenvalue of A^H W A by power iteration from a pseudo-random start (a fixed
+        // seed, so the reconstruction stays independent of the data), run to convergence. Power
+        // iteration estimates from below and certifies nothing: the margin covers its slow last
+        // digits, and `image` checks every reconstruction's residual, which cannot grow unless an
+        // eigenvalue lies above the interval.
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        let mut v: Vec<C> = (0..n * n).map(|_| C { re: rnd(), im: rnd() }).collect();
         let mut lam = 0.0;
         for _ in 0..POWER_ITERATIONS {
             let nv = norm(&v);
             let u = r.normal(&v);
             let nu = norm(&u);
-            lam = nu / nv;
+            let next = nu / nv;
             v = u.into_iter().map(|c| c.scale(1.0 / nu)).collect();
+            let done = (next - lam).abs() <= 1e-10 * next;
+            lam = next;
+            if done {
+                break;
+            }
         }
         r.lambda_hi = LAMBDA_MARGIN * lam;
         r
@@ -141,14 +168,15 @@ impl SpiralRecon {
     pub(crate) fn image(&self, d: &[C]) -> Vec<C> {
         assert_eq!(d.len(), self.k.len(), "one value per sample");
         let dw: Vec<C> = d.iter().zip(&self.win).map(|(c, &w)| c.scale(w)).collect();
-        let (hi, lo) = (self.lambda_hi, self.lambda_hi / LS_KAPPA);
+        let (hi, lo) = (self.lambda_hi, self.lambda_hi / self.kappa);
         let (theta, delta) = ((hi + lo) / 2.0, (hi - lo) / 2.0);
         let sigma1 = theta / delta;
         let mut rho = 1.0 / sigma1;
         let mut x = vec![C::ZERO; self.n * self.n];
         let mut r = self.adjoint(&dw);
+        let r0 = norm(&r);
         let mut dir: Vec<C> = r.iter().map(|c| c.scale(1.0 / theta)).collect();
-        for _ in 0..LS_ITERATIONS {
+        for _ in 0..self.iterations {
             for (xi, di) in x.iter_mut().zip(&dir) {
                 *xi = xi.add(*di);
             }
@@ -162,6 +190,12 @@ impl SpiralRecon {
             }
             rho = rho1;
         }
+        // the residual is p(A^H W A) r0 with |p| <= 1 on [0, lambda_hi]: if it grew, an eigenvalue
+        // lies above the estimated interval and the image cannot be trusted
+        let rn = norm(&r);
+        assert!(rn <= (1.0 + 1e-6) * r0 + 1e-300,
+                "spiral reconstruction: the residual grew from {r0:e} to {rn:e}; the normal operator has an eigenvalue \
+                 above the estimated {:e}", self.lambda_hi);
         x
     }
 
@@ -217,18 +251,6 @@ mod tests {
                       signal_scale: 1.0, ..Acquisition::default() }
     }
 
-    /// Gaussian blobs (spectrum below 1e-13 of its peak at k_max) with a smooth phase.
-    fn blobs(n: usize) -> (Vec<f32>, Vec<f64>) {
-        let c = n as f64 / 32.0;
-        let obj = (0..n * n).map(|i| {
-            let (x, y) = ((i % n) as f64, (i / n) as f64);
-            let g = |cx: f64, cy: f64, s: f64| (-((x - cx).powi(2) + (y - cy).powi(2)) / (2.0 * s * s)).exp();
-            (g(13.0 * c, 15.0 * c, 2.5 * c) + 0.7 * g(20.0 * c, 19.0 * c, 3.0 * c)) as f32
-        }).collect();
-        let ph = (0..n * n).map(|i| 0.02 * (i % n) as f64 - 0.03 * (i / n) as f64).collect();
-        (obj, ph)
-    }
-
     /// A deterministic uniform stream on (-1/2, 1/2).
     fn uniform(seed: u64) -> impl FnMut() -> f64 {
         let mut s = seed;
@@ -240,29 +262,30 @@ mod tests {
 
     #[test]
     fn reconstructs_a_band_limited_object_and_a_uniform_one() {
-        // the declared tolerances (part C): band-limited 1e-2 of peak, uniform 1e-3 at the centre,
-        // at oversample 1 where the data are exactly A x; on asl001's in-plane design (64 x 64,
-        // 8 interleaves, 4 ms, 4 us) and a 32 x 32 one; gridding's numbers printed beside
-        for &(n, il, dw) in &[(32usize, 4usize, 0.008f64), (64, 8, 0.004)] {
+        // the declared tolerances (part C): an object band-limited to |k| <= 0.625 k_max reproduced
+        // to 1e-2 of peak wherever it sits in the FOV (centre, edge, corner: the review found the
+        // edge failing at 40 iterations over [lambda/30, lambda]); a uniform object to 1e-3 at the
+        // centre; at oversample 1, where the data are exactly A x; on asl001's in-plane design
+        // (64 x 64, 8 interleaves, 4 ms, 4 us) and a 32 x 32 one; gridding's numbers beside
+        for &(n, il, dw, sigma, kb) in &[(32usize, 4usize, 0.008f64, 3.0f64, 10.0f64), (64, 8, 0.004, 6.0, 20.0)] {
             let tr = spiral_trajectory(n, n, il, 4.0, dw).unwrap();
             let taus: Vec<f64> = (0..tr.k.len()).map(|j| tr.tau_ms[j % tr.n_samples()]).collect();
             let rec = SpiralRecon::new(&tr.k, n, KspaceWindow::None);
             let acq = plain();
             let t2 = [T2Slice::Uniform(f32::INFINITY)];
             let fmap = vec![0.0f32; n * n];
-            let (obj, ph) = blobs(n);
-            let comps = [obj.as_slice()];
-            let d = spiral_kspace_exact(&inp(&comps, &t2, &fmap, &ph, n, 1), &acq, 0, 1, &tr.k, &taus, None);
-            let peak = obj.iter().fold(0.0f32, |a, &b| a.max(b)) as f64;
-            let err = |img: &[C]| (0..n * n).fold(0.0f64, |m, i| {
-                let want = C::cis(ph[i]).scale(obj[i] as f64);
-                m.max((img[i].re - want.re).hypot(img[i].im - want.im))
-            }) / peak;
-            let (e_ls, e_grid) = (err(&rec.reconstruct(std::slice::from_ref(&d), &acq)), err(&rec.gridding(&d)));
-            println!("{n} x {n}: band-limited: least squares {e_ls:.2e}, gridding {e_grid:.2e} of peak");
-            assert!(e_ls <= 1e-2, "{e_ls}");
-            let one = vec![1.0f32; n * n];
             let zero = vec![0.0f64; n * n];
+            let h = (n / 2) as f64;
+            for (name, cx, cy) in [("centre", h, h), ("edge", 0.0, h), ("corner", 0.0, 0.0)] {
+                let obj = band_limited(n, sigma, kb, cx, cy);
+                let comps = [obj.as_slice()];
+                let d = spiral_kspace_exact(&inp(&comps, &t2, &fmap, &zero, n, 1), &acq, 0, 1, &tr.k, &taus, None);
+                let err = |img: &[C]| (0..n * n).fold(0.0f64, |m, i| m.max((img[i].re - obj[i] as f64).hypot(img[i].im)));
+                let (e_ls, e_grid) = (err(&rec.reconstruct(std::slice::from_ref(&d), &acq)), err(&rec.gridding(&d)));
+                println!("{n} x {n}: band-limited at the {name}: least squares {e_ls:.2e}, gridding {e_grid:.2e} of peak");
+                assert!(e_ls <= 1e-2, "{name}: {e_ls}");
+            }
+            let one = vec![1.0f32; n * n];
             let comps = [one.as_slice()];
             let d = spiral_kspace_exact(&inp(&comps, &t2, &fmap, &zero, n, 1), &acq, 0, 1, &tr.k, &taus, None);
             let c = (n / 2) * (n + 1);
@@ -329,5 +352,63 @@ mod tests {
         let peak = ib.iter().fold(0.0f64, |m, c| m.max(c.abs()));
         let err = ia.iter().zip(&ib).fold(0.0f64, |m, (p, q)| m.max((p.re - q.re).hypot(p.im - q.im)));
         assert!(err <= 1e-6 * peak, "{}", err / peak);
+    }
+
+    /// An exactly band-limited periodic object on the `n x n` grid: a Gaussian spectrum
+    /// `exp(-2 pi^2 sigma^2 |k|^2 / n^2)` on the integer frequencies `|k| <= kb`, nothing outside,
+    /// centred at `(cx, cy)` (anywhere in the periodic FOV, edges included).
+    fn band_limited(n: usize, sigma: f64, kb: f64, cx: f64, cy: f64) -> Vec<f32> {
+        let h = (n / 2) as i64;
+        let mut ks = Vec::new();
+        for ky in -h..h {
+            for kx in -h..h {
+                let r2 = (kx * kx + ky * ky) as f64;
+                if r2 <= kb * kb {
+                    ks.push((kx as f64, ky as f64, (-2.0 * std::f64::consts::PI.powi(2) * sigma * sigma * r2 / (n * n) as f64).exp()));
+                }
+            }
+        }
+        let mut obj: Vec<f64> = (0..n * n).map(|i| {
+            let (x, y) = ((i % n) as f64, (i / n) as f64);
+            ks.iter().map(|&(kx, ky, c)| c * (TAU * (kx * (x - cx) + ky * (y - cy)) / n as f64).cos()).sum()
+        }).collect();
+        let pk = obj.iter().fold(0.0f64, |a, &b| a.max(b.abs()));
+        obj.iter_mut().for_each(|v| *v /= pk);
+        obj.into_iter().map(|v| v as f32).collect()
+    }
+
+    /// The numbers behind the reconstruction's iteration count and interval ratio (plan
+    /// Measurements): exactly band-limited objects at the centre, the edge and the corner.
+    #[test]
+    #[ignore]
+    fn sweep_iterations_and_interval() {
+        for &(n, il, dw, sigma, kb) in &[(32usize, 4usize, 0.008f64, 3.0f64, 10.0f64), (64, 8, 0.004, 6.0, 20.0)] {
+            let tr = spiral_trajectory(n, n, il, 4.0, dw).unwrap();
+            let taus: Vec<f64> = (0..tr.k.len()).map(|j| tr.tau_ms[j % tr.n_samples()]).collect();
+            let acq = plain();
+            let t2 = [T2Slice::Uniform(f32::INFINITY)];
+            let fmap = vec![0.0f32; n * n];
+            let zero = vec![0.0f64; n * n];
+            let h = (n / 2) as f64;
+            let objs: Vec<(&str, Vec<f32>)> = vec![("centre", band_limited(n, sigma, kb, h, h)),
+                                                   ("edge", band_limited(n, sigma, kb, 0.0, h)),
+                                                   ("corner", band_limited(n, sigma, kb, 0.0, 0.0))];
+            let data: Vec<Vec<C>> = objs.iter().map(|(_, o)| {
+                let comps = [o.as_slice()];
+                spiral_kspace_exact(&inp(&comps, &t2, &fmap, &zero, n, 1), &acq, 0, 1, &tr.k, &taus, None)
+            }).collect();
+            for &kappa in &[30.0, 100.0, 300.0] {
+                for &it in &[40usize, 60, 80, 120] {
+                    let rec = SpiralRecon::with_params(&tr.k, n, KspaceWindow::None, it, kappa);
+                    let t0 = std::time::Instant::now();
+                    let errs: Vec<String> = objs.iter().zip(&data).map(|((name, o), d)| {
+                        let img = rec.image(d);
+                        let e = (0..n * n).fold(0.0f64, |m, i| m.max((img[i].re - o[i] as f64).hypot(img[i].im)));
+                        format!("{name} {e:.2e}")
+                    }).collect();
+                    println!("n {n} kappa {kappa} it {it}: {} ({:.0?} per image)", errs.join(", "), t0.elapsed() / 3);
+                }
+            }
+        }
     }
 }
