@@ -746,6 +746,40 @@ measured; the refusals and the uncertifiable-range report.
   validates with no errors (warnings only: authors, recommended keys).
 - End to end: linearity under spirals with every P4 part, physiology and a shot event `0.163` of
   the tolerance, its negative control failing; the sidecar test; the non-`kspace` refusal.
+- Gates on the final state of Tasks 11-14 (aslscan a5ccff2, mrsim-acq 10c40df): TRXScan P0 clean;
+  `regress_identity.sh` 38 identical.
+
+### Codex adversarial implementation reviews (2026-10-02)
+
+Two runs: milestone AB at its commits (mrsim-acq `054bfdf..f13d157`, aslscan
+`p4-complete..9b29d48`) and milestone C with the part C amendment. Every finding was checked
+against the code; all were valid and are fixed (mrsim-acq 247f96e, aslscan 10ee904).
+
+- **AB** (2 major, 3 minor): a zero arterial blood T1 panicked the 3D EPG (refused in
+  `resolve_readout`); voxel mode never wrote `desc-acqT1map_gt` (written now, tested); 3D spike
+  streams ignored the coil (keyed on it now, tested); an accepted overlay line spacing published
+  the sidecar's effective spacing (the simulated one now); the GE compat sidecar named `T2`
+  instead of `T2*`.
+- **C** (3 major, 4 minor): the certificate's rounding term ignored the phase (now
+  `(Lambda^2 + 1)(1 + B)(4 eps (1 + theta) + 2 L eps)`, phases past `1e4` rad refused, tested
+  against a double-double oracle: at a constant 10 kHz the bound is `9.0e-13` against an error of
+  `8.2e-15`); `lambda_hi` was claimed as an upper bound (now estimated from a pseudo-random start
+  to convergence, the claim withdrawn, each reconstruction checking its residual did not grow);
+  the band-limited accuracy held only for centred objects. A sweep over exactly band-limited
+  objects (`|k| <= 0.625 k_max`) at the centre, edge and corner:
+
+  | `kappa`, iterations | `32 x 32` worst | `64 x 64` worst | noise / Cartesian (`32 x 32`) |
+  |---|---|---|---|
+  | 30, 40 | `1.5e-2` (edge) | `6.6e-3` | about 1.0 |
+  | 100, 80 | `6.8e-3` (corner) | `3.5e-3` | 1.60 |
+  | 300, 80 | `4.2e-3` | `2.5e-3` | 2.03 |
+
+  The reconstruction is now 80 iterations over `[lambda/100, lambda]` (the noise cost of
+  `kappa = 300` judged not worth its margin), described as a regularized approximate inverse; the
+  test covers all three positions at both sizes. The shot test asserts on acquired samples; an
+  overridden `PulseSequenceType`, a non-string `PhaseEncodingDirection` with a spiral and the
+  separate M0's replaced `DwellTime` are handled. `asl001` now simulates in 22.3 s (80 iterations)
+  and validates.
 
 ## Codex review of this plan (2026-10-02)
 
