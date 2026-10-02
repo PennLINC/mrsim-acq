@@ -779,7 +779,32 @@ against the code; all were valid and are fixed (mrsim-acq 247f96e, aslscan 10ee9
   test covers all three positions at both sizes. The shot test asserts on acquired samples; an
   overridden `PulseSequenceType`, a non-string `PhaseEncodingDirection` with a spiral and the
   separate M0's replaced `DwellTime` are handled. `asl001` now simulates in 22.3 s (80 iterations)
-  and validates.
+  and validates. Gates on these fixes (aslscan 10ee904, mrsim-acq 250c0c4): TRXScan P0 clean,
+  `regress_identity.sh` 38 identical.
+
+### Ordinary Codex final review and the radial oversampling (2026-10-02)
+
+The final review confirmed every fix but one: `cos(2 pi 5 x / 32)` reconstructed at `1.16e-2`.
+The worst single Fourier mode over the whole half-disc `|k| <= 10` at `32 x 32` (4 interleaves,
+4 ms, 4 us; `sweep_worst_single_mode`, `OVS` the radial oversampling `c`):
+
+| `c` | band | `kappa`, iterations | worst single mode |
+|---|---|---|---|
+| 1 | no | 100, 80 | `0.66` at `(7, 7)` |
+| 1 | disc | 10, 40 | `0.76` |
+| 1 | disc | 100, 80 | `0.16` |
+| 1.2 | no | 100, 80 | `3.1e-2` |
+| 1.2 | disc | 10, 40 | `7.3e-5` |
+| 1.2 | disc | 30, 40 | `1.6e-6` |
+| 1.25 / 1.5 | disc | 10, 40 | `2.4e-11` / `1.8e-11` (an earlier, scaled construction) |
+
+Both are needed: the margin over Nyquist and the image restricted to the sampled disc. The user
+chose an overlay knob, `[readout] radial_oversampling`, default 1.2 (mrsim-acq 44f61f3, aslscan
+85932b9); the reconstruction is 40 iterations over `[lambda/10, lambda]` on the disc band. Tests:
+the whole half-disc of single modes at `16 x 16` (worst `1e-7`), the review's and the formerly
+worst modes at `32 x 32` (`8.6e-5`), band-limited objects at the centre, edge and corner (`4e-8`
+to `3e-5`). Noise SD over the Cartesian path's: `0.57` (2D), `0.47` (3D). `asl001` (dwell bound
+4.14 us at `c = 1.2`, centre region 0.0597 ms) simulates in 16.7 s and validates.
 
 ## Codex review of this plan (2026-10-02)
 
