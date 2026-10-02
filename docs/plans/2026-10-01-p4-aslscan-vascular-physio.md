@@ -418,9 +418,11 @@ scale); validator run on the every-part dataset.
 - Record every number in Measurements.
 
 - [x] Commit: `test: P4 end to end and acceptance`.
-- [ ] Codex adversarial review of the implementation (skipped for now: the workspace was out of
-  credits; an internal adversarial review stood in and its findings are fixed); ordinary Codex
-  review as the final pass; tag `p4-complete`.
+- [x] Codex adversarial review of the implementation (first attempt died for credits; an internal
+  review stood in, fixed in 9247127; the Codex review then ran, 7 findings fixed in 706924a);
+  ordinary Codex review as the final pass (3 findings, fixed in e664b20; a re-review of the fixes
+  found the PASL guard incomplete, clamped in 1df98a2; a last re-review found nothing); tag
+  `p4-complete`.
 
 ## Acceptance criteria coverage
 
