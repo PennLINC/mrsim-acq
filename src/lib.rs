@@ -29,6 +29,8 @@ pub mod analytic;
 pub mod phase;
 /// EPI readout trajectory and line timing.
 pub mod readout;
+/// CPMG echo amplitudes by the extended phase graph (P5, the 3D echo trains).
+pub mod epg;
 /// Noise models. `add_complex_gaussian` is a `todo!()` stub; the noise that runs lives in
 /// `kspace` and is reached through `Acquisition::noise_variance`.
 pub mod noise;
