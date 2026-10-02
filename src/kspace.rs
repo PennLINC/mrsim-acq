@@ -173,6 +173,19 @@ pub struct Acquisition {
     pub accel: usize,         // GRAPPA acceleration R (1 = fully sampled); undersamples PE lines
     pub acs_lines: usize,     // GRAPPA autocalibration lines (fully-sampled central PE band)
     pub seed: u64,            // mixed into every derived per-slice seed; 0 reproduces legacy output
+    pub echo: EchoFormation,  // how the echo forms: spin echo (default) or gradient echo
+}
+
+/// How the echo forms (P5 addendum, part A). `Spin`: static off-resonance is refocused at the
+/// echo, so `T2'` decays as `exp(-|t|/T2')` about it and the fieldmap phase is `2 pi fmap t`, `t`
+/// from the echo. `Gradient`: nothing is refocused, so `T2'` decays from the RF,
+/// `exp(-trf/T2')`, and the fieldmap phase is `2 pi fmap (TE + t)`, whose static part
+/// `2 pi fmap TE` joins the object phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EchoFormation {
+    #[default]
+    Spin,
+    Gradient,
 }
 
 /// Spatial sensitivity of `coil` (of `n_coils` arranged in a ring) at continuous position
@@ -228,6 +241,7 @@ impl Default for Acquisition {
             accel: 1,
             acs_lines: 24,
             seed: 0,
+            echo: EchoFormation::Spin,
         }
     }
 }
@@ -613,6 +627,12 @@ fn build_coil_kspace_timed(inp: &SliceInput, acq: &Acquisition, coil: usize, nco
                 // z centred on the volume (zc is slice-index-from-start, not centred).
                 p0 += acq.eddy_phase * (gradient[0] * xc + gradient[1] * yc + gradient[2] * zc_c);
             }
+            if acq.echo == EchoFormation::Gradient && acq.do_distortions {
+                // Unrefocused off-resonance accrued from the RF to the echo: static per voxel,
+                // so it joins the object phase. B0 only: the replayed eddy shear that shares
+                // `rate` below is a readout-gradient effect and accrues nothing before the readout.
+                p0 += TAU * fmap[i] as f64 * (acq.t_echo / 1000.0);
+            }
             phi0[i] = p0;
             let mut r = if acq.do_distortions { fmap[i] as f64 } else { 0.0 };
             if let Some(a) = inp.eddy_lin {
@@ -789,7 +809,10 @@ fn build_coil_kspace_timed(inp: &SliceInput, acq: &Acquisition, coil: usize, nco
                         Some(T2Slice::Uniform(v)) => v as f64,
                         Some(T2Slice::Map(_)) => unreachable!("uniform branch"),
                     };
-                    (-trf / t2c as f64 - t.abs() * 1000.0 / tic).exp()
+                    match acq.echo {
+                        EchoFormation::Spin => (-trf / t2c as f64 - t.abs() * 1000.0 / tic).exp(),
+                        EchoFormation::Gradient => (-trf / t2c as f64 - trf / tic).exp(),
+                    }
                 } else {
                     1.0
                 };
@@ -850,7 +873,10 @@ fn build_coil_kspace_timed(inp: &SliceInput, acq: &Acquisition, coil: usize, nco
                             Some(T2Slice::Uniform(v)) => v as f64,
                             Some(T2Slice::Map(m)) => m[i] as f64,
                         };
-                        (-trf / t2c - t.abs() * 1000.0 / tic).exp()
+                        match acq.echo {
+                            EchoFormation::Spin => (-trf / t2c - t.abs() * 1000.0 / tic).exp(),
+                            EchoFormation::Gradient => (-trf / t2c - trf / tic).exp(),
+                        }
                     } else {
                         1.0
                     };
@@ -1699,7 +1725,12 @@ mod tests {
                                 Some(T2Slice::Uniform(u)) => u as f64,
                                 Some(T2Slice::Map(m)) => m[at(x, y)] as f64,
                             };
-                            v *= (-(trf as f64) / t2c - t.abs() * 1000.0 / tic).exp();
+                            // T2' from the echo (spin echo) or from the RF (gradient echo)
+                            let inhom_ms = match acq.echo {
+                                EchoFormation::Spin => t.abs() * 1000.0,
+                                EchoFormation::Gradient => trf,
+                            };
+                            v *= (-(trf as f64) / t2c - inhom_ms / tic).exp();
                         }
                         f_real += v;
                     }
@@ -1725,7 +1756,13 @@ mod tests {
                         (y as f64 - yoff) / oy as f64,
                     );
                     f_real *= acq.signal_scale * coil_sensitivity(coil, ncoils, xa, ya, nx, ny);
-                    let mut phi = if acq.do_distortions { fmap[at(x, y)] as f64 * t } else { 0.0 };
+                    // B0 phase accrues over `t` from the echo (spin echo) or `TE + t` from the RF
+                    // (gradient echo)
+                    let t_b0 = match acq.echo {
+                        EchoFormation::Spin => t,
+                        EchoFormation::Gradient => t + acq.t_echo / 1000.0,
+                    };
+                    let mut phi = if acq.do_distortions { fmap[at(x, y)] as f64 * t_b0 } else { 0.0 };
                     // Pre-readout object phase, already in radians, so it is added outside the TAU
                     // factor that scales the distortion/eddy term.
                     let mut phi0 = inp.phase0.map_or(0.0, |p| p[at(x, y)]);
@@ -2813,6 +2850,14 @@ mod tests {
                 ("everything", Acquisition { ghost_offset: 0.02, eddy_strength: 2.0, eddy_quad: 0.3, eddy_phase: 0.1,
                     partial_fourier: 0.8, accel: 2, acs_lines: 8, n_coils: 3, ..full.clone() },
                     Some([0.5, 0.5, 0.7]), Some([0.02, 0.04, -0.01]), 0, 3),
+                // gradient echo (P5 part A): decay from the RF and the static fmap*TE phase
+                ("ge-clean", Acquisition { echo: EchoFormation::Gradient, do_distortions: false, do_relaxation: false,
+                    ..full.clone() }, None, None, 0, 1),
+                ("ge-distortion+relaxation", Acquisition { echo: EchoFormation::Gradient, ..full.clone() }, None, None, 0, 1),
+                ("ge-everything", Acquisition { echo: EchoFormation::Gradient, ghost_offset: 0.02, eddy_strength: 2.0,
+                    eddy_quad: 0.3, eddy_phase: 0.1, partial_fourier: 0.8, accel: 2, acs_lines: 8, n_coils: 3,
+                    reverse_phase: true, ..full.clone() },
+                    Some([0.5, 0.5, 0.7]), Some([0.02, 0.04, -0.01]), 0, 3),
             ];
             for (name, acq, eddy_drive, eddy_lin, coil, ncoils) in cases {
                 let inp = SliceInput {
@@ -2996,6 +3041,122 @@ mod tests {
             assert!((gr - w.re).abs() < 1e-10 * peak && (gi - w.im).abs() < 1e-10 * peak,
                     "restructured forward diverged from the literal sum");
         }
+    }
+
+    /// Gradient echo (P5 part A) with per-voxel T2 and T2' maps against the literal sum.
+    #[test]
+    fn gradient_echo_maps_match_the_literal_sum() {
+        let (nx, ny) = (12, 12);
+        let comps = [box_hires(nx, ny, 3.0, 9.0, 3.0, 9.0)];
+        let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
+        let fmap: Vec<f32> = (0..nx * ny).map(|i| 3.0 * ((i % 5) as f32 - 2.0)).collect();
+        let map: Vec<f32> = (0..nx * ny).map(|i| 60.0 + (i % 7) as f32 * 10.0).collect();
+        let tmap: Vec<f32> = (0..nx * ny).map(|i| 30.0 + (i % 4) as f32 * 15.0).collect();
+        let acq = Acquisition { echo: EchoFormation::Gradient, ..Acquisition::default() };
+        let inp = SliceInput {
+            compartments: &comp_refs, t2: &[T2Slice::Map(&map)], t_inhom: Some(&[T2Slice::Map(&tmap)]),
+            fmap: &fmap, phase0: None, sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
+            eddy_drive: None, prep_drive: None, slice_seed: 5, eddy_lin: None,
+        };
+        let got = simulate_slice_kspace(&inp, &acq);
+        let want = reference_coil_kspace(&inp, &acq, 0, 1);
+        let peak = want.iter().map(|k| k.abs()).fold(0.0, f64::max);
+        assert!(peak > 0.0);
+        for ((gr, gi), w) in got.iter().zip(want.iter()) {
+            assert!((gr - w.re).abs() < 1e-10 * peak && (gi - w.im).abs() < 1e-10 * peak);
+        }
+    }
+
+    /// The gradient echo's two departures from the spin echo, each isolated on the acquired
+    /// k-space without assuming when the centre line is read: with a uniform fieldmap and no
+    /// decay, every sample is the spin echo's times `exp(i 2 pi f TE)` (the distortion term is
+    /// shared, whatever the line times); with decay and no fieldmap, moving TE scales every line
+    /// by `exp(-dTE (1/T2 + 1/T2'))`.
+    #[test]
+    fn gradient_echo_adds_the_static_phase_and_decays_from_the_rf() {
+        let (nx, ny) = (16, 16);
+        let comps = [box_hires(2 * nx, 2 * ny, 9.0, 23.0, 7.0, 21.0)];
+        let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
+        let phase0: Vec<f64> = (0..4 * nx * ny).map(|i| 0.3 * ((i % 11) as f64 - 5.0)).collect();
+        let f = 20.0f32;
+        let fmap = vec![f; 4 * nx * ny];
+        let t2 = [T2Slice::Uniform(80.0)];
+        let zero = vec![0.0f32; 4 * nx * ny];
+        let with_fmap = SliceInput {
+            compartments: &comp_refs, t2: &t2, t_inhom: None, fmap: &fmap, phase0: Some(&phase0), sim: [2 * nx, 2 * ny],
+            acq_matrix: [nx, ny], z: 0, nz: 1, eddy_drive: None, prep_drive: None, slice_seed: 1, eddy_lin: None,
+        };
+        let without = SliceInput { fmap: &zero, ..with_fmap };
+        let base = Acquisition { do_relaxation: false, t_echo: 40.0, t_line: 0.5, ..Acquisition::default() };
+        let spin = simulate_slice_kspace(&with_fmap, &base);
+        let grad = simulate_slice_kspace(&with_fmap, &Acquisition { echo: EchoFormation::Gradient, ..base.clone() });
+        let rot = TAU * f as f64 * 0.040;
+        let (c, s) = (rot.cos(), rot.sin());
+        let peak = spin.iter().map(|(a, b)| a.hypot(*b)).fold(0.0, f64::max);
+        assert!(peak > 0.0);
+        for ((sr, si), (gr, gi)) in spin.iter().zip(&grad) {
+            let (wr, wi) = (sr * c - si * s, sr * s + si * c);
+            assert!((gr - wr).hypot(gi - wi) <= 1e-12 * peak, "static phase: {gr},{gi} vs {wr},{wi}");
+        }
+        // decay from the RF: T2 80 ms, T2' (the acquisition scalar) 50 ms
+        let decaying = Acquisition { echo: EchoFormation::Gradient, do_relaxation: true, t_inhom: 50.0, ..base.clone() };
+        let k1 = simulate_slice_kspace(&without, &decaying);
+        let k2 = simulate_slice_kspace(&without, &Acquisition { t_echo: 70.0, ..decaying.clone() });
+        let factor = (-30.0 * (1.0 / 80.0 + 1.0 / 50.0f64)).exp();
+        let peak = k1.iter().map(|(a, b)| a.hypot(*b)).fold(0.0, f64::max);
+        for ((ar, ai), (br, bi)) in k1.iter().zip(&k2) {
+            assert!((br - factor * ar).hypot(bi - factor * ai) <= 1e-12 * peak, "decay from the RF");
+        }
+        // the spin echo does not decay with T2' as the echo moves: the same TE shift scales by T2 only
+        let spin_decaying = Acquisition { echo: EchoFormation::Spin, ..decaying.clone() };
+        let s1 = simulate_slice_kspace(&without, &spin_decaying);
+        let s2 = simulate_slice_kspace(&without, &Acquisition { t_echo: 70.0, ..spin_decaying.clone() });
+        let t2_only = (-30.0f64 / 80.0).exp();
+        for ((ar, ai), (br, bi)) in s1.iter().zip(&s2) {
+            assert!((br - t2_only * ar).hypot(bi - t2_only * ai) <= 1e-12 * peak, "spin echo decay");
+        }
+    }
+
+    /// The static gradient-echo term is B0 only: the replayed eddy shear shares `rate` but is a
+    /// readout-gradient effect, so with no fieldmap and no decay the gradient echo is the spin
+    /// echo exactly, shear and all.
+    #[test]
+    fn gradient_echo_static_phase_excludes_the_eddy_shear() {
+        let (nx, ny) = (16, 16);
+        let comps = [box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
+        let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
+        let fmap = vec![0.0f32; nx * ny];
+        let t2 = [T2Slice::Uniform(80.0)];
+        let inp = SliceInput {
+            compartments: &comp_refs, t2: &t2, t_inhom: None, fmap: &fmap, phase0: None, sim: [nx, ny],
+            acq_matrix: [nx, ny], z: 2, nz: 5, eddy_drive: None, prep_drive: None, slice_seed: 1,
+            eddy_lin: Some([0.05, -0.03, 0.02]),
+        };
+        let spin = Acquisition { do_relaxation: false, ..Acquisition::default() };
+        let a = simulate_slice_kspace(&inp, &spin);
+        let b = simulate_slice_kspace(&inp, &Acquisition { echo: EchoFormation::Gradient, ..spin.clone() });
+        assert_eq!(a, b);
+    }
+
+    /// The NUFFT path (uniform relaxation) and the rotor path (a constant map) agree under the
+    /// gradient echo, static phase and decay from the RF included.
+    #[test]
+    fn gradient_echo_nufft_and_rotor_paths_agree() {
+        let (nx, ny) = (16, 16);
+        let comps = [box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
+        let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
+        let fmap: Vec<f32> = (0..nx * ny).map(|i| 15.0 + 5.0 * ((i % 7) as f32 - 3.0)).collect();
+        let acq = Acquisition { echo: EchoFormation::Gradient, ..Acquisition::default() };
+        let map = vec![100.0f32; nx * ny];
+        let u = simulate_slice_kspace(&mk_slice(&comp_refs, &[T2Slice::Uniform(100.0)], None, &fmap, nx, ny, 3), &acq);
+        let m = simulate_slice_kspace(&mk_slice(&comp_refs, &[T2Slice::Map(&map)], None, &fmap, nx, ny, 3), &acq);
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for ((ur, ui), (mr, mi)) in u.iter().zip(m.iter()) {
+            num += (ur - mr).powi(2) + (ui - mi).powi(2);
+            den += ur.powi(2) + ui.powi(2);
+        }
+        let l2_rel = (num / den.max(1e-300)).sqrt();
+        assert!(l2_rel < 1e-12, "gradient echo, NUFFT vs rotor: L2 relative {l2_rel:e}");
     }
 
     /// A readout that starts before the excitation. TRXScan never hits this at TE 88 ms; ASL

@@ -1,12 +1,18 @@
 //! Object phase (spec 3.2). Three additive terms, all applied to the object on the SIMULATION
 //! grid *before* the finite Fourier acquisition.
 //!
-//! **No term is derived from the fieldmap.** TRXScan simulates spin-echo EPI DWI (`kspace.rs`
-//! applies `exp(-|t|/t_inhom)` centred on the echo, and `readout.rs` defines
-//! `time_from_rf = t_echo + time_from_max_echo`). Static off-resonance is refocused at the spin
-//! echo and survives only as readout-time-dependent phase, which `kspace` already models as
-//! geometric distortion. A `2*PI*fmap*TE` term would double-count B0 and impose gradient-echo
-//! physics on a spin-echo sequence.
+//! **No term here is derived from the fieldmap**; where one applies, `kspace` adds it, because it
+//! depends on how the echo forms (`kspace::EchoFormation`):
+//!
+//! - **Spin echo** (the default, and TRXScan's spin-echo EPI DWI): `kspace` applies
+//!   `exp(-|t|/t_inhom)` centred on the echo, and `readout.rs` defines
+//!   `time_from_rf = t_echo + time_from_max_echo`. Static off-resonance is refocused at the spin
+//!   echo and survives only as readout-time-dependent phase, which `kspace` models as geometric
+//!   distortion. A `2*PI*fmap*TE` term would double-count B0 and impose gradient-echo physics on
+//!   a spin-echo sequence, so there is none.
+//! - **Gradient echo** (P5): nothing is refocused. `kspace` decays `T2'` from the RF and adds the
+//!   static `2*PI*fmap*TE` to the pre-readout phase it forms from this model's output, beside the
+//!   same readout-time distortion term.
 
 /// Deterministic Gaussian source, seeded per shot. Mirrors the SplitMix64 generator in `kspace`.
 struct Rng(u64);
