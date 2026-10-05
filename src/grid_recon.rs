@@ -10,9 +10,11 @@
 //! over `[lambda_hi / LS_KAPPA, lambda_hi]`, [`LS_ITERATIONS`] iterations, with `lambda_hi` from a
 //! power iteration on a fixed pseudo-random start: every coefficient depends only on the
 //! trajectory, so the reconstruction is linear in the data (the linearity identity needs that;
-//! conjugate gradients is not). On the spec's radially oversampled spirals (`c = 1.2`) the band's
-//! spectrum lies in the interval and every in-band mode is recovered to rounding; at `c = 1`
-//! (exactly Nyquist) it does not, and some modes were 16-66% wrong. Its residual polynomial is
+//! conjugate gradients is not). It converges on the band's eigencomponents inside the interval and
+//! only partly below it. On the measured designs at the spec's radial oversampling (`c = 1.2`) the
+//! band's smallest eigenvalue is inside (0.049 of `lambda_hi` at 32 x 32, 0.019 at 64 x 64;
+//! `band_spectrum`); at `c = 1` (exactly Nyquist) it is not, and some modes were 16-66% wrong. This
+//! is measured per design, not guaranteed. Its residual polynomial is
 //! bounded by 1 on `[0, lambda_hi]`; the power iteration certifies nothing, so every image checks
 //! that its residual did not grow. Then the Roemer combine of `kspace::reconstruct_coils`.
 //!
@@ -36,9 +38,9 @@ use crate::nufft::Nufft2;
 /// Pipe-Menon iterations (fixed, recorded).
 pub const DCF_ITERATIONS: usize = 10;
 /// Chebyshev iterations of the least squares (fixed, recorded).
-pub const LS_ITERATIONS: usize = 40;
+pub const LS_ITERATIONS: usize = 80;
 /// The ratio of the Chebyshev interval's ends.
-pub const LS_KAPPA: f64 = 10.0;
+pub const LS_KAPPA: f64 = 100.0;
 /// The cap on the power iterations for the largest eigenvalue of the normal operator (they stop
 /// at convergence), and the margin over the estimate.
 pub const POWER_ITERATIONS: usize = 1000;
@@ -102,7 +104,9 @@ struct Band {
 impl Band {
     fn new(n: usize, radius: f64) -> Band {
         let mut planner = rustfft::FftPlanner::<f64>::new();
-        let signed = |i: usize| if i < n / 2 { i as f64 } else { i as f64 - n as f64 };
+        // FFT bin i is frequency i up to (n-1)/2 and i - n above (for odd n, +(n-1)/2 is a bin of
+        // its own; for even n the Nyquist bin n/2 is -n/2, the same radius either way)
+        let signed = |i: usize| if i < n.div_ceil(2) { i as f64 } else { i as f64 - n as f64 };
         let keep = (0..n * n).map(|i| signed(i % n).hypot(signed(i / n)) <= radius).collect();
         Band { keep, fwd: planner.plan_fft_forward(n), inv: planner.plan_fft_inverse(n) }
     }
@@ -517,6 +521,56 @@ mod tests {
             }
         }
         v
+    }
+
+    #[test]
+    fn the_band_keeps_exactly_the_disc_on_odd_and_even_grids() {
+        // the final review's case: on 33 x 33 the bin of +16 is +16 (not -17), so a disc of radius
+        // 16.49 keeps (+-16, 0) and drops (12, 12); on 32 x 32 the Nyquist bin is -16
+        for (n, radius) in [(33usize, 16.49), (32, 15.9)] {
+            let b = Band::new(n, radius);
+            let mode = |kx: f64, ky: f64| -> Vec<C> {
+                (0..n * n).map(|i| C::cis(TAU * (kx * (i % n) as f64 + ky * (i / n) as f64) / n as f64)).collect()
+            };
+            for (kx, ky) in [(16.0, 0.0), (-16.0, 0.0), (12.0, 12.0), (0.0, 15.0), (3.0, -7.0)] {
+                let x = mode(kx, ky);
+                let mut y = x.clone();
+                b.project(n, &mut y);
+                let inside = f64::hypot(kx, ky) <= radius && (n % 2 == 1 || kx.abs() < (n / 2) as f64 || kx == -((n / 2) as f64));
+                let want: Vec<C> = if inside { x } else { vec![C::ZERO; n * n] };
+                let e = y.iter().zip(&want).fold(0.0f64, |m, (a, b)| m.max((a.re - b.re).hypot(a.im - b.im)));
+                assert!(e < 1e-12, "n {n} k ({kx}, {ky}) inside {inside}: {e:e}");
+            }
+        }
+    }
+
+    /// The band's smallest and largest eigenvalues of the normal operator, for the record: the
+    /// Chebyshev interval `[lambda_hi / LS_KAPPA, lambda_hi]` must contain the spectrum for the
+    /// reconstruction to converge on every in-band direction (power iteration on `lambda_hi - N`;
+    /// an estimate, run long).
+    #[test]
+    #[ignore]
+    fn band_spectrum() {
+        for &(n, il, dw) in &[(32usize, 4usize, 0.008f64), (32, 4, 0.004), (64, 8, 0.004)] {
+            let tr = spiral_trajectory(n, n, il, 4.0, dw, 1.2).unwrap();
+            let rec = SpiralRecon::new(&tr.k, n, KspaceWindow::None);
+            let hi = rec.lambda_hi;
+            let mut g = uniform(5);
+            let mut v: Vec<C> = (0..n * n).map(|_| C { re: g(), im: g() }).collect();
+            rec.project(&mut v);
+            let mut mu = 0.0;
+            for _ in 0..4000 {
+                let nv = norm(&v);
+                let mut w: Vec<C> = rec.normal(&v).iter().zip(&v).map(|(a, b)| C { re: hi * b.re - a.re, im: hi * b.im - a.im }).collect();
+                rec.project(&mut w); // rounding leaks out of the band, where N is 0
+                mu = norm(&w) / nv;
+                let nw = norm(&w);
+                v = w.into_iter().map(|c| c.scale(1.0 / nw)).collect();
+            }
+            let lmin = hi - mu;
+            println!("{n} x {n}, {il} interleaves, dwell {dw}: lambda_min / lambda_hi = {:.4} (interval from 1/{LS_KAPPA} = {:.4})",
+                     lmin / hi, 1.0 / LS_KAPPA);
+        }
     }
 
     #[test]

@@ -804,7 +804,27 @@ chose an overlay knob, `[readout] radial_oversampling`, default 1.2 (mrsim-acq 4
 the whole half-disc of single modes at `16 x 16` (worst `1e-7`), the review's and the formerly
 worst modes at `32 x 32` (`8.6e-5`), band-limited objects at the centre, edge and corner (`4e-8`
 to `3e-5`). Noise SD over the Cartesian path's: `0.57` (2D), `0.47` (3D). `asl001` (dwell bound
-4.14 us at `c = 1.2`, centre region 0.0597 ms) simulates in 16.7 s and validates.
+4.14 us at `c = 1.2`, centre region 0.0597 ms) simulates in 16.7 s and validates. Gates on
+these commits: TRXScan P0 clean, `regress_identity.sh` 38 identical.
+
+### Codex review of the radial oversampling (2026-10-05)
+
+Three findings, each checked and valid. The band's frequency signing (`i < n/2`) dropped the
+`+(n-1)/2` frequency on odd matrices: now `i < n.div_ceil(2)`, tested on 33 x 33. The claim that
+the band's spectrum lies in `[lambda/10, lambda]` was false; measured by power iteration on
+`lambda_hi - N` (`band_spectrum`, re-projecting onto the band each step, since rounding leaks
+out of it where `N` is zero):
+
+| design | `lambda_min / lambda_hi` |
+|---|---|
+| 32 x 32, 4 interleaves, 8 us | 0.0485 |
+| 32 x 32, 4 interleaves, 4 us | 0.0494 |
+| 64 x 64, 8 interleaves, 4 us (`asl001`) | 0.0189 |
+
+so the interval is now `[lambda/100, lambda]` with 80 iterations (`kappa = 30` would have missed
+`asl001`), the claim stated as measured. Tests after the change: single modes worst `4.9e-7`,
+band-limited objects `9e-8` to `3e-6`; noise unchanged. The sidecar's reconstruction block now
+records the band.
 
 ## Codex review of this plan (2026-10-02)
 

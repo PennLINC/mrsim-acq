@@ -789,20 +789,27 @@ sampled, and leaving them free let them mimic in-band directions). It approximat
 in the convention above, `1/(nx ny)`), `A^H` its adjoint (the type-1 NUFFT with the opposite sign,
 deapodized), `w_j` the density weights, `Q` the projection onto the band (FFT, mask, inverse
 FFT). The solver is the **Chebyshev semi-iteration** on the normal equations
-`Q A^H W A Q x = Q A^H W d` from `x = 0`, over the eigenvalue interval `[lambda_hi / 10, lambda_hi]`,
-40 iterations, `lambda_hi` 1.1 times the largest eigenvalue estimated by power iteration from a
+`Q A^H W A Q x = Q A^H W d` from `x = 0`, over the eigenvalue interval `[lambda_hi / 100, lambda_hi]`,
+80 iterations, `lambda_hi` 1.1 times the largest eigenvalue estimated by power iteration from a
 pseudo-random start (fixed seed) run to convergence: every coefficient depends only on the
 trajectory and the weights, so the reconstruction is a fixed **linear** operator on the samples,
 which the linearity identity requires (conjugate gradients, whose step sizes depend on the data,
-is not). It is an approximate inverse on the band, exact only as far as the band's spectrum lies
-in the interval; with `c = 1.2` it does. Its residual polynomial is bounded by 1 on
+is not). It is an approximate inverse on the band, converging (by a factor about `1e-7` over the
+80 iterations) on the eigencomponents inside the interval and only partly below it. For the
+designs measured at `c = 1.2` the band's smallest eigenvalue is inside it: `lambda_min / lambda_hi`
+about `0.049` at `32 x 32` and `0.019` at `asl001`'s `64 x 64` (estimated by power iteration on
+`lambda_hi - N`; the interval reaches `0.01`). This is measured, not guaranteed for every design;
+an earlier wording ("every in-band mode recovered to rounding", with `[lambda/10, lambda]`) was
+wrong for `asl001`'s design (the third implementation review). Its residual polynomial is bounded by 1 on
 `[0, lambda_hi]`; power iteration estimates the top of the spectrum from below and certifies
 nothing, so every reconstruction checks that its normal-equation residual did not grow (it can
 only grow if an eigenvalue lies above `lambda_hi`) and panics if it did. What the tests assert:
 every single Fourier mode with `|k| <= 0.625 k_max` (the whole half-disc at `16 x 16`; the
 reviewed and formerly worst modes at `32 x 32`), and band-limited objects at the centre, edge and
-corner of the field of view, to `1e-2` of peak (measured: `1e-7` to `1e-4`). The earlier
-parameters (80 iterations over `[lambda/100, lambda]`, no band, `c = 1`) are recorded in the plan.
+corner of the field of view, to `1e-2` of peak (measured: `1e-8` to `3e-6`). The earlier
+parameters (no band and `c = 1`; then 40 iterations over `[lambda/10, lambda]`) are recorded in the plan.
+The band is the disc of the largest sample radius, on the grid's DFT frequencies (signed as `i` up
+to `(n-1)/2` and `i - n` above, so odd matrices keep their `+(n-1)/2` frequency).
 The density weights are Pipe and Menon's in operator form, `w <- w / |A A^H w|` (10 iterations,
 fixed, recorded), normalized so that a constant object with no off-resonance and no decay grids to
 its Cartesian value at the image centre (the scale is common to every weight, so it does not move
@@ -1219,3 +1226,11 @@ radially. Decided by the user: the turns gain a radial oversampling `c` (`[reado
 radial_oversampling`, default 1.2), and the reconstruction works on the disc band (40 iterations
 over `[lambda/10, lambda]`). Every in-band mode is then recovered to rounding; the tests cover
 single modes.
+
+Ordinary Codex review of the radial oversampling, 2026-10-05: 3 findings, checked and valid. The
+band's frequency signing mapped `+(n-1)/2` to `-(n+1)/2` on odd matrices, dropping in-disc
+frequencies (fixed, tested on 33 x 33); "every in-band mode recovered to rounding" was false,
+the band's smallest eigenvalue lying below `[lambda/10, lambda]` (measured 0.049 of `lambda_hi` at
+32 x 32, and 0.019 at `asl001`'s 64 x 64, which the review had not checked): the interval is now
+`[lambda/100, lambda]` with 80 iterations and the claim is stated as measured; the sidecar now
+records the band.
