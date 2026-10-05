@@ -4,8 +4,8 @@ Design spec addendum, 2026-10-05. Extends `2026-09-21-mrsim-acq-aslscan-design.m
 spec) and follows the P2-P5 addenda (`2026-09-24-p2-asldro-compat-design.md`,
 `2026-09-24-p3-motion-bs-ir-design.md`, `2026-10-01-p4-vascular-physio-design.md`,
 `2026-10-01-p5-3d-readouts-ge-design.md`). Where this document is silent, those stand.
-Codex-reviewed once (2026-10-05: 1 blocker, 13 majors, 1 minor; all verified and applied; the
-review is summarized at the end).
+Codex-reviewed twice (2026-10-05: 1 blocker, 13 majors and 1 minor; then 8 majors and 2 minors;
+all verified and applied; both reviews are summarized at the end).
 
 ## Context
 
@@ -169,17 +169,33 @@ D_j = (2 / H) * sum_i h_ij * S_i
 The general form is what a scanner gets: tissue that differs between encoded preparations
 (gradient-echo transients after an M0 or a differently prepared row, physiological tissue
 factors) leaks into every decoded sub-bolus, and preparation-dependent label factors
-(physiology) mix sub-boli. aslscan keeps that physics; it does not force a common `C`. The sidecar
-reports, per cycle, the largest tissue difference across its encoded preparations
-(`TissueLeakage`, relative to the tissue mean), so a user sees when decoding is not clean.
+(physiology) mix sub-boli. aslscan keeps that physics; it does not force a common `C`.
+
+**Tissue leakage** is reported as the decoded tissue-only residual. aslscan runs the cycle's
+tissue images alone (blood compartments zeroed) through the same acquisition, `C_i` the resulting
+reconstructed complex images, and decodes them: `L_j = (2/H) sum_i h_ij C_i`. With noise, spikes
+and GRAPPA off, this is exactly the tissue part of `D_j` (the acquisition is linear in its
+compartments). The sidecar records, per cycle and sub-bolus, `||L_j||_2` over the brain mask (the
+phantom's `dseg > 0` resampled to the acquisition grid) in image units, and the same divided by
+`max(||M0_ref||_2, eps)`, `M0_ref` the unsuppressed tissue steady state at the cycle's `TR`
+(always positive, unlike suppressed tissue, which can be near zero). It costs one extra
+noise-free acquisition of the tissue images and is computed only under Hadamard; an overlay key
+`[hadamard] report_leakage = false` skips it.
 
 aslscan decodes the reconstructed complex images per cycle in `f64`, from the acquisition's `f32`
 magnitude and phase. Decoding is a fixed linear map, so it is exact **when the acquisition is the
 same linear operator for every preparation of the cycle**: no GRAPPA (its weights are calibrated
 per volume, `kspace.rs:1335-1360`), no spikes (placed per volume at its own peak, `:926-943`), the
-same pose, and up to the `f32` rounding of the tissue (an absolute error of order `1e-7` of the
-tissue magnitude, which the tests' tolerance scales with). GRAPPA, spikes and motion are allowed and
-decode into realistic artefacts; the sidecar says which were on.
+same pose for every preparation. Fixed GRASE and spiral shot assembly is linear and is allowed in
+the exact case; shot motion or per-shot factors are not. The `f32` output rounds each raw image
+to a relative `2^-24` of its magnitude, so the decoded error is bounded by
+`(2/H) sum_i |h_ij| 2^-24 |S_i| <= 2 * 2^-24 * max_i |S_i|` per voxel; the tests use
+`|D_j - ref_j| <= 4 * 2^-24 * max_i |S_i| + 1e-6 * max |ref_j|` per voxel, and require
+`max |ref_j|` to exceed 100 times the first term (so a resolved sub-bolus is tested, not hidden
+in the allowance), and that the same comparison fails for a sign flip and for a swapped column.
+GRAPPA, spikes and motion are allowed and decode into realistic artefacts; the sidecar records
+which were on (`Grappa`, `Spikes`, `Motion`, `ShotFactors`, `Transients`), and the readout type
+separately.
 
 The decoded noise SD is the raw SD times `2/sqrt(H)` (measured, not asserted).
 
@@ -233,17 +249,23 @@ Two truths, named apart:
   kinetics alone, at the sub-bolus's own timing, without physiological factors, unmoved (static,
   since a decoded volume has no single pose; the sidecar says so). The P4 truths
   (`deltamIntravascular`, `deltamArterial`, `deltamSuppressed`) likewise per sub-bolus.
-- **Raw acquisition truth** (`sourcedata`, per raw volume): the encoded `sum_j w_ij dM_sub` with the
-  preparation's physiological and suppression factors, moved with the raw volume's pose, as P3/P4
-  write `desc-deltam_gt` today.
+- **Raw truth** (`sourcedata`), defined per **preparation**, because a 3D raw volume holds several
+  preparations with different factors and poses and has no single image-space truth:
+  `desc-deltam_gt` per raw volume is the encoded kinetic `sum_j w_ij dM_sub` with today's
+  conventions (no suppression factor, no physiological factor, moved with the raw volume's
+  pose in 2D; static in 3D), and a TSV `desc-preparations_gt.tsv` gives, per preparation (indexed
+  by the preparation map), the encoding row, the labeled sub-boli, the shot, and the label,
+  tissue and suppression factors actually applied. The P4 truths keep their existing definitions
+  per raw volume. No product averages factors across the shots of a raw volume.
 
 ## Outputs
 
 - **Main dataset** (validates): the decoded series (`deltam` in sub-bolus order per cycle, `m0scan`
   as raw volumes between cycles), the input arrays, and `AslscanSimulation.Hadamard`: the order, the
   matrix, `[a_j, b_j]`, `PLD`, the maps above, the preparation, raw and decoded counts, the decoding
-  rule, `2/sqrt(H)`, `TissueLeakage` per cycle, and which non-exact features were on (GRASE/spikes/
-  motion/physiology/transients).
+  rule, `2/sqrt(H)`, the tissue leakage per cycle and sub-bolus (absolute and normalized), and
+  which non-exact features were on (`Grappa`, `Spikes`, `Motion`, `ShotFactors`, `Transients`,
+  `Physiology`), with the readout type separately.
 - **`TotalAcquiredPairs`**: BIDS defines it as acquired control-label pairs, which a Hadamard
   acquisition does not have. aslscan writes the **number of encoding cycles** (each cycle gives one
   measurement of every sub-bolus, the role a control-label pair plays for one PLD) and states the
@@ -276,16 +298,32 @@ before the first readout as today) and the slice's own readouts (`cos(a_n)` each
 `t_n + offset_z`), with T1 recovery between them; readout `n`'s transverse signal is
 `sin(a_n) Mz(t_n + offset_z, before the pulse)`. The cycle is affine in the starting `Mz`, so its
 steady state is P5's fixed point with the event list extended, solved per slice, and cycles with
-different preparations carry state forward as `tissue_mz_ge_sequence` does. One readout
-(`M = 1`) dispatches to P5's `tissue_mz_ge` and `tissue_mz_ge_sequence` themselves.
+different preparations carry state forward as `tissue_mz_ge_sequence` does.
+
+**Legacy dispatch for one readout** applies only to the subset P5 can represent: every cycle has
+`M = 1`, one scalar flip for the whole series (P5's sequence function takes one flip,
+`longitudinal.rs:117`), and P5's `m0scan` convention. Then aslscan calls P5's `tissue_mz_ge` and
+`tissue_mz_ge_sequence` themselves and the output is P5's bit for bit. Any other Look-Locker series,
+including `M = 1` with varying flips, uses the generalized timeline.
+
+**Included `m0scan` rows** under Look-Locker are their own one-readout cycle with their own flip
+(their `FlipAngle` entry), no labeling and no suppression; their excitation is at `t = 0` of their
+repetition (as an M0 excitation is today, `protocol.rs:1071-1082`), and P5's convention of reading
+the `m0scan` longitudinal state at `r.tr` (`series.rs:698`) is that excitation seen from the
+previous repetition, so in the generalized timeline the `m0scan` excitation is the event at the
+start of its own repetition and its sampled block must fit in that repetition. The clock advances
+one `TR` per `m0scan` row. A test places an `m0scan` between two Look-Locker cycles and checks the
+state carried across it against brute-force propagation.
 
 **Blood.** The readout depletes the difference magnetization of label that has **arrived** in the
 imaged slice (the excitation scales `Mz` of both control and label by `cos(a)`, so their difference
 by the same factor); label in transit is outside the imaged slices (the P1 geometry) and is not
-depleted. The delta-M read at readout `n` splits by arrival window:
+depleted. Every time below is **slice-specific**: slice `z`'s readout `n` excites at
+`e_{n,z} = t_n + offset_z`, and label arriving in slice `z` between `t_1` and `e_{1,z}` has not yet
+been excited there. The delta-M read at slice `z`'s readout `n` splits by arrival window:
 
 ```
-dM_n = sum_{k=0}^{n-1} [ prod_{m=k+1}^{n-1} cos(a_m) ] * dM_arr(t_n; t_k, t_{k+1})      (t_0 = 0)
+dM_{n,z} = sum_{k=0}^{n-1} [ prod_{m=k+1}^{n-1} cos(a_m) ] * dM_arr(e_{n,z}; e_{k,z}, e_{k+1,z})    (e_{0,z} = 0)
 ```
 
 with `dM_arr(t; u1, u2)` the delta-M at `t` of the label that arrived during `[u1, u2)`, residue
@@ -298,8 +336,9 @@ with `dM_arr(t; u1, u2)` the delta-M at `t` of the label that arrived during `[u
   `dM_arr = 2 alpha M0b f exp(-t/T1') (exp(-q u_lo) - exp(-q u_hi)) / q`, keeping the existing
   GKM's guard at `q = 0` (it returns zero there, `kinetic.rs:92-105`, not the continuous limit).
 
-The windows partition `[0, t_n)`, so with every `cos(a_m) = 1` the sum is `delta_m(t_n)` (pinned to
-`1e-12`). The read signal is `sin(a_n) dM_n`. New in `kinetic.rs` as `delta_m_arrival`. Exchange, the
+The windows partition `[0, e_{n,z})`, so with every `cos(a_m) = 1` the sum is
+`delta_m(e_{n,z})`, today's slice-specific kinetic time (`series.rs:740`, `:917`; pinned to `1e-12`).
+The read signal is `sin(a_n) dM_{n,z}`. New in `kinetic.rs` as `delta_m_arrival`. Exchange, the
 arterial compartment, crushing and bolus-position suppression are refused under Look-Locker.
 
 **Physiology and motion.** One labeling factor per cycle (sampled or window-averaged at the cycle's
@@ -329,9 +368,13 @@ unchanged for part B.
   `LookLocker: true`).
 - **Timing on explicit intervals**: for every slice excitation at `e = t_n + offset_z`, the sampled
   readout is `[e + TE - h, e + TE + h]` (`h` half the EPI block, the sample times
-  `TE + time_from_max_echo`, `readout.rs:60-67`); it must end before the next slice's excitation in
-  the same readout and the last slice's before the next readout's first excitation, the last
-  readout's before `TR`, and every sample must follow its excitation (the existing check).
+  `TE + time_from_max_echo`, `readout.rs:60-67`). Slices excited at the same time form an
+  **excitation group** (multiband groups, `protocol.rs:1137`, share an offset); the checks run on
+  the groups in chronological order (not on slice indices): a group's blocks must end before the
+  next group's excitation, the last group of a readout before the next readout's first group, the
+  last readout's before `TR`, and every sample must follow its excitation (the existing check).
+  Interleaved and reversed slice orders are therefore handled by sorting the offsets. Compat is
+  refused under Look-Locker, so its all-zero offsets do not arise here.
 
 The clock advances one `TR` per cycle; readout volume times are `cycle start + t_n`.
 
@@ -342,9 +385,10 @@ The raw volumes as acquired, the input arrays, `LookLocker: true`, `FlipAngle` a
 blood models, the refused P4 parts. `pixdim[4]` stays the first non-`m0scan` row's `tr`, a storage
 convention (BIDS's ASL timing is in the arrays); the sidecar records the actual readout schedule.
 
-**Ground truth**: `desc-deltam_gt` per readout volume is the undepleted `delta_m(t_n)` (moved, as
-today); `desc-deltamRead_gt` the depleted `sin(a_n) dM_n`; `desc-lookLocker_gt.tsv` one row per
-readout (cycle, readout, time, flip, mean tissue `Mz` before the pulse per label).
+**Ground truth**: `desc-deltam_gt` per readout volume is the undepleted `delta_m(e_{n,z})` per slice
+(moved, as today); `desc-deltamRead_gt` the depleted `sin(a_n) dM_{n,z}`; `desc-lookLocker_gt.tsv`
+one row per readout and excitation group (cycle, readout, group, excitation time, flip, mean tissue
+`Mz` before the pulse per label).
 
 ## Refusals
 
@@ -368,12 +412,17 @@ spin echo (CPMG):  exp(-(TE_e + t)/T2_c - |t|/T2'_c)
 gradient echo:     exp(-(TE_e + t)(1/T2_c + 1/T2'_c)) * exp(i 2 pi fmap TE_e)
 ```
 
-(`kspace.rs:813-830`, `:636-641`). The `TE_e` part is a common factor of every line, so between two
-echoes the image of a compartment changes by exactly `exp(-dTE/T2_c)` (spin echo) or
-`exp(-dTE (1/T2_c + 1/T2'_c)) exp(i 2 pi fmap dTE)` (gradient echo); blood has `T2_blood` and inherits
-its label's `T2'` (`series.rs:495-497`); the arterial compartment has `T2_arterial`. P4's exchange
-puts the intravascular delta-M in the blood compartment and the extravascular delta-M in the tissue
-compartment (`series.rs:487-497`, `:951-954`, `:990-992`), so the spin-echo delta-M follows
+(`kspace.rs:813-830`, `:636-641`). These are factors of the **forward integrand**, per voxel of the
+simulation grid, before encoding; the reconstruction then mixes locations (sampling, window,
+inverse transform). So the echo `TE_e` multiplies the **object** of compartment `c` by
+`exp(-TE_e/T2_c(r))` (spin echo) or `exp(-TE_e (1/T2_c(r) + 1/T2'_c(r))) exp(i 2 pi fmap(r) TE_e)`
+(gradient echo), and a reconstructed echo is the acquisition of that reweighted object. Only when
+those factors are spatially constant (uniform relaxation in `class` mode, and for gradient echo a
+constant fieldmap) is echo `e+1`'s reconstructed compartment image echo `e`'s times a scalar.
+Blood has `T2_blood` and inherits its label's `T2'` (`series.rs:495-497`); the arterial
+compartment has `T2_arterial`. P4's exchange puts the intravascular delta-M in the blood
+compartment and the extravascular delta-M in the tissue compartment (`series.rs:487-497`,
+`:951-954`, `:990-992`), so at the object level (echo centre) the spin-echo delta-M follows
 
 ```
 dM(t, TE) = dM_iv(t) exp(-TE/T2b) + dM_ev(t) exp(-TE/T2t)  [+ arterial term]
@@ -404,8 +453,19 @@ into an **excitation seed** (the prepared-shot phase, unsalted: every echo of a 
 shot phase) and a **receiver seed** salted per echo (`echo_salt(0) = 0`), used for k-space noise and
 spikes (through `slice_seed`) and for image-space noise (`noise_sigma`): independent noise per echo.
 With one echo at `acq.t_echo` it is bit-identical to `simulate_acquisition_oversampled` (pinned).
+The per-volume path is today a closure inside `simulate_acquisition_oversampled`
+(`kspace.rs:1460`); it is moved into a private function taking the two seeds, which
+`simulate_acquisition_oversampled` calls with both seeds equal to its `seed` (the same arithmetic
+in the same order, so its bits do not move: the golden record and the bit-pinned tests are the
+check). `simulate_slice`, `SliceInput` and every public signature stay as they are.
 Echoes of a volume are independent 2D readouts at their own `TE`; the echo train's own k-space
 trajectory is not modeled (stated).
+
+**Memory.** Outside compat every echo borrows the same images. Under compat each echo has its own
+image set: `4 E C V N` bytes of input (`E` echoes, `C` compartments, `V` simulation voxels, `N`
+volumes; three echoes, six compartments, `64 x 64 x 32` voxels and 100 volumes is about 0.9 GiB).
+aslscan estimates it before building them and refuses past a limit (overlay
+`[multi_te] max_image_memory_gib`, default 4), naming the estimate.
 
 ## Inputs (`aslscan`)
 
@@ -415,20 +475,26 @@ trajectory is not modeled (stated).
 - An `EchoTime` array in any sidecar keeps today's rule, naming the `echo-N` layout.
 - Overlay `[multi_te] refocusing_time` (ms, default 2; spin echo only, refused otherwise): the 2D home
   for the refocusing reserve (the 2D `[readout]` table stays refused).
-- **Timing on explicit intervals**, per slice: echo `e`'s sampled block is
+- **Timing on explicit intervals.** Within one excitation: echo `e`'s sampled block is
   `[exc + TE_e - h, exc + TE_e + h]`. Gradient echo: blocks must not overlap. Spin echo: the first
   refocusing pulse is centred at `TE_1/2` and reserves `refocusing_time` about its centre; it must
   clear the excitation and end before the first block; each later pulse is centred at
-  `(TE_e + TE_{e+1})/2` and must fit between the two blocks. The last block must end before the next
-  slice's excitation, the last slice's before `TR`; the separate M0 likewise at its own `TR`.
+  `(TE_e + TE_{e+1})/2` and must fit between the two blocks. Between excitations, the checks run on
+  **excitation groups** in chronological order (slices sharing an offset, as multiband groups do,
+  `protocol.rs:1137`): a group's last block must end before the next group's excitation, the last
+  group's before `TR`; the separate M0 likewise at its own `TR`. **Under compat** every slice offset
+  is zero (`protocol.rs:2008`) by compat's own abstraction (independent slices excited together, as
+  simasl assumes); the between-group checks are waived there and the sidecar says so, the
+  within-excitation checks are not.
 
 ## The series and outputs
 
 Outside compat the series builds the compartment images once and passes the same images for every
 echo. **Under compat** the echo-time decay belongs to the signal stage (`te_factor`), so the series
 builds one image set per echo, applying `exp(-TE_e/T2)` (or `T2*`) before resampling as today, and
-passes them per echo; with one echo this is today's path. The separate M0 likewise (its own seed,
-per-echo salts). Ground truth is echo-independent and written once. Output: one series per echo,
+passes them per echo; with one echo this is today's path. The separate M0 is its own call with
+`n_volumes = 1` and its own base seed (`series.rs:1158`), per-echo salts; compat still refuses a
+separate M0 (`protocol.rs:2017`), unchanged by P6. Ground truth is echo-independent and written once. Output: one series per echo,
 `sub-X_echo-<e>_part-{mag,phase}_asl.nii.gz` with its own sidecar (scalar `EchoTime`, that echo's
 input sidecar as base), one `sub-X_aslcontext.tsv`, a separate M0 per echo, and
 `AslscanSimulation.MultiEcho`: echo times, echo formation, the noise streams, the decay statement,
@@ -480,25 +546,46 @@ benchmark H compares each echo voxelwise.
   synthetic all-ones weight vector (outside the matrix) to `1e-12`; every actual encoding row's blood
   against an independent weighted sum of `delta_m_sub`; **decoded volume `j` of a noiseless series
   without suppression, physiology, GRAPPA, spikes, motion or GE transients equals a single `deltam`
-  run with `tau_j`, `PLD_j`** (shift invariance of (P)CASL kinetics) to the linearity tolerance with a
-  tissue-scaled absolute term; the same with gradient echo after enough cycles for the transient to
-  vanish; a **transient negative case** (an included long-`TR` M0 before a low-flip encoding cycle)
-  where decoding leaks tissue and `TissueLeakage` reports it; **with physiology on**, the decoded
-  image equals the general formula `(2/H) sum_i h_ij [C_i - sum_k w_ik dM_ik]` assembled from
-  independent single-row runs scaled by the recorded per-preparation factors (not by decoding the
-  truth); the 3D schedule (`H x NumberShots` preparations, clock, maps); the input checks.
+  run with `tau_j`, `PLD_j`** (shift invariance of (P)CASL kinetics) to the tolerance stated in part
+  A (`f32` bound plus `1e-6` relative, a resolved reference, and failing for a sign flip and a swapped
+  column); the same with gradient echo after enough cycles for the transient to vanish; a
+  **transient negative case** (an included long-`TR` M0 before a low-flip encoding cycle) where the
+  decoded tissue residual `L_j` is nonzero and equals the decoded images' tissue part;
+  **with physiology on**, against an independent reference built per component, not by scaling a
+  finished image: in stationary 2D, the tissue-only images and each sub-bolus's blood-only images
+  (with exchange on, its intravascular and extravascular parts separately) are acquired by
+  single-row runs, each scaled by its own recorded per-preparation factor (tissue factor on tissue,
+  label factor on every label part, so a tissue factor wrongly applied to extravascular label is
+  caught), summed per raw volume and decoded; for gradient-echo transients the reference tissue is
+  propagated through the actual preparation history; in 3D the reference applies factors and poses
+  per preparation before line selection (through the 3D call's line weights and shot sets) and
+  then reconstructs; the 3D schedule (`H x NumberShots` preparations, clock, maps); the input
+  checks.
 - **Look-Locker**: the arrival-window partition identity to `1e-12` (both label types; arrival before,
-  during, after the readouts; the PASL `q = 0` guard); `M = 1` equals P5's gradient-echo series bit for
-  bit (legacy dispatch); the steady state equals brute-force cycle iteration until successive starts
-  differ by `1e-15 M0`; with flips at `1e-6` degrees the readout volumes equal multi-PLD single-readout
-  rows; cycle grouping and its overlay check; per-cycle suppression; the separate-M0 flip rule; the
-  timing intervals (accept and reject cases); the linearity identity per readout (control cycle -
-  label cycle - deltam cycle) and its negative control.
+  during, after the readouts; an arrival strictly between `t_1` and a delayed slice's `e_{1,z}`; the
+  PASL `q = 0` guard); `M = 1` with one scalar flip equals P5's gradient-echo series bit for bit
+  (legacy dispatch), and `M = 1` with varying flips equals brute-force propagation (generalized
+  path); the steady state equals brute-force cycle iteration until successive starts differ by
+  `1e-15 M0`; an `m0scan` between two cycles carries state as brute-force propagation does;
+  **vanishing flip** (`1e-6` degrees), suppression, presaturation and physiology off: the readout
+  blood divided by `sin(a_n)` equals the undepleted `delta_m(e_{n,z})` (a nonzero reference asserted,
+  so a zero-signal implementation fails), and the tissue equals an independently propagated
+  timeline; cycle grouping and its overlay check; per-cycle suppression; the separate-M0 flip rule;
+  the excitation-group timing (multiband, interleaved and reversed orders; accept and reject cases);
+  the linearity identity per readout between a control cycle, a label cycle and a deltam cycle with
+  matched tissue history and physiology (consecutive cycles with identical preparations, after the
+  steady state), with a negative control and a deliberately mismatched-history case that fails.
 - **Multi-TE**: one echo bit-identical (regress); echo `e` equals a single-echo run at `TE_e` (noise
-  off); spin echo, uniform compartments, no fieldmap: the IV/EV images scale between echoes by
-  `exp(-dTE/T2b)` / `exp(-dTE/T2t)` exactly, and the delta-M follows the two-compartment formula;
-  gradient echo: the same with `T2'` and the fieldmap phase; the arterial term when enabled; compat
-  benchmark H (noise off); sidecar agreement; the spin-echo refocusing-interval checks.
+  off); **scalar-ratio tests** only where they are exact (`class` mode uniform relaxation, no noise,
+  spikes or GRAPPA; for gradient echo a spatially constant fieldmap): the IV/EV images scale between
+  echoes by `exp(-dTE/T2b)` / `exp(-dTE/T2t)` (spin echo) or with `T2'` and the constant phase
+  (gradient echo), to `4 * 2^-24` of the image plus `1e-9` relative, and the delta-M follows the
+  two-compartment formula at the object level; **heterogeneous cases** (voxel-mode maps, a varying
+  fieldmap) against the input compartments reweighted per voxel by the object-level factor and
+  passed through the same forward at the first echo's timing (not against a reweighted
+  reconstructed image); the arterial term when enabled; compat benchmark H (noise off); sidecar
+  agreement; the spin-echo refocusing intervals and the excitation-group checks, including
+  multiband and multi-slice compat (waived between groups); the compat memory limit.
 - The validator passes on every P6 output (the decoded Hadamard dataset, Look-Locker, `echo-N`).
 
 # Acceptance criteria
@@ -509,13 +596,14 @@ benchmark H compares each echo voxelwise.
    validates, and writes the raw series under `sourcedata`; a GRASE variant simulates with
    `H x NumberShots` preparations.
 3. A QUASAR-like Look-Locker protocol (PASL, 2D, 12 readouts 0.3 s apart, 35 degrees) simulates,
-   reduces to single readouts at vanishing flip, and validates.
+   reduces to the undepleted kinetics at vanishing flip (matched conditions), and validates.
 4. A three-echo PCASL protocol with exchange (gradient echo `TE` 13, 32, 51 ms and a spin-echo
-   variant meeting the refocusing intervals) simulates, matches the decay formulas, its `echo-N`
-   dataset validates, and compat benchmark H passes.
+   variant meeting the refocusing intervals) simulates, matches the decay formulas under the
+   scalar-ratio conditions and the reweighted-forward reference otherwise, its `echo-N` dataset
+   validates, and compat benchmark H passes.
 5. Hadamard x multi-TE simulates and its decoded `echo-N` dataset validates.
-6. The tests above pass and the measured numbers (decoded noise, `TissueLeakage`, Look-Locker steady
-   states, multi-TE ratios, run times) are recorded in the plan.
+6. The tests above pass and the measured numbers (decoded noise, the decoded tissue residual,
+   Look-Locker steady states, multi-TE ratios, run times) are recorded in the plan.
 
 # Decisions deferred
 
@@ -575,3 +663,30 @@ source (and the cached schema) and found valid; all applied.
   not a BIDS rule: a stated convention (encoding cycles).
 - **Minor.** The Sylvester matrix has no all-labeled row: the partition test uses a synthetic weight
   vector.
+
+Second Codex adversarial design review, 2026-10-05: no blocker, 8 majors and 2 minors, each checked
+against the source and found valid; all applied. It confirmed nine of the first review's findings
+resolved and six partly resolved, and judged the new acquisition entry point implementable without
+touching `simulate_slice`, `SliceInput` or any public signature (by moving the per-volume closure into
+a private two-seed function, now stated).
+
+- **Majors.** The multi-TE decay was claimed for reconstructed images, but the factors act on the
+  object before encoding: the formulas are now at the object level, scalar-ratio tests are
+  restricted to uniform relaxation and a constant fieldmap, and heterogeneous cases compare with
+  reweighted input passed through the forward. The timing rules compared adjacent slice indices,
+  which rejects every multiband group and multi-slice compat: they now run on excitation groups in
+  time order, waived between groups under compat. Look-Locker's arrival windows used first-slice
+  times: every boundary is now slice-specific, `e_{n,z}`. `M = 1` legacy dispatch cannot represent
+  varying flips: it is limited to one scalar flip, and included `m0scan` rows under Look-Locker have
+  an explicit convention. The independent physiology reference scaled finished images: it is now
+  built per component (tissue, each sub-bolus, intravascular and extravascular), through the actual
+  preparation history for gradient-echo transients, and per preparation before line selection in
+  3D. Raw truth per raw volume was undefined for segmented 3D: truth is kinetic per raw volume with
+  today's conventions plus a per-preparation factor table. `TissueLeakage` had no definition: it is
+  now the decoded tissue-only residual `L_j`, normalized by the unsuppressed steady state over a
+  stated mask. The vanishing-flip test could fail on differing preparations or pass on a zero signal:
+  it now runs under matched conditions and divides by `sin(a)` with a nonzero reference.
+- **Minors.** The decoding tolerance is now an explicit `f32` bound plus a relative term with a
+  resolved reference and sign/permutation negative checks; the non-exact-feature metadata names
+  GRAPPA (not GRASE) and records the readout separately. Also from the review's notes: a compat
+  image-memory estimate and limit, and the separate M0 under compat stays refused.
