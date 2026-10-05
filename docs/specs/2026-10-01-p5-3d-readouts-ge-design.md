@@ -1234,3 +1234,10 @@ the band's smallest eigenvalue lying below `[lambda/10, lambda]` (measured 0.049
 32 x 32, and 0.019 at `asl001`'s 64 x 64, which the review had not checked): the interval is now
 `[lambda/100, lambda]` with 80 iterations and the claim is stated as measured; the sidecar now
 records the band.
+
+Follow-up Codex review of those fixes, 2026-10-05: no bugs. It confirmed the signing for both
+parities against the NUFFT's mode band, that the `band_spectrum` estimate approaches `lambda_min`
+from above (an estimate, not a certificate), and recomputed the band's spectrum independently
+by diagonalizing the dense restricted normal matrix: `lambda_min / lambda_hi` = 0.0485, 0.0493
+and 0.0189 for the three designs, `asl001`'s 1.89 times the interval's lower end, with an 80-step
+Chebyshev residual bound of about `2.1e-7` inside the interval.

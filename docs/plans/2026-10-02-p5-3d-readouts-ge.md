@@ -826,6 +826,11 @@ so the interval is now `[lambda/100, lambda]` with 80 iterations (`kappa = 30` w
 band-limited objects `9e-8` to `3e-6`; noise unchanged. The sidecar's reconstruction block now
 records the band.
 
+Follow-up Codex review (2026-10-05): no bugs; the band's spectrum recomputed independently from
+the dense restricted normal matrix (0.0485, 0.0493, 0.0189 of `lambda_hi`), `asl001`'s minimum
+1.89 times the interval's lower end. Gates on aslscan 715bcb0 / mrsim-acq b3f907e: TRXScan P0
+clean, `regress_identity.sh` 38 identical.
+
 ## Codex review of this plan (2026-10-02)
 
 Nine findings (1 blocker, 4 major, 4 minor), all verified and applied. The blocker was in the
