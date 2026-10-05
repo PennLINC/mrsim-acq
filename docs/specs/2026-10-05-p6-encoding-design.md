@@ -3,8 +3,9 @@
 Design spec addendum, 2026-10-05. Extends `2026-09-21-mrsim-acq-aslscan-design.md` (the main
 spec) and follows the P2-P5 addenda (`2026-09-24-p2-asldro-compat-design.md`,
 `2026-09-24-p3-motion-bs-ir-design.md`, `2026-10-01-p4-vascular-physio-design.md`,
-`2026-10-01-p5-3d-readouts-ge-design.md`). Where this document is silent, those stand. Not yet
-reviewed.
+`2026-10-01-p5-3d-readouts-ge-design.md`). Where this document is silent, those stand.
+Codex-reviewed once (2026-10-05: 1 blocker, 13 majors, 1 minor; all verified and applied; the
+review is summarized at the end).
 
 ## Context
 
@@ -14,114 +15,122 @@ The roadmap gives P6 "Encoding variety: Hadamard, Look-Locker, velocity-selectiv
 type (`ArterialSpinLabelingType` is `CASL`, `PCASL` or `PASL` in the released specification
 1.11.1, the validator's schema 1.2.7 and the specification's `master`), no BEP or open issue
 proposes one, and the ASL-BIDS paper (Clement et al., Sci Data 2022) lists velocity-selective and
-time-encoded ASL among the approaches a future release may add. A VSASL dataset would therefore
-either fail the validator or be misdescribed as PASL. See "Decisions deferred".
+time-encoded ASL among the approaches a future release may add. See "Decisions deferred".
 
-What exists today, verified against the source (`aslscan` at `715bcb0`, `mrsim-acq` at
-`b340133`):
+What exists today, verified against the source (`aslscan` and `mrsim-acq` at `p5-complete`:
+`715bcb0`, `b340133`):
 
 - **A row is one labeling and one readout.** `Row { kind, t, tau, tr }` (`rows.rs:8-38`) carries
-  one kinetic time, one bolus duration and one repetition time; `RowKind` is
-  `{M0scan, Control, Label, Deltam}`; the clock `row_start` advances by one `tr` per row (by
-  `NumberShots x tr` for a segmented 3D volume, `protocol.rs:1898-1909`). The blood image of a
-  row is one signed delta-M (`blood_sign`, `series.rs:187-203`: `-1` label, `+1` deltam).
+  one kinetic time (`t`, the excitation time from the start of labeling), one bolus duration and
+  one repetition time; `RowKind` is `{M0scan, Control, Label, Deltam}`. The clock `row_start`
+  advances by one `tr` per row, by `NumberShots x tr` for a segmented 3D volume, because each shot
+  has its own labeling (`protocol.rs:1898-1909`); 3D physiology runs per shot at
+  `row_start + shot x tr` (`series.rs:813-823`). The blood image of a row is one signed delta-M
+  (`blood_sign`, `series.rs:187-203`: `-1` label, `+1` deltam).
 - **The only multi-bolus primitive is P4's sub-bolus.** `delta_m_sub(k, .., t, a, b)`
-  (`kinetic.rs:128-137`) is the delta-M of the parcels labeled during `[a, b]` of `[0, tau]`,
-  with a partition identity tested to `1e-12` (`kinetic.rs:556-591`); its intravascular twin is
-  `delta_m_iv_sub` (`:174`). `bolus::subbolus_factors` (`bolus.rs:61-72`) produces factors only
-  from background-suppression pulses. Nothing produces a 0/1 encoding pattern.
-- **One readout per labeling, one excitation per slice per row.** The tissue timeline
-  (`longitudinal.rs:54-74`, `tissue_mz_ge` `:83-100`, `tissue_mz_ge_sequence` `:117-140`) is
-  affine in the starting `Mz`, with events that scale `Mz` (inversions, `1 - 2 eps`) and one
-  readout at `t_read`; blood under gradient echo is `sin(a) dm` with no depletion by earlier
-  readouts (`mrsignal.rs:106`). Pulses must precede the first readout (`protocol.rs:1694-1701`).
-- **One echo time per series.** `echo_time_s` is a scalar; an unequal `EchoTime` array is an
-  error naming P6 (`protocol.rs:1208-1213`); `Acquisition.t_echo` is one value per acquisition
-  call (`kspace.rs:148`). `LookLocker: true` is an error naming P6 (`protocol.rs:1023-1025`). The
-  compat translator refuses a varying `echo_time` (`tools/compat_asldro.py:357-358`).
-- **In `mrsim-acq`, `t_echo` enters only `trf`.** It is read by `LineTiming::for_acquisition`
-  (`trf = t_echo + t`, `kspace.rs:251-296`), by the gradient-echo static phase
-  `2 pi fmap TE` (`kspace.rs:636-641`) and by the timing check (`:331-350`); the line times `t`,
-  the NUFFT affinity check and the rotors do not depend on it. Noise and spikes are keyed on
-  `(volume, slice)` within one call plus the call's `seed` (`slice_seed`, `kspace.rs:1485-1489`);
-  the prepared-shot phase uses the same `seed` (`phase.rs:121-138`).
+  (`kinetic.rs:128-137`) is the delta-M of the parcels labeled during `[a, b]` of `[0, tau]` (for
+  (P)CASL a bolus of length `b - a` started `a` later); `delta_m_iv_sub` (`:174-181`) is its
+  intravascular part; the arterial term can be selected by its labeling coordinate
+  (`:213-222`). A partition identity is tested to `1e-12` (`:556-591`).
+  `bolus::subbolus_factors` produces factors only from suppression pulses.
+- **Per-row inputs are keyed to rows.** Background suppression assigns one pulse set per distinct
+  input `PostLabelingDelay` (`pulse_times_per_pld`, `protocol.rs:1610-1638`); a
+  `VascularCrushingVENC` array is expanded per row (`:1794`).
+- **One readout per labeling.** The tissue timeline (`longitudinal.rs:54-74`; `tissue_mz_ge`
+  `:83-100`; `tissue_mz_ge_sequence` `:117-140`, which carries state between rows whose
+  preparations differ, including `m0scan` rows, `series.rs:682-709`) is affine in the starting
+  `Mz` with events that scale `Mz` (inversions, `1 - 2 eps`) and one readout at `t_read`; blood
+  under gradient echo is `sin(a) dm` with no depletion (`mrsignal.rs:106`). Physiological label
+  factors are sampled at the labeling time (PASL) or averaged over the labeling window ((P)CASL)
+  (`series.rs:378-393`); motion poses are indexed by volume (`resolve_poses` takes a volume count,
+  `series.rs:1017-1020`).
+- **One echo time per series.** `echo_time_s` is a scalar; an unequal `EchoTime` array and
+  `LookLocker: true` are errors naming P6 (`protocol.rs:1208-1213`, `:1023-1025`); a `FlipAngle`
+  array is an error ("must be a number", `opt_num`, `:626-631`). Under compat the echo-time decay
+  `exp(-TE/T2)` (`T2*` under gradient echo) is applied **while building the compartment images**
+  (`te_factor`, `series.rs:615-634`) and the acquisition's relaxation is off
+  (`protocol.rs:2149-2151`). The 2D `[readout]` table is refused (`protocol.rs:1018-1019`).
+- **In `mrsim-acq`, `t_echo` enters `trf` and the gradient-echo static phase.**
+  `LineTiming::for_acquisition` gives `trf = t_echo + t` (`kspace.rs:251-296`); gradient echo adds
+  `2 pi fmap TE` to the static phase (`:636-641`); the line times `t`, the NUFFT affinity check and
+  the rotors do not depend on it. Within one call: k-space noise and spikes use `slice_seed`
+  (keyed on `(volume, slice)` and the call `seed`, `:1485-1489`, spikes `:940`, noise `:958`);
+  image-space noise (`noise_sigma`) uses the call `seed` directly (`:1512-1521`); the prepared-shot
+  phase uses the call `seed` (`:1480-1482`). The public function returns magnitude and phase in
+  `f32` (`:1524-1525`); aslscan rebuilds complex values (`complex_from`, `series.rs:1250-1251`).
 
-What BIDS settles (schema 1.2.7, `rules/sidecars/asl.yaml`, `rules/checks/asl.yaml`):
+What BIDS settles (schema 1.2.7):
 
-- **Look-Locker**: `LookLocker` (boolean, optional) true makes `FlipAngle` required
-  (`MRIFlipAngleLookLockerTrue`), here and in `*_m0scan.json`; `FlipAngle` may be an array, one
-  value per volume, whose length must equal both the NIfTI `dim[4]` and the `aslcontext.tsv` rows
-  (an error). `PostLabelingDelay` is an array "for multi-PLD and Look-Locker", one value per
-  volume in acquisition order, `0` for `m0scan`, length-checked as an error. Each Look-Locker
-  readout is its own volume and its own `aslcontext.tsv` row. `RepetitionTimeExcitation` is not an
-  ASL key.
-- **Multi-TE**: the `echo` entity is allowed on `_asl`, `_m0scan` and `_noRF` files (since
-  specification PR #1884); `aslcontext.tsv` takes no `echo` entity, so one `sub-X_aslcontext.tsv`
-  is inherited by every `echo-N` series. Each series has a scalar `EchoTime`.
-- **Hadamard / time-encoded**: no representation. The raw encoded volumes are neither `control`
-  nor `label`. What validates is the **decoded** form: one `deltam` volume per sub-bolus, with
-  `PostLabelingDelay` and `LabelingDuration` arrays giving each sub-bolus's effective delay and
-  duration (both length-checked as errors). `aslcontext.tsv`'s `volume_type` enum is `control`,
-  `label`, `m0scan`, `deltam`, `cbf`, `noRF`.
+- **Look-Locker**: `LookLocker` (boolean, optional) true makes `FlipAngle` required **for that
+  file** (`MRIFlipAngleLookLockerTrue` applies to a file whose resolved sidecar has
+  `LookLocker: true`); `FlipAngle`, `PostLabelingDelay` and `LabelingDuration` arrays have one value
+  per volume and error-level length checks against both `dim[4]` and the `aslcontext.tsv` rows.
+- **Multi-TE**: `rules.files.raw.perf` allows the `echo` entity on `_asl`, `_m0scan` and `_noRF` but
+  not on `aslcontext.tsv`, and `meta.associations.aslcontext` with the validator's subset-entity
+  inheritance (validator 3.0.2, `files/inheritance.ts:41-47`) associates one echo-less
+  `aslcontext.tsv` with every `echo-N` series. An `EchoTime` array's length check is a warning.
+- **Hadamard / time-encoded**: no representation. `volume_type` is `control`, `label`, `m0scan`,
+  `deltam`, `cbf`, `noRF`; the raw encoded volumes are none of these. `TotalAcquiredPairs` is "the
+  number of acquired control-label pairs" and is checked against the control and label counts only
+  when control rows exist.
 
-simasl (ASLDRO v2.2.0) implements none of the three: one Buxton evaluation per series
-(`examples.py:125-150`), `pasl`/`casl`/`pcasl` only (`filters/gkm_filter.py:95-97`), no
-Look-Locker or encoding. It does carry a per-volume `echo_time` list
+simasl (ASLDRO v2.2.0) implements none of the three, but carries a per-volume `echo_time`
 (`validators/user_parameter_input.py:243-249`, applied at `examples.py:199`) with a
-single-compartment `exp(-TE/T2)`; that is the one P6 case it can check (part C, "compat").
+single-compartment `exp(-TE/T2)`: the one P6 case it can check (part C).
 
 ## The one idea underneath
 
-P1-P5 identify a volume with **one labeling followed by one readout**. All three P6 features
-break that identity in a different direction, and each is a re-indexing rather than new physics:
+P1-P5 identify a volume with **one labeling (a preparation) followed by one readout**. P6 breaks
+that identity in three directions, each a re-indexing of existing physics:
 
-- **Hadamard** puts several labelings (sub-boli, each on or off) in **one** volume. Kinetics are
-  linear in the labeling, so an encoded volume's blood image is a 0/1-weighted sum of P4
-  sub-bolus delta-Ms, which already exist (`delta_m_sub`), and decoding is a fixed linear
-  combination of reconstructed volumes.
-- **Look-Locker** puts several readouts after **one** labeling. Each readout is an event on the
-  existing affine `Mz` timeline (it scales `Mz` by `cos(a)` exactly as an inversion scales it by
-  `1 - 2 eps`), and the label it reads has been depleted by the readouts before it, which splits
-  the kinetic integral by arrival window.
-- **Multi-TE** reads several echoes after **one** excitation. The compartment images are the same
-  for every echo; only the acquisition's `t_echo` changes, and the blood and tissue compartments
-  already decay with their own T2 (and P4's exchange already splits delta-M into intravascular
-  and extravascular parts, which is the two-compartment multi-TE model of Gregori et al.).
+- **Hadamard** puts several sub-boli, each on or off, in **one preparation**. Kinetics are linear
+  in the labeling, so an encoded preparation's blood image is a 0/1-weighted sum of P4 sub-bolus
+  delta-Ms, and decoding is a fixed linear combination of reconstructed volumes.
+- **Look-Locker** puts several readouts after **one preparation**. Each readout is an event on the
+  affine `Mz` timeline (a `cos(a)` scaling, like an inversion's `1 - 2 eps`), and the label it reads
+  has been depleted by the readouts after its arrival.
+- **Multi-TE** reads several echoes after **one excitation**. The longitudinal state is the same for
+  every echo; the transverse decay differs per compartment, which the acquisition already applies.
 
-So the new structure is a **labeling cycle** (`aslscan`): one labeling (possibly encoded) and one
-or more readouts (Look-Locker), each readout producing one volume per echo (multi-TE). Every
-existing protocol is a cycle with one unencoded labeling, one readout and one echo, and keeps its
-bytes.
+So aslscan gains an explicit **schedule** with three indices: a **preparation** (one labeling, with
+its suppression and crushing; P5's shots are preparations), a **raw volume** (one reconstructed
+image per readout, made of one or more preparations in 3D), and an **output volume** (what is
+written: the raw volume, or a decoded combination). Every existing protocol is the identity
+schedule, and its code path is unchanged (below).
 
 ## Scope
 
 In: Hadamard time-encoded (P)CASL for 2D and 3D readouts (part A); Look-Locker readouts for 2D EPI
 under gradient-echo excitation (part B); multi-TE for 2D EPI, spin echo and gradient echo, with the
-`echo-N` layout (part C); the combination Hadamard x multi-TE. Out, with reasons under "Decisions
-deferred": velocity-selective labeling; Look-Locker with 3D readouts; multi-TE with 3D readouts;
-Look-Locker x Hadamard and Look-Locker x multi-TE; vessel-encoded labeling; Walsh-ordered or
-non-Sylvester encoding matrices; the arterial (QUASAR) compartment under Look-Locker.
+`echo-N` layout (part C); Hadamard x multi-TE. Out, with reasons under "Decisions deferred":
+velocity-selective labeling; Look-Locker and multi-TE with 3D readouts; Look-Locker x Hadamard and
+Look-Locker x multi-TE; vessel-encoded labeling; non-Sylvester matrices; the arterial (QUASAR)
+compartment and the other P4 parts under Look-Locker.
 
-**Byte identity.** With no P6 input, every output is unchanged, in the three places P5 established:
+**Byte identity.** With no P6 input, every output is unchanged:
 
-- **TRXScan** (`p0-mrsim-acq-extraction`, now published at `12a9d09`): the P0 gate
-  (`tools/run_p0_baseline.sh`, diff against `tests/fixtures/p0_baseline/checksums.txt`, both
-  feature sets). P6 adds **no field** to `Acquisition` or `SliceInput` and changes no existing
-  signature, so TRXScan needs no source change: both structs are built with every field named at
-  `trxscan.rs:828` and in TRXScan's benchmark and test literals, which a new field would break.
-- **mrsim-acq**: the golden record (`tests/golden_baseline.rs`, `tests/fixtures/p4_baseline/`) and
-  every bit-pinned test. The one new entry point (part C) calls the existing per-volume code with a
-  per-echo `Acquisition` clone; with one echo equal to the series `t_echo` and the echo index 0 it
-  computes exactly what `simulate_acquisition_oversampled` computes, and a test pins that bit for
-  bit.
-- **aslscan**: `tools/regress_identity.sh` against `p5-complete` with `mrsim-acq` at its
-  `p5-complete`, both feature sets, all 19 cases. The default path builds one-cycle rows exactly as
-  today; a test pins that the cycle structure of every existing fixture is "one labeling, one
-  readout, one echo" and that `simulate` takes the existing code path for it.
+- **TRXScan** (`p0-mrsim-acq-extraction`, `12a9d09`): the P0 gate. P6 adds **no field** to
+  `Acquisition` or `SliceInput` and changes no existing signature (TRXScan builds both with every
+  field named, `trxscan.rs:828`, `benchmark.rs:84`), so TRXScan needs no source change; the gate
+  checks the bytes.
+- **mrsim-acq**: the golden record and every bit-pinned test; the new entry point (part C) is a
+  separate function whose one-echo case is pinned bit for bit against
+  `simulate_acquisition_oversampled`.
+- **aslscan**: `tools/regress_identity.sh` against **`p5-complete`** for both repositories, both
+  feature sets. Its 19 cases are all P1-P4 (`regress_identity.sh:125-144`), so P6 first adds P5
+  cases to it, run against `p5-complete` before any P6 change: gradient echo at 90 and 35 degrees
+  with mixed preparations and an included M0 (state propagation), gradient-echo separate M0,
+  GRASE (`asl005_p5`), spiral (`asl001_p5`), and a segmented GRASE case with physiology and a
+  shot event.
+- **Explicit legacy dispatch**: when no P6 input is present the series takes today's code path,
+  not a generalized schedule evaluated with identity indices (generic timeline arithmetic is known
+  to differ in the last bits from the closed forms, `longitudinal.rs:51-53`). Likewise
+  Look-Locker with one readout dispatches to P5's functions, and multi-TE with one echo to the
+  existing acquisition call.
 
 **Activation and refusals** (the P4 rule): Hadamard by an overlay `[hadamard]` table, Look-Locker
 by `LookLocker: true`, multi-TE by more than one `--asl-json`. Every P6 input belonging to a feature
-that is off is an error naming it, and every refused combination is an error naming both features.
+that is off is an error naming it; every refused combination is an error naming both.
 
 ---
 
@@ -130,107 +139,125 @@ that is off is an error naming it, and every refused combination is an error nam
 ## What is modeled
 
 A (P)CASL labeling of total duration `tau_tot = sum_j tau_j` divided into `N` consecutive
-sub-boli, `j = 1..N` in time order (sub-bolus 1 is labeled first, so it is the oldest at the
-readout), followed by a delay `PLD` to the readout. An **encoding cycle** is `N + 1` acquisitions;
-acquisition `i` labels sub-bolus `j` when `h_ij = -1` and controls it when `h_ij = +1`, where `h`
-is the Sylvester Hadamard matrix of order `N + 1` (a power of two: 4, 8, 16, 32) with its all-ones
-first column removed (Dai et al., MRM 2013; Teeuwisse et al., MRM 2014). The overlay gives `N + 1`.
+sub-boli, `j = 1..N` in time order (sub-bolus 1 is labeled first), followed by a delay `PLD` to the
+excitation. An **encoding cycle** is `H = N + 1` encoded preparations; preparation `i` labels
+sub-bolus `j` when `h_ij = -1` and controls it when `h_ij = +1`, `h` the Sylvester Hadamard matrix
+of order `H` (4, 8, 16 or 32) with its all-ones first column removed (Dai et al., MRM 2013;
+Teeuwisse et al., MRM 2014). Encoding row 1 labels nothing; every other row labels `H/2` sub-boli.
 
-**Kinetics.** Sub-bolus `j` occupies `[a_j, b_j]` of `[0, tau_tot]` (`a_1 = 0`,
-`b_j = a_j + tau_j`). The labeled parcels of acquisition `i` are the union of the sub-boli it
-labels, so its blood delta-M is
+**Kinetics.** Sub-bolus `j` occupies `[a_j, b_j]` of `[0, tau_tot]`. Preparation `i`'s blood
+delta-M is
 
 ```
 dM_i(t) = sum_j w_ij * dM_sub(t; a_j, b_j),     w_ij = (1 - h_ij) / 2  in {0, 1}
 ```
 
-with `dM_sub` P4's `delta_m_sub` (and, under exchange, `delta_m_iv_sub` for the intravascular
-part), evaluated at the readout time `t = tau_tot + PLD` plus the slice offset. This is exact for
-the linear kinetic model; the partition identity (`kinetic.rs:556-591`) already guarantees that the
-all-labeled acquisition equals the unencoded bolus of duration `tau_tot`. The tissue of every
-encoded acquisition is the control tissue (the labeling RF saturates nothing in the imaged slices,
-the P1 assumption). The raw acquisition's image is `tissue - dM_i` (the label sign convention).
+with `dM_sub` P4's `delta_m_sub` (`delta_m_iv_sub` for the intravascular part under exchange, and
+the arterial term restricted to the labeled parcels), at `t = tau_tot + PLD` plus the slice offset.
+This is exact for the linear kinetic model. The raw image is `tissue - dM_i` (label subtracts).
+**PASL is refused**: time encoding needs a labeling switched during the bolus.
 
-**PASL is refused** with Hadamard: time encoding needs a labeling that can be switched on and off
-during the bolus (continuous or pseudo-continuous labeling). CASL and PCASL are allowed.
-
-**Decoding.** The columns of `h` sum to zero and are orthogonal (`sum_i h_ij h_ik = (N+1) delta_jk`),
-so with `S_i = C - sum_j w_ij dM_j`,
+**Decoding.** With `S_i = C_i - sum_j w_ij dM_ij` (tissue `C_i` and sub-bolus signals `dM_ij` as
+acquired in preparation `i`), the columns of `h` sum to zero and are orthogonal, so
 
 ```
-D_j = (2 / (N+1)) * sum_i h_ij * S_i = dM_j
+D_j = (2 / H) * sum_i h_ij * S_i
+    = dM_j                                       when C_i = C and dM_ij = dM_j for every i
+    = (2/H) sum_i h_ij C_i  -  (2/H) sum_i h_ij sum_k w_ik dM_ik     in general
 ```
 
-exactly, for any common `C`. aslscan decodes the **reconstructed complex images** (before the
-magnitude), per cycle, voxel by voxel, in `f64`: linear and exact when noise is off. The noise of a
-decoded image is that of one raw image times `2 / sqrt(N+1)` (measured and recorded, not asserted:
-the reconstruction's own noise transfer is unchanged).
+The general form is what a scanner gets: tissue that differs between encoded preparations
+(gradient-echo transients after an M0 or a differently prepared row, physiological tissue
+factors) leaks into every decoded sub-bolus, and preparation-dependent label factors
+(physiology) mix sub-boli. aslscan keeps that physics; it does not force a common `C`. The sidecar
+reports, per cycle, the largest tissue difference across its encoded preparations
+(`TissueLeakage`, relative to the tissue mean), so a user sees when decoding is not clean.
+
+aslscan decodes the reconstructed complex images per cycle in `f64`, from the acquisition's `f32`
+magnitude and phase. Decoding is a fixed linear map, so it is exact **when the acquisition is the
+same linear operator for every preparation of the cycle**: no GRAPPA (its weights are calibrated
+per volume, `kspace.rs:1335-1360`), no spikes (placed per volume at its own peak, `:926-943`), the
+same pose, and up to the `f32` rounding of the tissue (an absolute error of order `1e-7` of the
+tissue magnitude, which the tests' tolerance scales with). GRAPPA, spikes and motion are allowed and
+decode into realistic artefacts; the sidecar says which were on.
+
+The decoded noise SD is the raw SD times `2/sqrt(H)` (measured, not asserted).
 
 ## Inputs
 
-The input describes the dataset that will be written, the **decoded** form, plus the encoding:
+The input describes the **decoded** dataset to be written, plus the encoding:
 
-- `aslcontext.tsv`: `deltam` rows, `N` per cycle, in sub-bolus order `j = 1..N`, any number of
-  cycles, and `m0scan` rows anywhere. `control` and `label` rows are refused with Hadamard (the raw
-  encoded volumes are generated, not listed).
-- `LabelingDuration`: an array, one per row, `tau_j` for the `deltam` rows (the same per cycle),
-  `0` for `m0scan`; a scalar means equal sub-boli.
-- `PostLabelingDelay`: an array, one per row, the **effective** delay of each sub-bolus,
-  `PLD_j = PLD + sum_{k>j} tau_k` (the time from the end of sub-bolus `j` to the readout, BIDS's
-  definition applied per sub-bolus). aslscan recovers `PLD = PLD_N` and checks every `PLD_j`
-  against the formula to `1e-6` s, naming the first mismatch.
-- `RepetitionTimePreparation`: the raw acquisition's repetition (one per raw acquisition, so a
-  scalar or an array over the `deltam` rows constant within a cycle).
-- Overlay `[hadamard]`: `order = N + 1` (required; 4, 8, 16 or 32), and nothing else. `N` must
-  equal the number of `deltam` rows per cycle; the `deltam` count must be a multiple of `N`.
+- `aslcontext.tsv`: `deltam` rows, `N` per cycle, in sub-bolus order, and `m0scan` rows **only
+  between cycles** (before the first, between two, after the last). `control` and `label` rows are
+  refused with Hadamard.
+- `LabelingDuration`: per row, `tau_j` for the `deltam` rows (identical in every cycle), `0` for
+  `m0scan`; a scalar means equal sub-boli.
+- `PostLabelingDelay`: per row, the effective delay of each sub-bolus,
+  `PLD_j = PLD + sum_{k>j} tau_k` (sub-bolus end to excitation, BIDS's definition per sub-bolus);
+  aslscan takes `PLD = PLD_N` and checks every `PLD_j` to `1e-6` s, naming the first mismatch.
+- `RepetitionTimePreparation`: the preparation repetition, constant within a cycle.
+- **Per-preparation inputs are per cycle.** Background suppression: the pulse set is resolved
+  once per cycle; under P3's `pulse_times_per_pld` the cycle's `deltam` rows must all map to the
+  same set (they carry `N` different effective PLDs, so an overlay listing sets per PLD must list
+  the same set for all of them, else an error naming the cycle). `VascularCrushingVENC`: a scalar,
+  or an array constant within each cycle (broadcast to the cycle's preparations).
+- Overlay `[hadamard]`: `order = H` (required; 4, 8, 16 or 32). `N = H - 1` must equal the number
+  of `deltam` rows per cycle.
 
-Each cycle is `N + 1` raw acquisitions, each one repetition, in matrix-row order; the clock
-`row_start` advances by one `tr` per raw acquisition. A raw acquisition's readout window is checked
-as today (`t + max slice offset <= tr`, `t = tau_tot + PLD`).
+## The schedule
 
-## The series
+Each cycle is `H` **raw volumes** in matrix-row order; each raw volume is one preparation in 2D and
+`NumberShots` preparations in 3D (every shot of a raw volume repeats that raw volume's encoding row;
+P5's shot order, per-shot physiology and motion are unchanged), each one `tr`. So a cycle is
+`H x NumberShots` preparations and the clock advances by `NumberShots x tr` per raw volume. `m0scan`
+rows sit between cycles as one raw volume each (`NumberShots` preparations in 3D, as today).
 
-Rows become **raw acquisitions**: a new `RowKind::Encoded { cycle, i }` with `t = tau_tot + PLD`,
-`tau = tau_tot`, the cycle's `tr`, and the encoding row `w_i`. The blood image of an encoded row is
-`-sum_j w_ij dM_sub(.; a_j, b_j)`, through the same per-voxel path as a label row's (P4's label
-path when exchange, bolus-position suppression, physiology or the arterial compartment is on, with
-the arterial term also summed over the labeled sub-boli; the P1 path otherwise). `m0scan` rows are
-unchanged and are carried into both the raw and the decoded series at their positions.
+aslscan publishes the maps: decoded row -> (cycle, sub-bolus); raw volume -> (cycle, encoding row,
+first preparation, preparation count); `m0scan` row -> its raw volume.
 
-Everything per volume applies to the **raw** acquisitions, which are what the scanner acquires:
-noise and spikes, motion poses and shot events, physiological factors (each raw acquisition has
-its own labeling window `[row_start, row_start + tau_tot]`), background suppression (pulses timed
-from the start of labeling, so they fall after `tau_tot` under the global model; the bolus-position
-model applies its factors per sub-bolus parcel as P4 does). The one acquisition call simulates all
-raw volumes.
+Rows become raw volumes of a new `RowKind::Encoded { cycle, row }`, `t = tau_tot + PLD`,
+`tau = tau_tot`, with the encoding weights `w_i`. The blood image of an encoded raw volume is
+`-sum_j w_ij dM_sub(.; a_j, b_j)` through the same per-voxel path as a label row (P4's label path
+when exchange, bolus-position suppression, physiology or the arterial compartment is on, P1's
+otherwise). Everything per preparation or per volume applies to the raw volumes: noise and spikes,
+poses and shot events, physiological factors (each preparation's labeling window is its own
+`[start, start + tau_tot]`), suppression (pulses from the start of labeling; after `tau_tot` under
+the global model; per parcel under P4's bolus-position model). One acquisition call simulates all
+raw volumes; decoding follows it.
 
-Decoding follows the call: per cycle, `D_j = (2/(N+1)) sum_i h_ij S_i` on the complex images
-(`simulate_acquisition_oversampled` returns magnitude and phase in `f32`; the series converts back
-to complex, as `complex_from` already does, and decodes in `f64`). The decoded volumes, in
-sub-bolus order, with the `m0scan` volumes at their input positions, are the main output.
+## Ground truth
 
-**Ground truth**: `desc-deltam_gt` holds, per decoded volume, the true `dM_j` (the sum of its
-parcels, at its own timing), and the P4 ground truths likewise per sub-bolus. The raw series'
-ground truth (per raw acquisition, the encoded sum) is written beside the raw data.
+Two truths, named apart:
+
+- **Ideal sub-bolus truth** (main dataset, `desc-deltam_gt`, per decoded volume): `dM_j` from the
+  kinetics alone, at the sub-bolus's own timing, without physiological factors, unmoved (static,
+  since a decoded volume has no single pose; the sidecar says so). The P4 truths
+  (`deltamIntravascular`, `deltamArterial`, `deltamSuppressed`) likewise per sub-bolus.
+- **Raw acquisition truth** (`sourcedata`, per raw volume): the encoded `sum_j w_ij dM_sub` with the
+  preparation's physiological and suppression factors, moved with the raw volume's pose, as P3/P4
+  write `desc-deltam_gt` today.
 
 ## Outputs
 
-- **Main dataset** (validates): the decoded series, `aslcontext.tsv` as input, the input
-  `PostLabelingDelay` and `LabelingDuration` arrays, `TotalAcquiredPairs` the `deltam` count (the
-  existing rule), and `AslscanSimulation.Hadamard`: the order, the matrix (rows of `+1/-1`), the
-  sub-bolus boundaries `[a_j, b_j]`, `PLD`, the raw volume count, the decoding rule, and the noise
-  scaling `2/sqrt(N+1)`.
-- **Raw series** under `sourcedata/sub-X/[ses-Y/]perf/`: the `N + 1` raw volumes per cycle (plus
-  the `m0scan` volumes), `part-mag`/`part-phase`, a sidecar carrying the matrix, the raw volume
-  order and each raw volume's labeled sub-boli, and a `sourcedata` `aslcontext`-like TSV with a
-  column `encoding_row` (`sourcedata` is not validated; the file names follow BIDS so that tools
-  find them). The raw ground truth sits beside it.
+- **Main dataset** (validates): the decoded series (`deltam` in sub-bolus order per cycle, `m0scan`
+  as raw volumes between cycles), the input arrays, and `AslscanSimulation.Hadamard`: the order, the
+  matrix, `[a_j, b_j]`, `PLD`, the maps above, the preparation, raw and decoded counts, the decoding
+  rule, `2/sqrt(H)`, `TissueLeakage` per cycle, and which non-exact features were on (GRASE/spikes/
+  motion/physiology/transients).
+- **`TotalAcquiredPairs`**: BIDS defines it as acquired control-label pairs, which a Hadamard
+  acquisition does not have. aslscan writes the **number of encoding cycles** (each cycle gives one
+  measurement of every sub-bolus, the role a control-label pair plays for one PLD) and states the
+  convention in `AslscanSimulation.Hadamard.TotalAcquiredPairsConvention`; the validator does not
+  check it for `deltam`-only contexts, which this design does not take as an endorsement.
+- **Raw series** under `sourcedata/sub-X/[ses-Y/]perf/`: the raw volumes, `part-mag`/`part-phase`,
+  a sidecar with the matrix and the maps, a TSV with one row per raw volume (`cycle`,
+  `encoding_row`, `labeled_subboli`, `first_preparation`), and the raw truth.
 
 ## Refusals
 
-PASL; `control`/`label` rows; `order` not a power of two in `[4, 32]`; inconsistent effective PLDs;
-`LabelingDuration` varying across cycles; `[hadamard]` with `LookLocker: true` (deferred); compat
-(simasl has no encoding).
+PASL; `control`/`label` rows; `m0scan` inside a cycle; `order` not in {4, 8, 16, 32}; inconsistent
+effective PLDs; `LabelingDuration` varying across cycles; suppression or VENC varying within a cycle;
+Look-Locker; compat.
 
 ---
 
@@ -238,93 +265,92 @@ PASL; `control`/`label` rows; `order` not a power of two in `[4, 32]`; inconsist
 
 ## What is modeled
 
-After one labeling, `M` readouts at times `t_1 < ... < t_M` (from the start of labeling for
-(P)CASL, the kinetic convention), each a low-flip gradient-echo excitation of every slice in turn
-(`a_n`, the slice's own excitation at `t_n + slice offset`), each producing one volume. The
-labeling cycle repeats every `TR`. This is the ITS-FAIR / QUASAR family (Gunther et al., MRM 2001;
-Petersen et al., MRM 2006) without the QUASAR crushed/uncrushed arterial separation, which is
-deferred.
+After one preparation, `M` readouts at `t_1 < ... < t_M` (excitation times from the start of
+labeling, the existing kinetic convention), each a low-flip gradient-echo excitation `a_n` of every
+slice in turn (slice `z` at `t_n + offset_z`), each producing one raw volume. The cycle repeats every
+`TR`. This is the ITS-FAIR / QUASAR family (Gunther et al., MRM 2001; Petersen et al., MRM 2006)
+without QUASAR's crushed/uncrushed arterial separation (deferred).
 
-**Tissue.** For one slice, the cycle is a sequence of events on `Mz`: background-suppression
-inversions (`1 - 2 eps`, before the first readout as today) and the readouts (`cos(a_n)` each),
-with T1 recovery between them, and the transverse signal of readout `n` is `sin(a_n) Mz(t_n^-)`.
-The whole cycle is affine in the starting `Mz`, so its steady state is the same fixed-point solve
-as P5's `tissue_mz_ge` with the event list extended; at `M = 1` it **is** `tissue_mz_ge`, and at
-`M = 1`, `a = 90` it is P3's `tissue_mz` (both pinned by test). Cycles with different preparations
-(control and label differ only in blood; suppression may differ per PLD set) propagate state cycle
-to cycle as P5's `tissue_mz_ge_sequence` does.
+**Tissue.** Per slice, the cycle is a list of events on `Mz`: suppression inversions (`1 - 2 eps`,
+before the first readout as today) and the slice's own readouts (`cos(a_n)` each, at
+`t_n + offset_z`), with T1 recovery between them; readout `n`'s transverse signal is
+`sin(a_n) Mz(t_n + offset_z, before the pulse)`. The cycle is affine in the starting `Mz`, so its
+steady state is P5's fixed point with the event list extended, solved per slice, and cycles with
+different preparations carry state forward as `tissue_mz_ge_sequence` does. One readout
+(`M = 1`) dispatches to P5's `tissue_mz_ge` and `tissue_mz_ge_sequence` themselves.
 
-**Blood.** Label magnetization that has arrived in the imaged slice is depleted by every readout
-of that slice after its arrival; label still in transit is not (the labeling plane and the feeding
-arteries are outside the imaged slices, the P1 geometry). The delta-M read at readout `n` therefore
-splits by arrival window:
+**Blood.** The readout depletes the difference magnetization of label that has **arrived** in the
+imaged slice (the excitation scales `Mz` of both control and label by `cos(a)`, so their difference
+by the same factor); label in transit is outside the imaged slices (the P1 geometry) and is not
+depleted. The delta-M read at readout `n` splits by arrival window:
 
 ```
 dM_n = sum_{k=0}^{n-1} [ prod_{m=k+1}^{n-1} cos(a_m) ] * dM_arr(t_n; t_k, t_{k+1})      (t_0 = 0)
 ```
 
-where `dM_arr(t; u1, u2)` is the delta-M at time `t` of the label that **arrived** during
-`[u1, u2)`. For the (P)CASL Buxton model the arterial input is `2 alpha M0b f exp(-delta/T1b)` on
-`[delta, delta + tau]` and the residue is `exp(-(t - u)/T1')`, so
+with `dM_arr(t; u1, u2)` the delta-M at `t` of the label that arrived during `[u1, u2)`, residue
+`exp(-(t - u)/T1')` after arrival (the existing GKM's `T1'`, `1/T1' = 1/T1t + f/lambda`):
 
-```
-dM_arr(t; u1, u2) = 2 alpha M0b f exp(-delta/T1b) T1' (exp(-(t - u_hi)/T1') - exp(-(t - u_lo)/T1'))
-u_lo = max(u1, delta),  u_hi = min(u2, delta + tau, t),  zero when u_hi <= u_lo
-```
+- (P)CASL, input `2 alpha M0b f exp(-delta/T1b)` on `[delta, delta + tau]`:
+  `dM_arr = 2 alpha M0b f exp(-delta/T1b) T1' (exp(-(t - u_hi)/T1') - exp(-(t - u_lo)/T1'))`,
+  `u_lo = max(u1, delta)`, `u_hi = min(u2, delta + tau, t)`, zero when `u_hi <= u_lo`.
+- PASL, input `2 alpha M0b f exp(-u/T1b)` on `[delta, delta + tau]`, `q = 1/T1b - 1/T1'`:
+  `dM_arr = 2 alpha M0b f exp(-t/T1') (exp(-q u_lo) - exp(-q u_hi)) / q`, keeping the existing
+  GKM's guard at `q = 0` (it returns zero there, `kinetic.rs:92-105`, not the continuous limit).
 
-and for PASL the input is `2 alpha M0b f exp(-u/T1b)` on `[delta, delta + tau]`, which integrates in
-closed form the same way. The windows partition `[0, t_n)`, so with every `cos(a_m) = 1` the sum
-is today's `delta_m(t_n)` (a partition identity, pinned to `1e-12` like P4's). The read signal is
-`sin(a_n) dM_n`. These functions are new in `kinetic.rs` (`delta_m_arrival`), with the GKM's
-existing guards; exchange, the arterial compartment, crushing and bolus-position suppression are
-refused under Look-Locker (their arrival-window forms are deferred), physiology and motion are
-allowed (per readout volume, on the cycle's clock).
+The windows partition `[0, t_n)`, so with every `cos(a_m) = 1` the sum is `delta_m(t_n)` (pinned to
+`1e-12`). The read signal is `sin(a_n) dM_n`. New in `kinetic.rs` as `delta_m_arrival`. Exchange, the
+arterial compartment, crushing and bolus-position suppression are refused under Look-Locker.
 
-**Acquisition.** Each readout is one volume of the existing single acquisition call, gradient-echo
-echo formation (P5 part A), `t_echo` the series `EchoTime`. The flip enters only the signal stage
-(`sin(a_n)` and the `cos(a_n)` events), so `mrsim-acq` is unchanged for part B.
+**Physiology and motion.** One labeling factor per cycle (sampled or window-averaged at the cycle's
+labeling, as today), shared by all its readouts; the tissue factor of readout `n` at
+`cycle start + t_n + offset_z`. Motion keeps today's convention: poses indexed by volume, so each
+readout volume has its own pose (the sidecar says the pose index is the volume, not a time).
+
+**Acquisition.** Each readout is one volume of the existing single call, gradient-echo echo
+formation, `t_echo` the series `EchoTime`; the flip enters only the signal stage, so `mrsim-acq` is
+unchanged for part B.
 
 ## Inputs
 
-- `LookLocker: true`; `acq_contrast = "ge"` (the overlay's `[signal]`; spin echo with Look-Locker
-  is refused: a Look-Locker readout is a low-flip gradient echo); 2D only.
-- `FlipAngle`: required (the BIDS rule); a scalar or an array, one per volume (in `(0, 90]` for
-  the readouts; `m0scan` entries are their own excitation's flip).
-- `PostLabelingDelay`: an array, one per volume, the readout's delay (BIDS: "for multi-PLD and
-  Look-Locker"). For (P)CASL `t_n = tau + PLD_n`; for PASL `t_n = PLD_n` (the existing rules).
-- **Cycles from the arrays.** A cycle is a maximal run of consecutive non-`m0scan` rows of the
-  same `volume_type` with strictly increasing `PostLabelingDelay` and equal `RepetitionTimePreparation`
-  and `LabelingDuration`; a new cycle starts when the type changes or the delay does not increase.
-  An optional overlay `[look_locker] readouts_per_cycle = M` makes the grouping explicit and is
-  checked against the arrays (an error naming the first row that disagrees).
-- Timing: each readout's slices must finish before the next readout begins
-  (`t_n + max slice offset + readout duration <= t_{n+1}`, the readout duration being
-  `TotalReadoutTime` plus the half echo time before the centre), and the last before `TR`.
+- `LookLocker: true`; overlay `[signal] acq_contrast = "ge"` (spin echo with Look-Locker is refused);
+  2D only.
+- `FlipAngle`: required; scalar or one per volume, `(0, 90]` for readouts; `m0scan` entries are
+  that volume's own excitation.
+- `PostLabelingDelay`: one per volume. (P)CASL `t_n = tau + PLD_n`, PASL `t_n = PLD_n`.
+- **Cycles from the arrays**: a cycle is a maximal run of consecutive non-`m0scan` rows of the same
+  `volume_type` with strictly increasing `PostLabelingDelay` and equal `RepetitionTimePreparation`
+  and `LabelingDuration`; optional overlay `[look_locker] readouts_per_cycle = M` is checked against
+  that grouping. Suppression is resolved once per cycle (all readouts of a cycle must map to the same
+  pulse set), and pulses must precede the cycle's first excitation.
+- **Separate M0**: its excitation flip is the overlay `[m0] flip_angle` (degrees), required when the
+  ASL `FlipAngle` is an array; when it is a scalar the M0 takes that scalar. The M0's signal and its
+  sidecar `FlipAngle` use the same resolved value. The M0 sidecar is not a Look-Locker file (no
+  `LookLocker: true`).
+- **Timing on explicit intervals**: for every slice excitation at `e = t_n + offset_z`, the sampled
+  readout is `[e + TE - h, e + TE + h]` (`h` half the EPI block, the sample times
+  `TE + time_from_max_echo`, `readout.rs:60-67`); it must end before the next slice's excitation in
+  the same readout and the last slice's before the next readout's first excitation, the last
+  readout's before `TR`, and every sample must follow its excitation (the existing check).
 
-The clock: `row_start` advances by one `TR` per **cycle**; a readout volume's time is
-`row_start + t_n` (physiology and motion use it).
+The clock advances one `TR` per cycle; readout volume times are `cycle start + t_n`.
 
 ## Outputs
 
-The volumes are written as they are acquired (one per readout per cycle), with the input arrays,
-`LookLocker: true`, `FlipAngle` as resolved (an array when the input was), and
-`AslscanSimulation.LookLocker`: the cycles (start row, readout count, readout times, flips), the
-tissue model ("affine timeline with readout events, steady state per slice"), the blood model
-(the arrival-window sum), and the refused P4 parts. The `m0scan` sidecar of a separate M0 gets
-`FlipAngle` (required by BIDS under Look-Locker). `pixdim[4]` stays the first non-`m0scan` row's
-`tr` (BIDS's ASL timing is in the sidecar arrays); the sidecar says so.
+The raw volumes as acquired, the input arrays, `LookLocker: true`, `FlipAngle` as resolved, and
+`AslscanSimulation.LookLocker`: the cycles (first row, readout count, times, flips), the tissue and
+blood models, the refused P4 parts. `pixdim[4]` stays the first non-`m0scan` row's `tr`, a storage
+convention (BIDS's ASL timing is in the arrays); the sidecar records the actual readout schedule.
 
-**Ground truth**: `desc-deltam_gt` per readout volume is the **undepleted** `delta_m(t_n)` (the
-perfusion signal, as today), and a new `desc-deltamRead_gt` the depleted `sin(a_n) dM_n` the
-readout saw; the tissue `Mz(t_n^-)` per readout is recorded in the TSV `desc-lookLocker_gt.tsv`
-per cycle (one row per readout: cycle, readout, time, flip, mean tissue `Mz` per label).
+**Ground truth**: `desc-deltam_gt` per readout volume is the undepleted `delta_m(t_n)` (moved, as
+today); `desc-deltamRead_gt` the depleted `sin(a_n) dM_n`; `desc-lookLocker_gt.tsv` one row per
+readout (cycle, readout, time, flip, mean tissue `Mz` before the pulse per label).
 
 ## Refusals
 
-3D; spin echo; exchange, the arterial compartment, crushing, bolus-position suppression; Hadamard;
-multi-TE; compat (simasl has no Look-Locker). A `FlipAngle` array without `LookLocker: true`
-stays an error, as today (`opt_num`, `protocol.rs:626-631`: "FlipAngle must be a number"):
-per-volume flips are Look-Locker only.
+3D; spin echo; exchange, arterial compartment, crushing, bolus-position suppression; Hadamard;
+multi-TE; compat; a `FlipAngle` array without `LookLocker: true` (as today); suppression differing
+within a cycle.
 
 ---
 
@@ -332,90 +358,91 @@ per-volume flips are Look-Locker only.
 
 ## What is modeled
 
-Each excitation is followed by `E` echoes at `TE_1 < ... < TE_E`, each read by its own EPI block,
-each producing its own image of the same volume. The compartment images are the same for every
-echo (one excitation, one magnetization state); what differs is the transverse decay, which the
-acquisition already applies per compartment: `exp(-trf/T2_c - |t|/T2'_c)` for spin echo,
-`exp(-trf/T2_c - trf/T2'_c)` for gradient echo, with `trf = TE_e + t` (`kspace.rs:813-830`).
-Because blood is its own compartment with `T2_blood` (and the arterial compartment with
-`T2_arterial`), and P4's exchange already splits the label's delta-M into intravascular (blood
-T2) and extravascular (tissue T2) parts by the exchange time, the multi-TE delta-M is the
-two-compartment model
+Each excitation is followed by `E` echoes at `TE_1 < ... < TE_E`, each read by its own EPI block and
+producing its own image of the same volume. The longitudinal state is common to the echoes; the
+transverse decay is applied per compartment by the acquisition. Echo `e` of compartment `c` at line
+`t` carries
 
 ```
-dM(t, TE) = dM_iv(t) exp(-TE/T2b) + dM_ev(t) exp(-TE/T2t)
+spin echo (CPMG):  exp(-(TE_e + t)/T2_c - |t|/T2'_c)
+gradient echo:     exp(-(TE_e + t)(1/T2_c + 1/T2'_c)) * exp(i 2 pi fmap TE_e)
 ```
 
-of Gregori et al. (JMRI 2013) and Ohene et al. (MRM 2021), with no new kinetics. Without exchange
-(`exchange_time` absent) all label stays intravascular, which the sidecar states.
+(`kspace.rs:813-830`, `:636-641`). The `TE_e` part is a common factor of every line, so between two
+echoes the image of a compartment changes by exactly `exp(-dTE/T2_c)` (spin echo) or
+`exp(-dTE (1/T2_c + 1/T2'_c)) exp(i 2 pi fmap dTE)` (gradient echo); blood has `T2_blood` and inherits
+its label's `T2'` (`series.rs:495-497`); the arterial compartment has `T2_arterial`. P4's exchange
+puts the intravascular delta-M in the blood compartment and the extravascular delta-M in the tissue
+compartment (`series.rs:487-497`, `:951-954`, `:990-992`), so the spin-echo delta-M follows
 
-**Echo formation.** Spin echo: every echo is a refocused spin echo (a CPMG train, T2' refocused at
-each echo centre). Gradient echo: one excitation, echoes along the free induction decay, T2' from
-the RF and the static `2 pi fmap TE_e` phase per echo (P5 part A). The model assumes perfect
-refocusing for spin-echo trains (no stimulated echoes; the 2D CPMG amplitudes at 180 degrees are
-`exp(-TE/T2)` exactly, P5's EPG).
+```
+dM(t, TE) = dM_iv(t) exp(-TE/T2b) + dM_ev(t) exp(-TE/T2t)  [+ arterial term]
+```
+
+(Gregori et al., JMRI 2013; Ohene et al., MRM 2021), and gradient echo multiplies each term by its
+`exp(-TE/T2')` and the fieldmap phase. P4's kinetics use the single residue `T1'` after arrival;
+they are not a two-compartment T1 exchange model (stated). Without `exchange_time` all label is
+intravascular. Spin-echo trains assume perfect refocusing (at 180 degrees the CPMG amplitudes are
+`exp(-TE/T2)`, P5's EPG).
 
 ## The acquisition (`mrsim-acq`)
 
-One new public entry point, no change to any existing struct or signature:
+One new public entry point; no existing struct or signature changes:
 
 ```rust
 pub fn simulate_acquisition_echoes(
-    sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, acq: &Acquisition,
-    echo_times_ms: &[f64], eddy_drive, prep_drive, phase, seed, noise_sigma, eddy_trace,
+    sim_dims, acq_dims, n_volumes, images_per_echo: &[&[Vec<f32>]], t2, fmap, t_inhom,
+    acq: &Acquisition, echo_times_ms: &[f64], eddy_drive, prep_drive, phase, seed,
+    noise_sigma, eddy_trace,
 ) -> Vec<(Vec<f32>, Vec<f32>)>        // per echo: magnitude, phase
 ```
 
-For echo `e` it runs the existing per-volume path with `Acquisition { t_echo: echo_times_ms[e],
-..acq.clone() }`. Noise and spikes get a per-echo stream: the `slice_seed` of echo `e` is today's
-`slice_seed` XORed with `echo_salt(e)`, `echo_salt(0) = 0`; the prepared-shot phase, which belongs
-to the excitation, keeps the unsalted `seed`, so every echo of a volume sees the same shot phase,
-while k-space noise is independent per echo (separate receiver samplings). With one echo equal to
-`acq.t_echo` it is bit-identical to `simulate_acquisition_oversampled` (pinned). The timing check
-runs per echo. The per-echo clone is the minimal change the code review of the interface
-identified (`t_echo` enters only `trf` and the GE static phase; the line times, NUFFT path and
-rotors are unchanged), and a per-volume `LineTiming` alternative would leave the GE static phase at
-the series `t_echo`.
-
-The echoes of one volume are acquired by independent calls of the 2D forward with the same
-images; nothing models the echo train's own k-space trajectory (e.g. the k-space centre of a
-later echo's EPI block) beyond each echo's own `t_echo`, which the sidecar states.
+`images_per_echo` gives each echo its compartment images (the same slice for every echo, except
+under compat, below). Echo `e` runs the existing per-volume path with
+`Acquisition { t_echo: echo_times_ms[e], ..acq.clone() }`. Internally the call's `seed` is split
+into an **excitation seed** (the prepared-shot phase, unsalted: every echo of a volume sees the same
+shot phase) and a **receiver seed** salted per echo (`echo_salt(0) = 0`), used for k-space noise and
+spikes (through `slice_seed`) and for image-space noise (`noise_sigma`): independent noise per echo.
+With one echo at `acq.t_echo` it is bit-identical to `simulate_acquisition_oversampled` (pinned).
+Echoes of a volume are independent 2D readouts at their own `TE`; the echo train's own k-space
+trajectory is not modeled (stated).
 
 ## Inputs (`aslscan`)
 
-- **The CLI takes `--asl-json` once per echo**, in echo order, each with a scalar `EchoTime`
-  (BIDS's `echo-N` layout: one sidecar per echo, one shared `aslcontext.tsv`). Every other key must
-  agree across the sidecars (compared numerically, the first difference named); `EchoTime` must
-  strictly increase. One `--asl-json` is today's single-echo protocol, unchanged.
-- An `EchoTime` array in any one sidecar keeps today's rule (equal entries collapse; unequal is an
-  error), now naming the `echo-N` layout as the way to give several echoes.
-- Timing: for gradient echo, consecutive EPI blocks must not overlap
-  (`TE_{e+1} - TE_e >= TotalReadoutTime`); for spin echo, a refocusing pulse sits between them
-  (`TE_{e+1} - TE_e >= TotalReadoutTime + refocusing_time`, P5's `refocusing_time`, default 2 ms);
-  the last echo's block must end within the slice's share of the repetition (the existing readout
-  window check, at the last echo).
+- **`--asl-json` once per echo**, in echo order, each with a scalar `EchoTime`, strictly increasing;
+  every other key must agree across the sidecars (compared numerically; the first difference named).
+  One `aslcontext.tsv`. One `--asl-json` is today's protocol, unchanged.
+- An `EchoTime` array in any sidecar keeps today's rule, naming the `echo-N` layout.
+- Overlay `[multi_te] refocusing_time` (ms, default 2; spin echo only, refused otherwise): the 2D home
+  for the refocusing reserve (the 2D `[readout]` table stays refused).
+- **Timing on explicit intervals**, per slice: echo `e`'s sampled block is
+  `[exc + TE_e - h, exc + TE_e + h]`. Gradient echo: blocks must not overlap. Spin echo: the first
+  refocusing pulse is centred at `TE_1/2` and reserves `refocusing_time` about its centre; it must
+  clear the excitation and end before the first block; each later pulse is centred at
+  `(TE_e + TE_{e+1})/2` and must fit between the two blocks. The last block must end before the next
+  slice's excitation, the last slice's before `TR`; the separate M0 likewise at its own `TR`.
 
 ## The series and outputs
 
-The series builds the compartment images once and makes **one** call of
-`simulate_acquisition_echoes`; the separate M0 likewise (its own seed, as today, with per-echo
-salts). Ground truth is echo-independent and written once (`desc-deltamIntravascular_gt` is the
-quantity multi-TE separates). The dataset has one series per echo:
-`sub-X_echo-<e>_part-{mag,phase}_asl.nii.gz` with its own sidecar (scalar `EchoTime`, the input
-sidecar of that echo as the base), and one `sub-X_aslcontext.tsv`; a separate M0 likewise gets
-`echo-<e>` files. `AslscanSimulation.MultiEcho`: the echo times, the echo formation, the noise
-streams, the two-compartment statement, and whether exchange is on.
+Outside compat the series builds the compartment images once and passes the same images for every
+echo. **Under compat** the echo-time decay belongs to the signal stage (`te_factor`), so the series
+builds one image set per echo, applying `exp(-TE_e/T2)` (or `T2*`) before resampling as today, and
+passes them per echo; with one echo this is today's path. The separate M0 likewise (its own seed,
+per-echo salts). Ground truth is echo-independent and written once. Output: one series per echo,
+`sub-X_echo-<e>_part-{mag,phase}_asl.nii.gz` with its own sidecar (scalar `EchoTime`, that echo's
+input sidecar as base), one `sub-X_aslcontext.tsv`, a separate M0 per echo, and
+`AslscanSimulation.MultiEcho`: echo times, echo formation, the noise streams, the decay statement,
+whether exchange is on.
 
 **Hadamard x multi-TE** (Mahroo et al., Front Neurosci 2021): allowed; each echo's raw series is
-decoded separately, and the decoded dataset has one `echo-N` series per echo.
+decoded separately; the decoded dataset has one `echo-N` series per echo.
 
 ## compat
 
-Multi-TE under `[compat] asldro = true` is allowed: simasl applies one `exp(-TE/T2)` (or `T2*`) per
-voxel to every volume and accepts a per-volume `echo_time`, so echo `e` of an aslscan compat run
-equals a single-echo compat run with `EchoTime = TE_e`, and equals simasl's run with a constant
-`echo_time = TE_e`. The compat translator (`tools/compat_asldro.py`) gains the echo loop; benchmark
-H compares each echo voxelwise, as A-G do.
+Multi-TE under `[compat] asldro = true` is allowed: echo `e` equals, with noise off, a single-echo
+compat run at `EchoTime = TE_e` and simasl's run with a constant `echo_time = TE_e` (later echoes
+use their own noise streams, so equality is noise-off only). The translator gains the echo loop;
+benchmark H compares each echo voxelwise.
 
 ---
 
@@ -423,104 +450,128 @@ H compares each echo voxelwise, as A-G do.
 
 | Piece | Where |
 |---|---|
-| `simulate_acquisition_echoes`, per-echo noise salt | `mrsim-acq` `kspace` |
-| Labeling cycles, `RowKind::Encoded`, Look-Locker cycle grouping, multi-sidecar parsing | aslscan `rows`, `protocol` |
-| Hadamard matrix, encoding weights, decoding | aslscan `hadamard` (new, pure std) |
-| `delta_m_arrival` (PASL and (P)CASL), partition identity | aslscan `kinetic` |
-| Look-Locker tissue timeline (readout events, fixed point, propagation) | aslscan `longitudinal` |
-| Per-cycle assembly, decoding after the call, the echo call | aslscan `series` |
-| Decoded main dataset, `sourcedata` raw series, `echo-N` series, Look-Locker ground truth | aslscan `bids` |
+| `simulate_acquisition_echoes`, excitation and receiver seeds | `mrsim-acq` `kspace` |
+| The schedule (preparations, raw volumes, output volumes), `RowKind::Encoded`, Look-Locker cycles, multi-sidecar parsing, per-cycle suppression and VENC | aslscan `rows`, `protocol` |
+| Hadamard matrix, weights, decoding, maps | aslscan `hadamard` (new, pure std) |
+| `delta_m_arrival` | aslscan `kinetic` |
+| Look-Locker timeline | aslscan `longitudinal` |
+| Assembly, decoding, per-echo compat images, legacy dispatch | aslscan `series` |
+| Decoded dataset, `sourcedata`, `echo-N`, Look-Locker truth | aslscan `bids` |
 | Repeated `--asl-json` | aslscan `bin/aslscan` |
-| Multi-TE compat, benchmark H | aslscan `tools/compat_asldro.py` |
+| P5 regress cases; compat benchmark H | aslscan `tools` |
 
 # Testing and verification
 
 **mrsim-acq**
 
-- `simulate_acquisition_echoes` with one echo at `acq.t_echo` equals
-  `simulate_acquisition_oversampled` bit for bit (both feature sets, noise on); with two echoes,
-  echo 0 equals the single-echo call bit for bit and echo 1 equals a single-echo call at `TE_1`
-  except for the noise stream (noise off: bit for bit); the echoes' noise is independent (sample
-  correlation within `3/sqrt(n)` of 0) and the shot phase is shared (prepared phase on, noise off:
-  echo images differ only by the decay); the golden record and every bit-pinned test unchanged.
+- `simulate_acquisition_echoes`: one echo at `acq.t_echo` equals `simulate_acquisition_oversampled`
+  bit for bit (both feature sets, k-space noise, image-space noise and a non-`None` `prep_drive` with
+  a prepared phase model); with two echoes, echo 0 equals the single-echo call bit for bit; echo 1
+  equals a single-echo call at `TE_1` with noise off; with noise on, echo 1's k-space and image-space
+  noise are each uncorrelated with echo 0's (sample correlation within `3/sqrt(n)`); with a prepared
+  phase on, noise off, no fieldmap and spin echo, echo 1 equals echo 0 times the per-compartment
+  decay (single-compartment images), which fails if the shot phase were salted.
+- The golden record and every bit-pinned test unchanged.
 
 **aslscan**
 
-- **Hadamard**: the matrix is orthogonal with zero column sums (orders 4-32); the encoded blood of
-  the all-labeled row equals the unencoded bolus of `tau_tot` to `1e-12` (the P4 partition
-  identity); **decoded volume `j` of a noiseless series equals a single `deltam` run with
-  `LabelingDuration = tau_j`, `PostLabelingDelay = PLD_j`** to the linearity tolerance (shift
-  invariance of the (P)CASL kinetics; without suppression or physiology, whose timing is not
-  shift-invariant), and the decoded ground truth equals that run's ground truth; with suppression
-  and physiology on, decoding is still exact against the encoded ground truth (decode the raw
-  ground truth, compare); the decoded noise SD over the raw is recorded (want about
-  `2/sqrt(N+1)`); the input checks (PLD formula, order, PASL, `control` rows).
-- **Look-Locker**: the arrival-window partition identity to `1e-12` (both label types, arrival
-  before, during and after the readouts); `M = 1` equals P5's gradient-echo series bit for bit
-  (tissue and blood); the tissue steady state equals brute-force iteration of the cycle until
-  successive starting values differ by `1e-15 M0`; with all flips at `1e-6` degrees the readout
-  volumes equal multi-PLD single-readout rows (sign and timing); the cycle grouping from the arrays
-  and its overlay check; the linearity identity per readout (control cycle - label cycle - deltam
-  cycle), with its negative control.
-- **Multi-TE**: one echo is today's output bit for bit (regress); echo `e`'s images equal a
-  single-echo run at `TE_e` with noise off; the ratio of decoded delta-M between two echoes matches
-  `exp(-dTE/T2b)` with exchange off and the two-compartment formula with exchange on (per voxel,
-  noise off, uniform compartments); compat benchmark H; the sidecar agreement checks.
-- The validator passes on every P6 output dataset (the decoded Hadamard dataset, Look-Locker,
-  multi-TE `echo-N`).
-- Byte identity: `regress_identity.sh` against `p5-complete`, TRXScan P0, the golden record.
+- **Byte identity**: the P5 regress cases (above) pass against `p5-complete` before and after P6.
+- **Hadamard**: orthogonality and zero column sums (orders 4-32); the partition identity with a
+  synthetic all-ones weight vector (outside the matrix) to `1e-12`; every actual encoding row's blood
+  against an independent weighted sum of `delta_m_sub`; **decoded volume `j` of a noiseless series
+  without suppression, physiology, GRAPPA, spikes, motion or GE transients equals a single `deltam`
+  run with `tau_j`, `PLD_j`** (shift invariance of (P)CASL kinetics) to the linearity tolerance with a
+  tissue-scaled absolute term; the same with gradient echo after enough cycles for the transient to
+  vanish; a **transient negative case** (an included long-`TR` M0 before a low-flip encoding cycle)
+  where decoding leaks tissue and `TissueLeakage` reports it; **with physiology on**, the decoded
+  image equals the general formula `(2/H) sum_i h_ij [C_i - sum_k w_ik dM_ik]` assembled from
+  independent single-row runs scaled by the recorded per-preparation factors (not by decoding the
+  truth); the 3D schedule (`H x NumberShots` preparations, clock, maps); the input checks.
+- **Look-Locker**: the arrival-window partition identity to `1e-12` (both label types; arrival before,
+  during, after the readouts; the PASL `q = 0` guard); `M = 1` equals P5's gradient-echo series bit for
+  bit (legacy dispatch); the steady state equals brute-force cycle iteration until successive starts
+  differ by `1e-15 M0`; with flips at `1e-6` degrees the readout volumes equal multi-PLD single-readout
+  rows; cycle grouping and its overlay check; per-cycle suppression; the separate-M0 flip rule; the
+  timing intervals (accept and reject cases); the linearity identity per readout (control cycle -
+  label cycle - deltam cycle) and its negative control.
+- **Multi-TE**: one echo bit-identical (regress); echo `e` equals a single-echo run at `TE_e` (noise
+  off); spin echo, uniform compartments, no fieldmap: the IV/EV images scale between echoes by
+  `exp(-dTE/T2b)` / `exp(-dTE/T2t)` exactly, and the delta-M follows the two-compartment formula;
+  gradient echo: the same with `T2'` and the fieldmap phase; the arterial term when enabled; compat
+  benchmark H (noise off); sidecar agreement; the spin-echo refocusing-interval checks.
+- The validator passes on every P6 output (the decoded Hadamard dataset, Look-Locker, `echo-N`).
 
 # Acceptance criteria
 
-1. No P6 input, no changed byte (TRXScan, `mrsim-acq`, `aslscan`).
-2. A Hadamard-8 PCASL protocol (7 sub-boli, 2 cycles, `m0scan`) on the crop and on the 3 T phantom
-   simulates, decodes to the single-sub-bolus runs, and its main dataset validates; the raw series
-   is written under `sourcedata`.
-3. A QUASAR-like Look-Locker protocol (PASL, 2D, 12 readouts 0.3 s apart, flips 35 degrees,
-   control/label cycles) simulates, matches the single-readout reduction, and validates.
-4. A three-echo PCASL protocol (`TE` 13, 32, 51 ms gradient echo; and a spin-echo variant) with
-   exchange simulates, matches the two-compartment formula, its `echo-N` dataset validates, and
-   compat benchmark H passes.
+1. No P6 input, no changed byte (TRXScan, `mrsim-acq`, `aslscan` including the P5 cases).
+2. A Hadamard-8 PCASL protocol (7 sub-boli, 2 cycles, `m0scan` before the first cycle) on the crop and
+   on the 3 T phantom simulates, decodes to the single-sub-bolus runs under the exactness conditions,
+   validates, and writes the raw series under `sourcedata`; a GRASE variant simulates with
+   `H x NumberShots` preparations.
+3. A QUASAR-like Look-Locker protocol (PASL, 2D, 12 readouts 0.3 s apart, 35 degrees) simulates,
+   reduces to single readouts at vanishing flip, and validates.
+4. A three-echo PCASL protocol with exchange (gradient echo `TE` 13, 32, 51 ms and a spin-echo
+   variant meeting the refocusing intervals) simulates, matches the decay formulas, its `echo-N`
+   dataset validates, and compat benchmark H passes.
 5. Hadamard x multi-TE simulates and its decoded `echo-N` dataset validates.
-6. The tests above pass and the measured numbers (decoded noise, Look-Locker steady states,
-   multi-TE ratios, run times) are recorded in the plan.
+6. The tests above pass and the measured numbers (decoded noise, `TissueLeakage`, Look-Locker steady
+   states, multi-TE ratios, run times) are recorded in the plan.
 
 # Decisions deferred
 
-- **Velocity-selective ASL**: no BIDS type; revisit when BIDS adds one (the model, Wong et al.
-  MRM 2006 and the consensus Qin et al. MRM 2022, is a saturation or inversion bolus with
-  efficiency about 0.5 for VSS and a bolus defined by the vascular crushing module, and would reuse
-  the PASL machinery).
-- **Look-Locker with 3D readouts**: needs 3D gradient-echo readouts, which P5 deferred.
-- **Multi-TE with 3D readouts**: the 3D echo-train model reads one partition per echo; a multi-echo
-  3D readout is a different train.
-- **Look-Locker x Hadamard, Look-Locker x multi-TE**: each is a product of the two cycle
-  structures; no target dataset motivates them yet.
+- **Velocity-selective ASL**: no BIDS type; revisit when BIDS adds one (Wong et al., MRM 2006; the
+  consensus Qin et al., MRM 2022: a saturation or inversion bolus, efficiency about 0.5 for VSS, the
+  bolus defined by the vascular crushing module; it would reuse the PASL machinery).
+- **Look-Locker and multi-TE with 3D readouts**: need 3D gradient-echo or multi-echo 3D trains.
+- **Look-Locker x Hadamard, Look-Locker x multi-TE.**
 - **The QUASAR arterial compartment**, crushing, exchange and bolus-position suppression under
-  Look-Locker: their arrival-window forms.
-- **Vessel-encoded labeling, Walsh-ordered or non-Sylvester matrices, T1-adjusted variable
-  sub-bolus designs with per-cycle variation.**
-- **A multi-echo EPI's own k-space**: echoes are independent 2D readouts at their own `TE`.
+  Look-Locker (their arrival-window forms).
+- **Vessel-encoded labeling, Walsh-ordered or non-Sylvester matrices, variable designs across
+  cycles, dummy cycles to settle gradient-echo transients.**
+- **A multi-echo EPI's own k-space**, and a two-compartment T1 exchange model.
 
 # Risks
 
-**BIDS underdetermines all three.** Hadamard has no representation, so the main dataset is the
-decoded form and the encoding lives in `sourcedata` and `AslscanSimulation`; Look-Locker's cycles
-are inferred from the delay arrays (with an explicit overlay check); multi-TE uses a layout
-(`echo-N` inheriting one `aslcontext.tsv`) whose inheritance this design assumes from the
-specification's rules and the validator must confirm on the first output.
+**BIDS underdetermines all three.** Hadamard has no representation: the main dataset is the decoded
+form under stated conventions (`TotalAcquiredPairs`, static truth), with the encoding in
+`sourcedata` and `AslscanSimulation`. Look-Locker cycles are inferred from the arrays (with an
+overlay check). The `echo-N` inheritance of one `aslcontext.tsv` is supported by the schema and the
+validator's inheritance code; the first output confirms it.
 
-**The Look-Locker blood model is a model.** Depletion is applied to arrived label only and
-in-transit label is untouched; partial arrival into a slice during a readout train, inflow of
-unsaturated arterial blood into the slice between readouts, and slice-profile effects on the flip
-are not modeled. The sidecar says so, and the arrival-window form reduces exactly to the existing
-model when the flips vanish.
+**Decoding is exact only under conditions the scanner rarely meets**, and aslscan simulates the
+rest (transients, physiology, motion, GRAPPA, spikes) as artefacts rather than idealizing them; the
+sidecar reports which were on and the tissue leakage, and the tests separate the exact case from the
+realistic one.
 
-**Decoding noise and motion.** Decoding mixes `N + 1` raw volumes; motion between them produces
-decoding artefacts, which is realistic, and the ground truth is per sub-bolus at the unmoved
-positions (as P3's static truth). Physiological factors per raw acquisition likewise leak between
-sub-boli after decoding, as on a scanner.
+**The Look-Locker blood model is a model**: depletion of arrived label only; in-transit label, inflow
+of fresh blood into the slice between readouts and slice-profile effects are not modeled; it reduces
+exactly to the existing model when the flips vanish.
 
 # Review record
 
-None yet.
+Codex adversarial design review, 2026-10-05: 1 blocker, 13 majors, 1 minor, each checked against the
+source (and the cached schema) and found valid; all applied.
+
+- **Blocker.** Multi-TE built the compartment images once, but under compat the echo-time decay is
+  applied while building them (`series.rs:615-634`), so every echo would carry the first echo's
+  decay: the entry point now takes images per echo and compat builds one set per echo.
+- **Majors.** The multi-TE formula omitted `T2'` and the fieldmap phase under gradient echo (now per
+  echo formation, with tests in the conditions where it is exact). Salting only `slice_seed` left the
+  image-space noise channel identical across echoes (`kspace.rs:1512-1521`): the call's seed is now
+  split into an unsalted excitation seed and a salted receiver seed, tested with a non-`None`
+  `prep_drive`. The timing checks admitted overlapping blocks and had no 2D home for the refocusing
+  reserve: they are now explicit intervals, with `[multi_te] refocusing_time`. Hadamard's clock
+  ignored P5's per-shot labelings: a raw volume is `NumberShots` preparations. Suppression (keyed by
+  PLD) and VENC (per row) had no mapping onto cycles: both are resolved per cycle and must be
+  constant within it. `m0scan` "anywhere" had no raw order: only between cycles, with published maps.
+  Gradient-echo transients break the common tissue decoding needs: the physics is kept, the exact
+  test is restricted, a transient negative case and a `TissueLeakage` report added. Exact decoding
+  was over-promised under GRAPPA, spikes and `f32` output: conditions and a tissue-scaled tolerance
+  stated. The physiology ground-truth test decoded the truth twice: an independent reference from
+  single-row runs replaces it, and ideal vs raw truth are named apart. Look-Locker physiology is one
+  labeling factor per cycle with tissue factors per readout, and motion stays volume-indexed. A
+  separate M0 under a variable-flip Look-Locker had no flip: `[m0] flip_angle`. The regress gate had
+  no P5 case: P5 cases are added and legacy dispatch is explicit. `TotalAcquiredPairs` for Hadamard is
+  not a BIDS rule: a stated convention (encoding cycles).
+- **Minor.** The Sylvester matrix has no all-labeled row: the partition test uses a synthetic weight
+  vector.
