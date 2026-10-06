@@ -1432,6 +1432,33 @@ pub fn simulate_acquisition_oversampled(
     // DIFFPREP eddy estimate as a geometric PE distortion (see `SliceInput::eddy_lin`).
     eddy_trace: Option<&[[f64; 3]]>,
 ) -> (Vec<f32>, Vec<f32>) {
+    acquire_volumes(sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, acq, eddy_drive, prep_drive, phase,
+                    seed, seed, noise_sigma, eddy_trace)
+}
+
+/// The body of [`simulate_acquisition_oversampled`] with its one seed split in two: the
+/// **excitation** seed draws the per-shot phase realization (`PrepPhase::shot`), the **receiver**
+/// seed the k-space noise and spikes (`slice_seed`) and the image-space noise. The public entries
+/// pass the same seed to both, except [`simulate_acquisition_echoes`], whose echoes share one
+/// excitation and draw independent receiver noise.
+#[allow(clippy::too_many_arguments)]
+fn acquire_volumes(
+    sim_dims: [usize; 3],
+    acq_dims: [usize; 3],
+    n_volumes: usize,
+    images: &[Vec<f32>],
+    t2: &[T2Volume],
+    fmap: &[f32],
+    t_inhom: Option<&[T2Volume]>,
+    acq: &Acquisition,
+    eddy_drive: &[Option<[f64; 3]>],
+    prep_drive: &[Option<(f64, [f64; 3])>],
+    phase: &PhaseModel,
+    excitation_seed: u64,
+    receiver_seed: u64,
+    noise_sigma: Option<&[f32]>,
+    eddy_trace: Option<&[[f64; 3]]>,
+) -> (Vec<f32>, Vec<f32>) {
     let [snx, sny, nz] = sim_dims;
     let [nx, ny, nzo] = acq_dims;
     assert_eq!(nz, nzo, "slice count must match; z is never oversampled");
@@ -1478,7 +1505,7 @@ pub fn simulate_acquisition_oversampled(
             let t2_slice = t2_slices(t2, z, snx * sny);
             let ti_slice = t_inhom.map(|ti| t2_slices(ti, z, snx * sny));
             let shot = match (&phase.prep, prep_drive[g]) {
-                (Some(p), Some((mag, dir))) => p.shot(mag, dir, g, z, seed),
+                (Some(p), Some((mag, dir))) => p.shot(mag, dir, g, z, excitation_seed),
                 _ => ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] },
             };
             let phi = phase_slice(phase, &shot, snx, sny, o, z, nz);
@@ -1486,7 +1513,7 @@ pub fn simulate_acquisition_oversampled(
                 .wrapping_mul(0x100_0001)
                 .wrapping_add(z as u64)
                 .wrapping_mul(0x9E37)
-                ^ seed;
+                ^ receiver_seed;
             let out = simulate_slice(
                 &SliceInput {
                     compartments: &refs,
@@ -1514,7 +1541,7 @@ pub fn simulate_acquisition_oversampled(
                         if sd > 0.0 {
                             // deterministic per (volume, voxel); parallel-safe (per_vol is over g)
                             let mut rng = Rng(
-                                seed ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                                receiver_seed ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
                                     ^ (vox as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) | 1,
                             );
                             re += (rng.gauss() * sd) as f32;
