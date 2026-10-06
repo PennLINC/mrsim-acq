@@ -27,7 +27,8 @@ reconstructing an image from it. The following effects are included:
   direction, as in real EPI data.
 - **Signal decay during the readout.** Each line of k-space is weighted by T2 and T2' decay at
   the time it is acquired. Several tissue compartments, each with its own T2 and T2', can be
-  combined in one voxel.
+  combined in one voxel. The echo can form as a spin echo (T2' refocused at the echo) or a
+  gradient echo (T2' decaying from the excitation, with the fieldmap phase of the echo time).
 - **Gibbs ringing.** The object is simulated on a finer grid than the scan and truncated in
   k-space, so ringing appears as it does in real data.
 - **Partial Fourier** acquisition and k-space **windowing** (Hann, Tukey, or Fermi filters).
@@ -36,9 +37,16 @@ reconstructing an image from it. The following effects are included:
 - **Noise**, added in k-space or, optionally, in image space with a spatially varying level.
 - **Head motion** (rigid, per volume) and **multiband** slice timing, including motion-related
   signal dropout.
+- **3D readouts:** segmented **GRASE** echo trains, with echo amplitudes from an extended-phase-
+  graph model of the refocusing pulses, and **stack-of-spirals**. The spirals are reconstructed by
+  gridding and iterative least squares, with a certified error bound on the off-resonance time
+  segmentation; spirals need the `kspace` feature.
+  A segmented acquisition can give each shot its own weight and pose.
+- **Several echo times** read from the same excitation, each with independent receiver noise.
 - **Output** as BIDS `part-mag` and `part-phase` NIfTI files with JSON sidecars.
 
-The readout model is 2D single-shot spin-echo EPI. Gradient-echo and 3D readouts are not modeled.
+The 2D readout is single-shot EPI. Multi-echo 3D trains and 3D gradient-echo readouts are not
+modeled.
 
 ## Installation
 
@@ -72,8 +80,15 @@ speed:
 
 ## Usage
 
-The main entry point is `kspace::simulate_acquisition_oversampled`. It simulates a whole series
-of volumes in one call. Its inputs are:
+There are three entry points, each simulating a whole series of volumes in one call:
+
+| Function | Readout |
+|---|---|
+| `kspace::simulate_acquisition_oversampled` | 2D EPI, one echo |
+| `kspace::simulate_acquisition_echoes` | 2D EPI, several echo times per excitation |
+| `kspace3d::simulate_acquisition_3d` | 3D GRASE or stack-of-spirals, optionally segmented into shots |
+
+The 2D entry point's inputs are:
 
 - **Grid sizes.** The scan matrix (for example 64 x 64 x 30), and a simulation grid that is an
   integer multiple of the scan matrix in-plane (for example 128 x 128 x 30). Slices are not
