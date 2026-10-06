@@ -1574,6 +1574,88 @@ fn acquire_volumes(
     (magd, phased)
 }
 
+/// The receiver-seed salt of echo `e` in [`simulate_acquisition_echoes`]: zero for the first echo,
+/// so a one-echo call is [`simulate_acquisition_oversampled`] bit for bit.
+fn echo_salt(e: usize) -> u64 {
+    (e as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
+}
+
+/// A multi-echo series in one call: each excitation is read at every `echo_times_ms[e]` (ms) by its
+/// own readout, and echo `e` is [`simulate_acquisition_oversampled`] with
+/// `Acquisition { t_echo: echo_times_ms[e], ..acq.clone() }` on `images_per_echo[e]`.
+///
+/// The echoes of a volume share one excitation: the per-shot phase realization (`phase.prep`) is
+/// drawn from `seed` itself for every echo. Each echo's receiver noise (k-space noise and spikes,
+/// and the image-space `noise_sigma` noise) is drawn from `seed ^ echo_salt(e)`, with
+/// `echo_salt(0) = 0`, so the echoes' noise is independent and a call with one echo at
+/// `acq.t_echo` is bit-identical to `simulate_acquisition_oversampled`. The echo train's own k-space
+/// trajectory is not modeled: the echoes are independent 2D readouts at their own echo times.
+///
+/// `images_per_echo[e]` holds echo `e`'s compartment images (callers that apply no echo-time decay
+/// themselves pass the same images for every echo). Returns `(magnitude, phase)` per echo, each in
+/// the layout of `simulate_acquisition_oversampled`.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_acquisition_echoes(
+    sim_dims: [usize; 3],
+    acq_dims: [usize; 3],
+    n_volumes: usize,
+    images_per_echo: &[&[Vec<f32>]],
+    t2: &[T2Volume],
+    fmap: &[f32],
+    t_inhom: Option<&[T2Volume]>,
+    acq: &Acquisition,
+    echo_times_ms: &[f64],
+    eddy_drive: &[Option<[f64; 3]>],
+    prep_drive: &[Option<(f64, [f64; 3])>],
+    phase: &PhaseModel,
+    seed: u64,
+    noise_sigma: Option<&[f32]>,
+    eddy_trace: Option<&[[f64; 3]]>,
+) -> Vec<(Vec<f32>, Vec<f32>)> {
+    for (e, w) in echo_times_ms.windows(2).enumerate() {
+        assert!(w[0] < w[1], "echo times must increase strictly: echo {e} at {} ms, echo {} at {} ms", w[0], e + 1, w[1]);
+    }
+    echoes_with_salt(sim_dims, acq_dims, n_volumes, images_per_echo, t2, fmap, t_inhom, acq, echo_times_ms,
+                     eddy_drive, prep_drive, phase, seed, noise_sigma, eddy_trace, echo_salt, |_| 0)
+}
+
+/// [`simulate_acquisition_echoes`] with the per-echo salts of the receiver and excitation seeds as
+/// parameters, so the tests can show what each salt does (no public switch).
+#[allow(clippy::too_many_arguments)]
+fn echoes_with_salt(
+    sim_dims: [usize; 3],
+    acq_dims: [usize; 3],
+    n_volumes: usize,
+    images_per_echo: &[&[Vec<f32>]],
+    t2: &[T2Volume],
+    fmap: &[f32],
+    t_inhom: Option<&[T2Volume]>,
+    acq: &Acquisition,
+    echo_times_ms: &[f64],
+    eddy_drive: &[Option<[f64; 3]>],
+    prep_drive: &[Option<(f64, [f64; 3])>],
+    phase: &PhaseModel,
+    seed: u64,
+    noise_sigma: Option<&[f32]>,
+    eddy_trace: Option<&[[f64; 3]]>,
+    receiver_salt: fn(usize) -> u64,
+    excitation_salt: fn(usize) -> u64,
+) -> Vec<(Vec<f32>, Vec<f32>)> {
+    assert!(!echo_times_ms.is_empty(), "simulate_acquisition_echoes needs at least one echo");
+    assert_eq!(images_per_echo.len(), echo_times_ms.len(),
+               "images_per_echo has {} entries for {} echoes", images_per_echo.len(), echo_times_ms.len());
+    echo_times_ms
+        .iter()
+        .zip(images_per_echo)
+        .enumerate()
+        .map(|(e, (&te, images))| {
+            let acq_e = Acquisition { t_echo: te, ..acq.clone() };
+            acquire_volumes(sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, &acq_e, eddy_drive, prep_drive,
+                            phase, seed ^ excitation_salt(e), seed ^ receiver_salt(e), noise_sigma, eddy_trace)
+        })
+        .collect()
+}
+
 /// **Legacy path: no intrinsic Gibbs ringing and no object phase.**
 ///
 /// Runs the acquisition with the object already on the reconstruction matrix (`o = 1`) and
@@ -3291,5 +3373,216 @@ mod tests {
                 &[None, None], &[None, None], &phase, 1, None, Some(&[[0.0; 3]]))
         });
         assert!(message(r).contains("eddy_trace has 1 entries for 2 volumes"));
+    }
+}
+
+/// `simulate_acquisition_echoes` (P6 addendum, part C), tested through the wrapper's outputs.
+#[cfg(test)]
+mod echo_tests {
+    use super::*;
+
+    const N: usize = 32; // acquired matrix
+    const O: usize = 2; // oversampling
+    const NZ: usize = 2;
+    const NV: usize = 2;
+
+    fn dims() -> ([usize; 3], [usize; 3]) {
+        ([N * O, N * O, NZ], [N, N, NZ])
+    }
+
+    /// A smooth disc with a bright off-centre spot, the same in every volume, plus a second
+    /// compartment at half weight.
+    fn images() -> Vec<Vec<f32>> {
+        let ([sx, sy, nz], _) = dims();
+        let mut a = vec![0.0f32; sx * sy * nz * NV];
+        for z in 0..nz {
+            for y in 0..sy {
+                for x in 0..sx {
+                    let (dx, dy) = (x as f64 - sx as f64 / 2.0, y as f64 - sy as f64 / 2.0);
+                    let r = (dx * dx + dy * dy).sqrt() / (0.35 * sx as f64);
+                    let spot = (-((dx - 8.0).powi(2) + (dy + 5.0).powi(2)) / 30.0).exp();
+                    let v = if r < 1.0 { 1.0 - 0.5 * r * r } else { 0.0 } + spot + 0.1 * z as f64;
+                    for g in 0..NV {
+                        a[(x + sx * (y + sy * z)) * NV + g] = v as f32;
+                    }
+                }
+            }
+        }
+        let b = a.iter().map(|v| 0.5 * v).collect();
+        vec![a, b]
+    }
+
+    fn fmap(zero: bool) -> Vec<f32> {
+        let ([sx, sy, nz], _) = dims();
+        (0..sx * sy * nz).map(|i| if zero { 0.0 } else { 3.0 * ((i % sx) as f32 / sx as f32 - 0.5) }).collect()
+    }
+
+    fn t2() -> Vec<T2Volume<'static>> {
+        vec![T2Volume::Uniform(80.0), T2Volume::Uniform(160.0)]
+    }
+
+    fn base() -> Acquisition {
+        Acquisition { t_echo: 30.0, t_line: 0.5, signal_scale: 1.0, ..Acquisition::default() }
+    }
+
+    type Drives = (Vec<Option<[f64; 3]>>, Vec<Option<(f64, [f64; 3])>>);
+
+    fn drives() -> Drives {
+        (vec![None; NV], vec![Some((800.0, [1.0, 0.3, 0.0])); NV])
+    }
+
+    /// One call of the single-echo entry.
+    fn single(acq: &Acquisition, imgs: &[Vec<f32>], fm: &[f32], seed: u64, sigma: Option<&[f32]>) -> (Vec<f32>, Vec<f32>) {
+        let (s, a) = dims();
+        let (eddy, prep) = drives();
+        simulate_acquisition_oversampled(s, a, NV, imgs, &t2(), fm, None, acq, &eddy, &prep, &PhaseModel::hbcd_like(),
+                                         seed, sigma, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn echoes(acq: &Acquisition, imgs: &[Vec<f32>], fm: &[f32], tes: &[f64], seed: u64, sigma: Option<&[f32]>,
+              rsalt: Option<fn(usize) -> u64>, xsalt: fn(usize) -> u64) -> Vec<(Vec<f32>, Vec<f32>)> {
+        let (s, a) = dims();
+        let (eddy, prep) = drives();
+        let per: Vec<&[Vec<f32>]> = tes.iter().map(|_| imgs).collect();
+        match rsalt {
+            // the public entry unless a test overrides a salt
+            None if xsalt(1) == 0 => simulate_acquisition_echoes(s, a, NV, &per, &t2(), fm, None, acq, tes, &eddy, &prep,
+                                                                 &PhaseModel::hbcd_like(), seed, sigma, None),
+            r => echoes_with_salt(s, a, NV, &per, &t2(), fm, None, acq, tes, &eddy, &prep, &PhaseModel::hbcd_like(),
+                                  seed, sigma, None, r.unwrap_or(echo_salt), xsalt),
+        }
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    fn complex(m: &[f32], p: &[f32]) -> Vec<(f64, f64)> {
+        m.iter().zip(p).map(|(&m, &p)| (m as f64 * (p as f64).cos(), m as f64 * (p as f64).sin())).collect()
+    }
+
+    /// The noise residual (noise-on minus noise-off) as interleaved real and imaginary parts.
+    fn residual(on: &(Vec<f32>, Vec<f32>), off: &(Vec<f32>, Vec<f32>)) -> Vec<f64> {
+        complex(&on.0, &on.1).iter().zip(complex(&off.0, &off.1)).flat_map(|(a, b)| [a.0 - b.0, a.1 - b.1]).collect()
+    }
+
+    fn corr(a: &[f64], b: &[f64]) -> f64 {
+        let n = a.len() as f64;
+        let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
+        let (mut ab, mut aa, mut bb) = (0.0, 0.0, 0.0);
+        for (x, y) in a.iter().zip(b) {
+            ab += (x - ma) * (y - mb);
+            aa += (x - ma) * (x - ma);
+            bb += (y - mb) * (y - mb);
+        }
+        ab / (aa * bb).sqrt()
+    }
+
+    fn zero(_: usize) -> u64 {
+        0
+    }
+
+    #[test]
+    fn one_echo_is_the_single_echo_entry_bit_for_bit() {
+        // k-space noise, image-space noise, spikes, a fieldmap and a prepared phase model with a
+        // drive on every volume: everything the two seeds feed
+        let acq = Acquisition { noise_variance: 0.01, n_spikes: 2, spike_amplitude: 0.5, ..base() };
+        let imgs = images();
+        let fm = fmap(false);
+        let sigma = vec![0.05f32; N * N * NZ];
+        let want = single(&acq, &imgs, &fm, 11, Some(&sigma));
+        let got = echoes(&acq, &imgs, &fm, &[acq.t_echo], 11, Some(&sigma), None, zero);
+        assert_eq!(got.len(), 1);
+        assert_eq!(bits(&got[0].0), bits(&want.0));
+        assert_eq!(bits(&got[0].1), bits(&want.1));
+        // and the same holds for gradient echo, whose static fieldmap phase depends on TE
+        let ge = Acquisition { echo: EchoFormation::Gradient, ..acq };
+        let want = single(&ge, &imgs, &fm, 11, Some(&sigma));
+        let got = echoes(&ge, &imgs, &fm, &[ge.t_echo], 11, Some(&sigma), None, zero);
+        assert_eq!(bits(&got[0].0), bits(&want.0));
+        assert_eq!(bits(&got[0].1), bits(&want.1));
+    }
+
+    #[test]
+    fn noise_off_each_echo_is_the_single_entry_at_its_echo_time() {
+        let acq = base();
+        let (imgs, fm) = (images(), fmap(false));
+        for echo in [EchoFormation::Spin, EchoFormation::Gradient] {
+            let acq = Acquisition { echo, ..acq.clone() };
+            let got = echoes(&acq, &imgs, &fm, &[30.0, 55.0], 4, None, None, zero);
+            for (e, te) in [30.0, 55.0].into_iter().enumerate() {
+                let want = single(&Acquisition { t_echo: te, ..acq.clone() }, &imgs, &fm, 4, None);
+                assert_eq!(bits(&got[e].0), bits(&want.0), "{echo:?} echo {e} magnitude");
+                assert_eq!(bits(&got[e].1), bits(&want.1), "{echo:?} echo {e} phase");
+            }
+            // the echoes differ (the decay and, for gradient echo, the fieldmap phase are applied)
+            assert_ne!(bits(&got[0].0), bits(&got[1].0));
+        }
+    }
+
+    /// Each receiver channel alone: the two echoes' noise residuals are uncorrelated with the
+    /// echo salt and identical without it (equal echo times, the negative control).
+    #[test]
+    fn echoes_draw_independent_receiver_noise() {
+        let (imgs, fm) = (images(), fmap(false));
+        let sigma = vec![0.05f32; N * N * NZ];
+        let kspace = Acquisition { noise_variance: 0.0025, ..base() };
+        let image = base();
+        for (name, on, sig) in [("k-space", &kspace, None), ("image-space", &image, Some(sigma.as_slice()))] {
+            let tes = [30.0, 55.0];
+            let noisy = echoes(on, &imgs, &fm, &tes, 9, sig, None, zero);
+            let clean = echoes(&base(), &imgs, &fm, &tes, 9, None, None, zero);
+            let (r0, r1) = (residual(&noisy[0], &clean[0]), residual(&noisy[1], &clean[1]));
+            let n = r0.len() as f64;
+            assert!(r0.iter().any(|v| v.abs() > 1e-3), "{name}: no noise in echo 0");
+            let r = corr(&r0, &r1);
+            assert!(r.abs() < 3.0 / n.sqrt(), "{name}: echo residuals correlated, r = {r}");
+            // negative control: equal echo times, the receiver salt forced to zero: the same noise
+            let same = echoes(on, &imgs, &fm, &[30.0, 30.0], 9, sig, Some(zero), zero);
+            let clean_same = echoes(&base(), &imgs, &fm, &[30.0, 30.0], 9, None, Some(zero), zero);
+            assert_eq!(bits(&same[0].0), bits(&same[1].0), "{name}: unsalted echoes differ");
+            let r = corr(&residual(&same[0], &clean_same[0]), &residual(&same[1], &clean_same[1]));
+            assert!(r > 0.999, "{name}: unsalted residuals not identical, r = {r}");
+            // and with the salt at equal echo times the noise is independent: the salt does it
+            let salted = echoes(on, &imgs, &fm, &[30.0, 30.0], 9, sig, Some(echo_salt), zero);
+            let r = corr(&residual(&salted[0], &clean_same[0]), &residual(&salted[1], &clean_same[1]));
+            assert!(r.abs() < 3.0 / n.sqrt(), "{name}: salted equal-TE residuals correlated, r = {r}");
+        }
+    }
+
+    /// The echoes of a volume share the excitation's shot phase: with one uniform compartment, no
+    /// fieldmap and spin echo, echo 1 is echo 0 times exp(-dTE/T2), phase and all. Salting the
+    /// excitation seed per echo (the negative control) breaks it.
+    #[test]
+    fn echoes_share_the_shot_phase() {
+        let one = vec![images().remove(0)];
+        let fm = fmap(true);
+        let acq = base();
+        let (s, a) = dims();
+        let (eddy, prep) = drives();
+        let run = |xsalt: fn(usize) -> u64| {
+            echoes_with_salt(s, a, NV, &[&one, &one], &[T2Volume::Uniform(80.0)], &fm, None, &acq, &[30.0, 55.0],
+                             &eddy, &prep, &PhaseModel::hbcd_like(), 21, None, None, echo_salt, xsalt)
+        };
+        let worst = |out: &[(Vec<f32>, Vec<f32>)]| {
+            let (c0, c1) = (complex(&out[0].0, &out[0].1), complex(&out[1].0, &out[1].1));
+            let f = (-25.0f64 / 80.0).exp();
+            let peak = c0.iter().map(|c| c.0.hypot(c.1)).fold(0.0, f64::max);
+            c0.iter().zip(&c1).map(|(a, b)| (b.0 - f * a.0).hypot(b.1 - f * a.1)).fold(0.0, f64::max) / peak
+        };
+        let shared = worst(&run(zero));
+        // f32 magnitude and phase: half an ulp each, at phases up to pi (ulp 2^-22)
+        let tol = 4.0 * 2f64.powi(-24);
+        assert!(shared < tol, "shared shot phase: worst relative error {shared:e} >= {tol:e}");
+        let salted = worst(&run(echo_salt));
+        assert!(salted > 1e3 * tol, "salting the excitation seed should change the shot phase: {salted:e}");
+    }
+
+    #[test]
+    #[should_panic(expected = "echo times must increase strictly")]
+    fn echo_times_must_increase() {
+        let (imgs, fm) = (images(), fmap(true));
+        echoes(&base(), &imgs, &fm, &[30.0, 30.0], 1, None, None, zero);
     }
 }
