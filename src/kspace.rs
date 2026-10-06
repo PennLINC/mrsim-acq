@@ -1575,8 +1575,9 @@ fn acquire_volumes(
 }
 
 /// The receiver-seed salt of echo `e` in [`simulate_acquisition_echoes`]: zero for the first echo,
-/// so a one-echo call is [`simulate_acquisition_oversampled`] bit for bit.
-fn echo_salt(e: usize) -> u64 {
+/// so a one-echo call is [`simulate_acquisition_oversampled`] bit for bit. Public so a caller can
+/// record the receiver seeds it produced.
+pub fn echo_salt(e: usize) -> u64 {
     (e as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)
 }
 
