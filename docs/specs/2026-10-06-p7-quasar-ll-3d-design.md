@@ -38,8 +38,8 @@ What exists today, checked against the source (`aslscan` and `mrsim-acq` at `p6-
   - `delta_m_read` (`kinetic.rs:265`) sums it over the windows between excitations, weighting
     each window by the `cos(a)` of every later readout.
   - The full bolus is the only labeling it takes. There is no sub-bolus or intravascular form.
-  - Its PASL branch forms `exp(kk t)` and `exp(-kk u)` separately (`kinetic.rs:251-254`). This is
-    the form `delta_m_iv` had to avoid for short `T1''` (`pasl_stable`, `kinetic.rs:190`).
+  - Its PASL branch forms `exp(kk t)` and `exp(-kk u)` separately (`kinetic.rs:248`). This is
+    the form `delta_m_iv` had to avoid for short `T1''` (`pasl_stable`, `kinetic.rs:189`).
 - **The pieces P7 composes exist as single-readout functions.**
   - The intravascular part `delta_m_iv` (`kinetic.rs:156`) is the GKM with `T1'` replaced by
     `T1'' = (1/T1' + 1/tau_ex)^-1`.
