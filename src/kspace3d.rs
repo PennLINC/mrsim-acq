@@ -31,7 +31,8 @@ use crate::kspace::{
     Rng, SliceInput, T2Slice, T2Volume, C,
 };
 use crate::phase::{PhaseModel, ShotPhase};
-use crate::readout::{grase_lines, EchoTrain, Grase3dTable, Readout3d};
+use crate::kspace::echo_salt;
+use crate::readout::{ge3d_lines, grase_lines, EchoTrain, ExcitationTrain, Ge3dReadout, Ge3dTable, Grase3dTable, Readout3d};
 
 /// The salt of the 3D path's noise and spike streams ("3DREAD").
 pub const SEED_SALT_3D: u64 = 0x3344_5245_4144;
@@ -480,6 +481,255 @@ pub fn simulate_acquisition_3d(
         }
     }
     (mag, ph)
+}
+
+// ---- the 3D gradient-echo train (P7 addendum, part C) ----
+
+/// One volume's input to [`simulate_acquisition_3d_ge`], built on demand by the caller.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeVolume {
+    /// Per compartment, one volume on the simulation grid (`x + snx*(y + sny*z)`); an empty image
+    /// is a compartment this volume does not use (its weights must be zero).
+    pub images: Vec<Vec<f32>>,
+    /// `w[(p * ky_segments + sy) * n_compartments + c]`: the scalar multiplying compartment `c`'s
+    /// object for the excitation that reads partition `p` at in-plane segment `sy`. It carries the
+    /// longitudinal state of the train: its approach to the steady state, the label's depletion and
+    /// kinetics, the per-shot physiology and gains.
+    pub weights: Vec<f64>,
+    /// P5's per-shot images, for per-shot motion; `None` when every shot sees `images`.
+    pub shot_images: Option<Vec<ShotSet>>,
+}
+
+/// The gradient-echo decay of a line read `trf_ms` after its excitation,
+/// `exp(-trf (1/T2 + 1/T2'))`, with infinite times meaning no decay.
+fn ge_line_weight(trf_ms: f64, t2_ms: f64, t2p_ms: f64) -> f64 {
+    let d2 = if t2_ms.is_infinite() { 0.0 } else { trf_ms / t2_ms };
+    let dp = if t2p_ms.is_infinite() { 0.0 } else { trf_ms / t2p_ms };
+    (-d2 - dp).exp()
+}
+
+/// Everything the gradient-echo train's forward needs, resolved once per call.
+struct GePlan<'a> {
+    snx: usize,
+    sny: usize,
+    nz: usize,
+    nx: usize,
+    ny: usize,
+    o: usize,
+    ncomp: usize,
+    acq: &'a Acquisition,
+    train: &'a ExcitationTrain,
+    ky_segments: usize,
+    table: Ge3dTable,
+    /// Per compartment: `Some((T2, T2'))` where every relaxation input is uniform (the decay is a
+    /// line weight), `None` where it is applied per voxel inside the forward.
+    class: Vec<Option<(f64, f64)>>,
+    t2: &'a [T2Volume<'a>],
+    t_inhom: Option<&'a [T2Volume<'a>]>,
+    fmap: &'a [f32],
+    phase: &'a PhaseModel,
+    zk: Vec<C>,
+    mask: Vec<bool>,
+}
+
+impl GePlan<'_> {
+    /// Each used compartment's 3D k-space at echo `e` from one set of images (`img(c, vox)`),
+    /// coil `q`, with its decay but not its weights: `out[c][(p * ny + ky) * nx + kx]`. Each
+    /// excitation's echo is a gradient echo at `TE_e`: the 2D forward with gradient-echo formation
+    /// at `t_echo = TE_e` adds the static `2 pi fmap TE_e` and the readout's off-resonance; the decay
+    /// `exp(-(TE_e + t)(1/T2 + 1/T2'))` is a line weight (class) or the forward's own (voxel).
+    fn compartments<F: Fn(usize, usize) -> f32>(&self, img: F, used: &[bool], q: usize, ncoils: usize, e: usize) -> Vec<Vec<C>> {
+        let (snx, sny, nz, nx, ny) = (self.snx, self.sny, self.nz, self.nx, self.ny);
+        let nplane = snx * sny;
+        let te = self.train.echo_times_ms[e];
+        let base = Acquisition {
+            echo: EchoFormation::Gradient, t_echo: te, noise_variance: 0.0, n_spikes: 0, ..self.acq.clone()
+        };
+        let norel = Acquisition { do_relaxation: false, ..base.clone() };
+        let rel = Acquisition { do_relaxation: true, ..base };
+        let t = &self.table.block.t_ms;
+        let within = LineTiming {
+            t_ms: t.clone(),
+            trf_ms: t.iter().map(|x| te + x).collect(),
+            tread_ms: t.clone(),
+            polarity: self.table.block.polarity.clone(),
+        };
+        let zero_shot = ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] };
+        let phis: Vec<Vec<f64>> = (0..nz).map(|z| phase_slice(self.phase, &zero_shot, snx, sny, self.o, z, nz)).collect();
+        let mut out = vec![Vec::new(); self.ncomp];
+        for c in (0..self.ncomp).filter(|&c| used[c]) {
+            let voxel = self.class[c].is_none() && self.acq.do_relaxation;
+            let acq_c = if voxel { &rel } else { &norel };
+            let k2: Vec<Vec<C>> = (0..nz).map(|z| {
+                let pl: Vec<f32> = (0..nplane).map(|i| img(c, z * nplane + i)).collect();
+                let refs = [&pl[..]];
+                let t2s = [slice_of(&self.t2[c], z, nplane)];
+                let tis = self.t_inhom.map(|ti| [slice_of(&ti[c], z, nplane)]);
+                let inp = SliceInput {
+                    compartments: &refs, t2: &t2s, t_inhom: tis.as_ref().map(|a| a.as_slice()),
+                    fmap: &self.fmap[z * nplane..(z + 1) * nplane], phase0: Some(&phis[z]), sim: [snx, sny],
+                    acq_matrix: [nx, ny], z, nz, eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None,
+                };
+                build_coil_kspace_timed(&inp, acq_c, q, ncoils, &within, None)
+            }).collect();
+            let mut kc = vec![C::ZERO; nz * ny * nx];
+            for p in 0..nz {
+                for ky in 0..ny {
+                    let w = match (self.class[c], self.acq.do_relaxation) {
+                        (Some((t2, t2p)), true) => ge_line_weight(te + t[ky], t2, t2p),
+                        _ => 1.0,
+                    };
+                    for kx in 0..nx {
+                        let mut acc = C::ZERO;
+                        for (z, k2z) in k2.iter().enumerate() {
+                            acc = acc.add(k2z[ky * nx + kx].mul(self.zk[p * nz + z]));
+                        }
+                        kc[(p * ny + ky) * nx + kx] = acc.scale(w);
+                    }
+                }
+            }
+            out[c] = kc;
+        }
+        out
+    }
+
+    /// The acquired 3D k-space of one volume at echo `e`, coil `q`, before spikes and noise: per
+    /// line, the compartment sum weighted by the excitation that reads it, from the images its shot
+    /// saw.
+    fn kspace(&self, vol: &GeVolume, q: usize, ncoils: usize, e: usize) -> Vec<C> {
+        let (nz, nx, ny, ncomp) = (self.nz, self.nx, self.ny, self.ncomp);
+        let used: Vec<bool> = vol.images.iter().map(|i| !i.is_empty()).collect();
+        let base = self.compartments(|c, v| vol.images[c][v], &used, q, ncoils, e);
+        let sets = vol.shot_images.as_deref().unwrap_or(&[]);
+        let moved: Vec<Vec<Vec<C>>> = sets.iter().map(|s| self.compartments(|c, v| s.images[c][v], &used, q, ncoils, e)).collect();
+        let mut k = vec![C::ZERO; nz * ny * nx];
+        for p in 0..nz {
+            for ky in 0..ny {
+                if !self.mask[ky * nx] {
+                    continue;
+                }
+                let line = self.table.line(p, ky);
+                let sy = ky % self.ky_segments;
+                let src = sets.iter().position(|s| s.shots.contains(&line.shot)).map_or(&base, |i| &moved[i]);
+                for (c, kc) in src.iter().enumerate().filter(|(c, _)| used[*c]) {
+                    let w = vol.weights[(p * self.ky_segments + sy) * ncomp + c];
+                    for kx in 0..nx {
+                        let i = (p * ny + ky) * nx + kx;
+                        k[i] = k[i].add(kc[i].scale(w));
+                    }
+                }
+            }
+        }
+        k
+    }
+}
+
+/// The reconstructed complex volumes of a 3D gradient-echo series, `f64`, per volume per echo,
+/// layout `vox = x + nx*(y + ny*z)`: [`simulate_acquisition_3d_ge`] before its `f32` cast.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn simulate_acquisition_3d_ge_complex(
+    sim_dims: [usize; 3], acq_dims: [usize; 3], n_volumes: usize, t2: &[T2Volume], fmap: &[f32],
+    t_inhom: Option<&[T2Volume]>, acq: &Acquisition, train: &ExcitationTrain, readout: &Ge3dReadout,
+    volume: &(dyn Fn(usize) -> GeVolume + Sync), phase: &PhaseModel, seed: u64,
+) -> Vec<Vec<Vec<(f64, f64)>>> {
+    let [snx, sny, nz] = sim_dims;
+    let [nx, ny, nzo] = acq_dims;
+    assert_eq!(nz, nzo, "partition count must match; z is never oversampled");
+    assert!(snx % nx == 0 && sny % ny == 0, "sim grid must be an integer multiple of the acquired matrix");
+    let o = snx / nx;
+    assert_eq!(o, sny / ny, "oversampling must match on both axes");
+    let nvox = snx * sny * nz;
+    let ncomp = t2.len();
+    assert_eq!(fmap.len(), nvox, "fieldmap is not on the simulation grid");
+    if let Some(ti) = t_inhom {
+        assert_eq!(ti.len(), ncomp, "t_inhom has {} entries for {ncomp} compartments", ti.len());
+    }
+    assert_eq!(acq.echo, EchoFormation::Gradient, "the 3D gradient-echo train is a gradient-echo acquisition");
+    assert!(acq.eddy_strength == 0.0 && acq.eddy_quad == 0.0 && acq.eddy_phase == 0.0,
+            "the eddy model is not available in 3D (an excitation-dependent eddy evolution breaks the z factorization)");
+    assert!(acq.partial_fourier >= 1.0, "partial Fourier is not available on the 3D gradient-echo train");
+    assert_eq!(readout.reverse_phase, acq.reverse_phase, "the readout's phase-encode sign must be the acquisition's");
+    assert!(!train.echo_times_ms.is_empty(), "a 3D gradient-echo train needs at least one echo time");
+    let table = ge3d_lines(train, readout, ny, nz).unwrap_or_else(|e| panic!("{e}"));
+    let class: Vec<Option<(f64, f64)>> = (0..ncomp).map(|c| {
+        let ti = t_inhom.map_or(T2Volume::Uniform(acq.t_inhom as f32), |t| t[c]);
+        match (t2[c], ti) {
+            (T2Volume::Uniform(a), T2Volume::Uniform(b)) => Some((a as f64, b as f64)),
+            _ => None,
+        }
+    }).collect();
+    let n_exc_lines = nz * readout.ky_segments * ncomp;
+    let pl = GePlan {
+        snx, sny, nz, nx, ny, o, ncomp, acq, train, ky_segments: readout.ky_segments, table, class, t2, t_inhom, fmap,
+        phase, zk: zkernel(nz), mask: sampling_mask(nx, ny, acq),
+    };
+    let ncoils = acq.n_coils.max(1);
+    let sigma = (acq.noise_variance / (nx * ny) as f64).sqrt();
+    let per_vol = |g: usize| -> Vec<Vec<(f64, f64)>> {
+        let vol = volume(g);
+        assert_eq!(vol.images.len(), ncomp, "volume {g}: {} compartment images for {ncomp} compartments", vol.images.len());
+        for (c, im) in vol.images.iter().enumerate() {
+            assert!(im.is_empty() || im.len() == nvox, "volume {g}: compartment {c} is not on the simulation grid");
+        }
+        assert_eq!(vol.weights.len(), n_exc_lines, "volume {g}: weights are not (partition, ky segment, compartment)");
+        for (c, im) in vol.images.iter().enumerate() {
+            if im.is_empty() {
+                assert!((0..nz * readout.ky_segments).all(|x| vol.weights[x * ncomp + c] == 0.0),
+                        "volume {g}: compartment {c} has no image but a nonzero weight");
+            }
+        }
+        if let Some(sets) = &vol.shot_images {
+            for s in sets {
+                assert!(s.images.len() == ncomp && s.images.iter().zip(&vol.images).all(|(a, b)| a.len() == b.len()),
+                        "volume {g}: shot images are not the volume's compartments");
+                assert!(s.shots.iter().all(|&x| x < pl.table.n_shots), "a shot index beyond the train's {}", pl.table.n_shots);
+            }
+        }
+        (0..train.echo_times_ms.len()).map(|e| {
+            // the receiver noise of echo e on its own streams (P6's echo salt; echo 0 unsalted)
+            let seed_e = seed ^ echo_salt(e);
+            let coil_parts: Vec<Vec<Vec<C>>> = (0..ncoils).map(|q| {
+                let mut k = pl.kspace(&vol, q, ncoils, e);
+                partitions_to_slices(&mut k, &pl.mask, &pl.zk, [nx, ny, nz], g, q, seed_e, acq, sigma)
+            }).collect();
+            reconstruct_slices(&coil_parts, acq, [nx, ny, nz])
+        }).collect()
+    };
+    #[cfg(feature = "par")]
+    let vols: Vec<Vec<Vec<(f64, f64)>>> = {
+        use rayon::prelude::*;
+        (0..n_volumes).into_par_iter().map(per_vol).collect()
+    };
+    #[cfg(not(feature = "par"))]
+    let vols: Vec<Vec<Vec<(f64, f64)>>> = (0..n_volumes).map(per_vol).collect();
+    vols
+}
+
+/// The 3D gradient-echo stack-of-EPI acquisition of a series (P7 addendum, part C): one call per
+/// series, each volume's images and per-excitation weights built on demand by `volume(g)` (called
+/// once per volume, from the worker that simulates it), so memory scales with the volumes in
+/// flight. The noise and spike streams are keyed on `(volume, partition)` and salted per echo.
+/// Returns per echo magnitude and phase, `f32`, layout `vox * n_volumes + g`.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_acquisition_3d_ge(
+    sim_dims: [usize; 3], acq_dims: [usize; 3], n_volumes: usize, t2: &[T2Volume], fmap: &[f32],
+    t_inhom: Option<&[T2Volume]>, acq: &Acquisition, train: &ExcitationTrain, readout: &Ge3dReadout,
+    volume: &(dyn Fn(usize) -> GeVolume + Sync), phase: &PhaseModel, seed: u64,
+) -> Vec<(Vec<f32>, Vec<f32>)> {
+    let vols = simulate_acquisition_3d_ge_complex(sim_dims, acq_dims, n_volumes, t2, fmap, t_inhom, acq, train, readout,
+                                                  volume, phase, seed);
+    let nvox = acq_dims.iter().product::<usize>();
+    (0..train.echo_times_ms.len()).map(|e| {
+        let (mut mag, mut ph) = (vec![0.0f32; nvox * n_volumes], vec![0.0f32; nvox * n_volumes]);
+        for (g, v) in vols.iter().enumerate() {
+            for (vox, &(re, im)) in v[e].iter().enumerate() {
+                let (re, im) = (re as f32, im as f32);
+                mag[vox * n_volumes + g] = (re * re + im * im).sqrt();
+                ph[vox * n_volumes + g] = im.atan2(re);
+            }
+        }
+        (mag, ph)
+    }).collect()
 }
 
 // ---- the stack of spirals (P5 addendum, part C) ----
@@ -1439,5 +1689,280 @@ mod tests {
         let acq = Acquisition { do_distortions: true, ..Acquisition::default() };
         let e = spiral_segmentation([s, s, nz], [n, n, nz], &t2, None, &wild, None, &acq, &tr, &spiral_ro()).unwrap_err();
         assert!(e.contains("slice 0") && e.contains("64 segments"), "{e}");
+    }
+
+    // ---- P7 part C: the 3D gradient-echo train
+
+    /// A fieldmap with a linear gradient and a bump (Hz), not constant, on the simulation grid.
+    fn varying_fmap(snx: usize, sny: usize, nz: usize) -> Vec<f32> {
+        (0..snx * sny * nz).map(|v| {
+            let (x, y, z) = (v % snx, (v / snx) % sny, v / (snx * sny));
+            let (fx, fy) = (x as f64 / snx as f64 - 0.5, y as f64 / sny as f64 - 0.5);
+            (25.0 * fx - 10.0 * fy + 15.0 * (-(fx * fx + fy * fy) / 0.02).exp() + 2.0 * z as f64) as f32
+        }).collect()
+    }
+
+    fn ge_train3(kz_segments: usize, tes: Vec<f64>) -> ExcitationTrain {
+        ExcitationTrain { kz_segments, kz_order: KzOrder::Linear, exc_spacing_ms: 60.0, echo_times_ms: tes, excitation_time_ms: 2.0 }
+    }
+
+    fn ge_acq(n_coils: usize) -> Acquisition {
+        Acquisition { echo: EchoFormation::Gradient, n_coils, signal_scale: 100.0, t_inhom: 45.0, ..Acquisition::default() }
+    }
+
+    /// The volume of `img` (one volume, voxel layout) with weight `w(p, sy, c)`.
+    fn ge_volume(img: &[Vec<f32>], nz: usize, ky_segments: usize, w: impl Fn(usize, usize, usize) -> f64) -> GeVolume {
+        let ncomp = img.len();
+        let mut weights = vec![0.0; nz * ky_segments * ncomp];
+        for p in 0..nz {
+            for sy in 0..ky_segments {
+                for c in 0..ncomp {
+                    weights[(p * ky_segments + sy) * ncomp + c] = w(p, sy, c);
+                }
+            }
+        }
+        GeVolume { images: img.to_vec(), weights, shot_images: None }
+    }
+
+    /// The reference: per slice and coil, the 2D forward with gradient-echo formation at `TE`, its
+    /// own decay at `trf = TE + t` (the block's line times), the fieldmap's static and readout
+    /// phase; the 3D k-space as the z-DFT of those, each partition times `w(p)`, back by the inverse
+    /// z-DFT; each slice through the 2D reconstruction. No code of the 3D gradient-echo path.
+    #[allow(clippy::too_many_arguments)]
+    fn ge_reference(img: &[f32], t2: f32, ti: f32, fmap: &[f32], acq: &Acquisition, te: f64, ro: &Ge3dReadout,
+                    dims: [usize; 3], o: usize, w: &dyn Fn(usize) -> f64) -> Vec<(f64, f64)> {
+        let [nx, ny, nz] = dims;
+        let (snx, sny) = (nx * o, ny * o);
+        let nplane = snx * sny;
+        let block = crate::readout::grase_block(ny, ro.ky_segments, ro.t_line_ms, ro.reverse_phase).unwrap();
+        let timing = LineTiming {
+            t_ms: block.t_ms.clone(), trf_ms: block.t_ms.iter().map(|t| te + t).collect(), tread_ms: block.t_ms.clone(),
+            polarity: block.polarity.clone(),
+        };
+        let a = Acquisition { t_echo: te, do_relaxation: true, noise_variance: 0.0, n_spikes: 0, ..acq.clone() };
+        let phase = PhaseModel::none();
+        let ncoils = acq.n_coils.max(1);
+        let zk = zkernel(nz);
+        let mut coil_parts = Vec::new();
+        for q in 0..ncoils {
+            let k2: Vec<Vec<C>> = (0..nz).map(|z| {
+                let pl = &img[z * nplane..(z + 1) * nplane];
+                let phi = phase_slice(&phase, &zero_shot(), snx, sny, o, z, nz);
+                let refs = [pl];
+                let t2s = [T2Slice::Uniform(t2)];
+                let tis = [T2Slice::Uniform(ti)];
+                let inp = SliceInput {
+                    compartments: &refs, t2: &t2s, t_inhom: Some(&tis), fmap: &fmap[z * nplane..(z + 1) * nplane],
+                    phase0: Some(&phi), sim: [snx, sny], acq_matrix: [nx, ny], z, nz, eddy_drive: None, prep_drive: None,
+                    slice_seed: 0, eddy_lin: None,
+                };
+                build_coil_kspace_timed(&inp, &a, q, ncoils, &timing, None)
+            }).collect();
+            let mut slices = vec![vec![C::ZERO; ny * nx]; nz];
+            for (z, sl) in slices.iter_mut().enumerate() {
+                for p in 0..nz {
+                    let kc = zk[p * nz + z];
+                    let conj = C { re: kc.re, im: -kc.im };
+                    for i in 0..ny * nx {
+                        let mut kp = C::ZERO;
+                        for (zz, k2z) in k2.iter().enumerate() {
+                            kp = kp.add(k2z[i].mul(zk[p * nz + zz]));
+                        }
+                        sl[i] = sl[i].add(kp.scale(w(p)).mul(conj));
+                    }
+                }
+                for c in sl.iter_mut() {
+                    *c = c.scale(1.0 / nz as f64);
+                }
+            }
+            coil_parts.push(slices);
+        }
+        let mut out = vec![(0.0, 0.0); nx * ny * nz];
+        for z in 0..nz {
+            let coils: Vec<Vec<C>> = coil_parts.iter().map(|cp| cp[z].clone()).collect();
+            for (i, c) in reconstruct_coils(coils, acq, [nx, ny]).iter().enumerate() {
+                out[i + nx * ny * z] = (c.re, c.im);
+            }
+        }
+        out
+    }
+
+    /// One shot, constant weights, two echoes, a varying fieldmap: each echo equals the
+    /// reference, in class mode (uniform T2) and voxel mode (a T2 map). A fieldmap phase taken as
+    /// a line weight (its mean, applied uniformly) is far from it: the static phase is per voxel.
+    #[test]
+    fn ge3d_matches_the_reference_forward() {
+        let (nx, ny, nz, o) = (16usize, 16usize, 4usize, 2usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let nvox = snx * sny * nz;
+        let img: Vec<f32> = blobs(snx, sny, nz, 1, 1).remove(0);
+        let fmap = varying_fmap(snx, sny, nz);
+        let ro = Ge3dReadout { ky_segments: 1, t_line_ms: 0.4, reverse_phase: false };
+        let tes = vec![12.0, 30.0];
+        let tr = ge_train3(1, tes.clone());
+        let t2map = vec![80.0f32; nvox];
+        let phase = PhaseModel::none();
+        for n_coils in [1usize, 3] {
+            let acq = ge_acq(n_coils);
+            for (mode, t2v) in [("class", T2Volume::Uniform(80.0)), ("voxel", T2Volume::Map(&t2map))] {
+                let t2 = [t2v];
+                let ti = [T2Volume::Uniform(45.0)];
+                let vol = |_g: usize| ge_volume(std::slice::from_ref(&img), nz, 1, |_, _, _| 0.7);
+                let got = simulate_acquisition_3d_ge_complex([snx, sny, nz], [nx, ny, nz], 1, &t2, &fmap, Some(&ti), &acq,
+                                                             &tr, &ro, &vol, &phase, 5);
+                for (e, &te) in tes.iter().enumerate() {
+                    let want = ge_reference(&img, 80.0, 45.0, &fmap, &acq, te, &ro, [nx, ny, nz], o, &|_| 0.7);
+                    let d = maxdiff(&got[0][e], &want);
+                    assert!(d <= 1e-9 * peak(&want), "{mode} coils {n_coils} echo {e}: {d:e} of {:e}", peak(&want));
+                }
+            }
+            // the negative control: the fieldmap's phase as one line weight (the mean) misses it
+            let zero = vec![0.0f32; nvox];
+            let mean = fmap.iter().map(|&f| f as f64).sum::<f64>() / nvox as f64;
+            let flat = ge_reference(&img, 80.0, 45.0, &zero, &acq, 30.0, &ro, [nx, ny, nz], o, &|_| 0.7);
+            let rot = C { re: (TAU * mean * 0.030).cos(), im: (TAU * mean * 0.030).sin() };
+            let as_weight: Vec<(f64, f64)> = flat.iter().map(|&(a, b)| { let c = C { re: a, im: b }.mul(rot); (c.re, c.im) }).collect();
+            let want = ge_reference(&img, 80.0, 45.0, &fmap, &acq, 30.0, &ro, [nx, ny, nz], o, &|_| 0.7);
+            assert!(maxdiff(&as_weight, &want) > 0.05 * peak(&want), "the fieldmap's phase is not per voxel here");
+        }
+    }
+
+    /// Weights that vary across partitions blur through-plane: the result is the inverse z-DFT of
+    /// `w_p` times the z-DFT of the object (the reference with `w(p)`), and differs from constant
+    /// weights.
+    #[test]
+    fn ge3d_weights_across_partitions_blur_through_plane() {
+        let (nx, ny, nz, o) = (12usize, 12usize, 6usize, 2usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let img: Vec<f32> = blobs(snx, sny, nz, 1, 1).remove(0);
+        let fmap = varying_fmap(snx, sny, nz);
+        let ro = Ge3dReadout { ky_segments: 1, t_line_ms: 0.4, reverse_phase: false };
+        let tr = ge_train3(2, vec![12.0]);
+        let acq = ge_acq(2);
+        let w = |p: usize| 1.0 + 0.5 * (p as f64 * 1.3).cos();
+        let vol = |_g: usize| ge_volume(std::slice::from_ref(&img), nz, 1, |p, _, _| w(p));
+        let got = simulate_acquisition_3d_ge_complex([snx, sny, nz], [nx, ny, nz], 1, &[T2Volume::Uniform(80.0)], &fmap,
+                                                     Some(&[T2Volume::Uniform(45.0)]), &acq, &tr, &ro, &vol, &PhaseModel::none(), 5);
+        let want = ge_reference(&img, 80.0, 45.0, &fmap, &acq, 12.0, &ro, [nx, ny, nz], o, &w);
+        assert!(maxdiff(&got[0][0], &want) <= 1e-9 * peak(&want));
+        let flat = ge_reference(&img, 80.0, 45.0, &fmap, &acq, 12.0, &ro, [nx, ny, nz], o, &|_| 1.0);
+        assert!(maxdiff(&flat, &want) > 0.01 * peak(&want));
+    }
+
+    /// Echo 0 of a two-echo call is the one-echo call bit for bit (noise and spikes on); echo 1
+    /// with noise off is the one-echo call at its TE; the noise of the two echoes is uncorrelated.
+    #[test]
+    fn ge3d_echoes() {
+        let (nx, ny, nz, o, nv) = (12usize, 12usize, 4usize, 2usize, 2usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let imgs = blobs(snx, sny, nz, nv, 1);
+        let one_vol = |g: usize| -> Vec<f32> { (0..snx * sny * nz).map(|v| imgs[0][v * nv + g]).collect() };
+        let fmap = varying_fmap(snx, sny, nz);
+        let ro = Ge3dReadout { ky_segments: 2, t_line_ms: 0.4, reverse_phase: false };
+        let t2 = [T2Volume::Uniform(80.0)];
+        let run = |tes: Vec<f64>, acq: &Acquisition| {
+            let vol = |g: usize| ge_volume(&[one_vol(g)], nz, 2, |p, sy, _| 0.5 + 0.1 * p as f64 + 0.05 * sy as f64);
+            simulate_acquisition_3d_ge([snx, sny, nz], [nx, ny, nz], nv, &t2, &fmap, None, acq, &ge_train3(2, tes), &ro,
+                                       &vol, &PhaseModel::none(), 77)
+        };
+        let noisy = Acquisition { noise_variance: 0.5, n_spikes: 2, ..ge_acq(2) };
+        let two = run(vec![12.0, 30.0], &noisy);
+        let one = run(vec![12.0], &noisy);
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!((bits(&two[0].0), bits(&two[0].1)), (bits(&one[0].0), bits(&one[0].1)));
+        let quiet = ge_acq(2);
+        let q2 = run(vec![12.0, 30.0], &quiet);
+        let q1 = run(vec![30.0], &quiet);
+        assert_eq!((bits(&q2[1].0), bits(&q2[1].1)), (bits(&q1[0].0), bits(&q1[0].1)));
+        // the noise residuals of echoes 0 and 1 at the same echo time: uncorrelated
+        let n_only = Acquisition { noise_variance: 0.5, ..ge_acq(2) };
+        let a = run(vec![12.0, 12.0], &n_only);
+        let b = run(vec![12.0, 12.0], &quiet);
+        let resid = |e: usize| -> Vec<(f64, f64)> {
+            (0..a[e].0.len()).map(|i| {
+                let c = |m: f32, p: f32| (m as f64 * (p as f64).cos(), m as f64 * (p as f64).sin());
+                let (x, y) = (c(a[e].0[i], a[e].1[i]), c(b[e].0[i], b[e].1[i]));
+                (x.0 - y.0, x.1 - y.1)
+            }).collect()
+        };
+        let (r0, r1) = (resid(0), resid(1));
+        let dot: f64 = r0.iter().zip(&r1).map(|(u, v)| u.0 * v.0 + u.1 * v.1).sum();
+        let n0: f64 = r0.iter().map(|u| u.0 * u.0 + u.1 * u.1).sum();
+        let n1: f64 = r1.iter().map(|u| u.0 * u.0 + u.1 * u.1).sum();
+        let corr = dot / (n0 * n1).sqrt();
+        assert!(n0 > 0.0 && corr.abs() < 3.0 / ((2 * r0.len()) as f64).sqrt(), "echo noise correlation {corr}");
+    }
+
+    /// `volume(g)` is called once per volume and its result, under one thread and under many, equals
+    /// the same call fed precomputed volumes, bit for bit (noise and spikes on).
+    #[test]
+    fn ge3d_volumes_on_demand() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (nx, ny, nz, o, nv) = (12usize, 12usize, 4usize, 2usize, 5usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let imgs = blobs(snx, sny, nz, nv, 2);
+        let pre: Vec<GeVolume> = (0..nv).map(|g| {
+            let im: Vec<Vec<f32>> = imgs.iter().map(|c| (0..snx * sny * nz).map(|v| c[v * nv + g]).collect()).collect();
+            ge_volume(&im, nz, 1, |p, _, c| 0.3 + 0.1 * (p + c + g) as f64)
+        }).collect();
+        let fmap = varying_fmap(snx, sny, nz);
+        let t2 = [T2Volume::Uniform(80.0), T2Volume::Uniform(120.0)];
+        let ro = Ge3dReadout { ky_segments: 1, t_line_ms: 0.4, reverse_phase: false };
+        let acq = Acquisition { noise_variance: 0.2, n_spikes: 1, ..ge_acq(2) };
+        let calls = AtomicUsize::new(0);
+        let vol = |g: usize| { calls.fetch_add(1, Ordering::SeqCst); pre[g].clone() };
+        let run = || simulate_acquisition_3d_ge([snx, sny, nz], [nx, ny, nz], nv, &t2, &fmap, None, &acq,
+                                                &ge_train3(1, vec![12.0]), &ro, &vol, &PhaseModel::none(), 3);
+        let a = run();
+        assert_eq!(calls.load(Ordering::SeqCst), nv);
+        #[cfg(feature = "par")]
+        let b = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap().install(run);
+        #[cfg(not(feature = "par"))]
+        let b = run();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!((bits(&a[0].0), bits(&a[0].1)), (bits(&b[0].0), bits(&b[0].1)));
+        // an unused compartment (empty image, zero weights) is skipped and changes nothing
+        let pre2: Vec<GeVolume> = pre.iter().map(|v| {
+            let mut images = v.images.clone();
+            images.push(Vec::new());
+            let mut weights = Vec::new();
+            for x in v.weights.chunks(2) {
+                weights.extend_from_slice(x);
+                weights.push(0.0);
+            }
+            GeVolume { images, weights, shot_images: None }
+        }).collect();
+        let t2b = [T2Volume::Uniform(80.0), T2Volume::Uniform(120.0), T2Volume::Uniform(60.0)];
+        let c = simulate_acquisition_3d_ge([snx, sny, nz], [nx, ny, nz], nv, &t2b, &fmap, None, &acq,
+                                           &ge_train3(1, vec![12.0]), &ro, &|g| pre2[g].clone(), &PhaseModel::none(), 3);
+        assert_eq!((bits(&a[0].0), bits(&a[0].1)), (bits(&c[0].0), bits(&c[0].1)));
+    }
+
+    /// The refusals: a compartment count other than `t2`'s, a spin-echo acquisition, the eddy model,
+    /// partial Fourier, a weight on a compartment without an image.
+    #[test]
+    fn ge3d_refusals() {
+        let (n, nz, o) = (12usize, 4usize, 2usize);
+        let s = n * o;
+        let img = vec![1.0f32; s * s * nz];
+        let fmap = vec![0.0f32; s * s * nz];
+        let ro = Ge3dReadout { ky_segments: 1, t_line_ms: 0.4, reverse_phase: false };
+        let tr = ge_train3(1, vec![12.0]);
+        let t2 = [T2Volume::Uniform(80.0)];
+        let fail = |acq: Acquisition, v: GeVolume, msg: &str| {
+            let r = std::panic::catch_unwind(|| {
+                simulate_acquisition_3d_ge_complex([s, s, nz], [n, n, nz], 1, &t2, &fmap, None, &acq, &tr, &ro, &|_| v.clone(),
+                                                   &PhaseModel::none(), 1)
+            });
+            let e = r.expect_err(msg);
+            let text = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap();
+            assert!(text.contains(msg), "{text}");
+        };
+        let ok = ge_volume(std::slice::from_ref(&img), nz, 1, |_, _, _| 1.0);
+        fail(ge_acq(1), ge_volume(&[img.clone(), img.clone()], nz, 1, |_, _, _| 1.0), "compartment images");
+        fail(Acquisition { echo: EchoFormation::Spin, ..ge_acq(1) }, ok.clone(), "gradient-echo acquisition");
+        fail(Acquisition { eddy_strength: 1.0, ..ge_acq(1) }, ok.clone(), "eddy");
+        fail(Acquisition { partial_fourier: 0.75, ..ge_acq(1) }, ok.clone(), "partial Fourier");
+        fail(ge_acq(1), GeVolume { images: vec![Vec::new()], ..ok.clone() }, "no image but a nonzero weight");
     }
 }
