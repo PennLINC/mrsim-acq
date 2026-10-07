@@ -223,6 +223,72 @@ impl Plan<'_> {
     }
 }
 
+/// One coil's acquired 3D k-space of volume `g` (layout `(p * ny + ky) * nx + kx`) to its 2D
+/// k-spaces per slice: spikes and noise per acquired sample on the `(volume, partition)` streams of
+/// `seed` (part B, "Seeds"), then the inverse z-DFT normalized by `1/nz`. Shared by the GRASE and
+/// the gradient-echo trains (P7).
+#[allow(clippy::too_many_arguments)]
+fn partitions_to_slices(k: &mut [C], mask: &[bool], zk: &[C], dims: [usize; 3], g: usize, q: usize, seed: u64,
+                        acq: &Acquisition, sigma: f64) -> Vec<Vec<C>> {
+    let [nx, ny, nz] = dims;
+    for p in 0..nz {
+        let part = &mut k[p * ny * nx..(p + 1) * ny * nx];
+        let pseed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(p as u64).wrapping_mul(0x9E37) ^ seed ^ SEED_SALT_3D;
+        if acq.n_spikes > 0 {
+            let (mut peak, mut peak_mag) = (C::ZERO, 0.0);
+            for c in part.iter() {
+                if c.abs() > peak_mag {
+                    peak_mag = c.abs();
+                    peak = *c;
+                }
+            }
+            let acquired: Vec<usize> = (0..nx * ny).filter(|&i| mask[i]).collect();
+            for pick in spike_picks(pseed, q, &acquired, acq.n_spikes) {
+                part[pick] = peak.scale(acq.spike_amplitude);
+            }
+        }
+        if acq.noise_variance > 0.0 {
+            let mut rng = Rng((pseed ^ (q as u64).wrapping_mul(0x9E37_79B9)) | 1);
+            for (i, c) in part.iter_mut().enumerate() {
+                if mask[i] {
+                    c.re += rng.gauss() * sigma;
+                    c.im += rng.gauss() * sigma;
+                }
+            }
+        }
+    }
+    // inverse z-DFT, normalized by 1/nz: per slice z, a 2D k-space
+    let mut slices = vec![vec![C::ZERO; ny * nx]; nz];
+    for (z, sl) in slices.iter_mut().enumerate() {
+        for p in 0..nz {
+            let kc = zk[p * nz + z];
+            let conj = C { re: kc.re, im: -kc.im };
+            for i in 0..ny * nx {
+                sl[i] = sl[i].add(k[p * ny * nx + i].mul(conj));
+            }
+        }
+        for c in sl.iter_mut() {
+            *c = c.scale(1.0 / nz as f64);
+        }
+    }
+    slices
+}
+
+/// Every slice through the 2D coil reconstruction: `coil_parts[q][z]` to the complex volume,
+/// `vox = x + nx*(y + ny*z)`.
+fn reconstruct_slices(coil_parts: &[Vec<Vec<C>>], acq: &Acquisition, dims: [usize; 3]) -> Vec<(f64, f64)> {
+    let [nx, ny, nz] = dims;
+    let mut out = vec![(0.0, 0.0); nx * ny * nz];
+    for z in 0..nz {
+        let coils: Vec<Vec<C>> = coil_parts.iter().map(|cp| cp[z].clone()).collect();
+        let img = reconstruct_coils(coils, acq, [nx, ny]);
+        for (i, c) in img.iter().enumerate() {
+            out[i + nx * ny * z] = (c.re, c.im);
+        }
+    }
+    out
+}
+
 /// The acquired samples one partition's spikes overwrite, on the stream of `(volume, partition)`
 /// (`pseed`) and coil `q` (part B, "Seeds").
 fn spike_picks(pseed: u64, q: usize, acquired: &[usize], n_spikes: usize) -> Vec<usize> {
@@ -376,57 +442,9 @@ pub(crate) fn simulate_acquisition_3d_complex(
         let mut coil_parts: Vec<Vec<Vec<C>>> = Vec::with_capacity(ncoils);
         for q in 0..ncoils {
             let mut k = pl.kspace(images, n_volumes, g, q, ncoils, line_weights, sets);
-            for p in 0..nz {
-                let part = &mut k[p * ny * nx..(p + 1) * ny * nx];
-                let pseed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(p as u64).wrapping_mul(0x9E37) ^ seed ^ SEED_SALT_3D;
-                if acq.n_spikes > 0 {
-                    let (mut peak, mut peak_mag) = (C::ZERO, 0.0);
-                    for c in part.iter() {
-                        if c.abs() > peak_mag {
-                            peak_mag = c.abs();
-                            peak = *c;
-                        }
-                    }
-                    let acquired: Vec<usize> = (0..nx * ny).filter(|&i| pl.mask[i]).collect();
-                    for pick in spike_picks(pseed, q, &acquired, acq.n_spikes) {
-                        part[pick] = peak.scale(acq.spike_amplitude);
-                    }
-                }
-                if acq.noise_variance > 0.0 {
-                    let mut rng = Rng((pseed ^ (q as u64).wrapping_mul(0x9E37_79B9)) | 1);
-                    for (i, c) in part.iter_mut().enumerate() {
-                        if pl.mask[i] {
-                            c.re += rng.gauss() * sigma;
-                            c.im += rng.gauss() * sigma;
-                        }
-                    }
-                }
-            }
-            // inverse z-DFT, normalized by 1/nz: per slice z, a 2D k-space
-            let mut slices = vec![vec![C::ZERO; ny * nx]; nz];
-            for (z, sl) in slices.iter_mut().enumerate() {
-                for p in 0..nz {
-                    let kc = pl.zk[p * nz + z];
-                    let conj = C { re: kc.re, im: -kc.im };
-                    for i in 0..ny * nx {
-                        sl[i] = sl[i].add(k[p * ny * nx + i].mul(conj));
-                    }
-                }
-                for c in sl.iter_mut() {
-                    *c = c.scale(1.0 / nz as f64);
-                }
-            }
-            coil_parts.push(slices);
+            coil_parts.push(partitions_to_slices(&mut k, &pl.mask, &pl.zk, [nx, ny, nz], g, q, seed, acq, sigma));
         }
-        let mut out = vec![(0.0, 0.0); nx * ny * nz];
-        for z in 0..nz {
-            let coils: Vec<Vec<C>> = coil_parts.iter().map(|cp| cp[z].clone()).collect();
-            let img = reconstruct_coils(coils, acq, [nx, ny]);
-            for (i, c) in img.iter().enumerate() {
-                out[i + nx * ny * z] = (c.re, c.im);
-            }
-        }
-        out
+        reconstruct_slices(&coil_parts, acq, [nx, ny, nz])
     };
     #[cfg(feature = "par")]
     let vols: Vec<Vec<(f64, f64)>> = {
