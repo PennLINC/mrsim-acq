@@ -293,6 +293,153 @@ pub fn check_grase_timing(train: &EchoTrain, table: &Grase3dTable, t_exc_ms: f64
     Ok(())
 }
 
+// ---- the 3D gradient-echo stack-of-EPI train (P7 addendum, part C) ----
+
+/// A segmented 3D gradient-echo train: per shot one small-flip excitation per partition of its kz
+/// segment, in `kz_order`, `exc_spacing_ms` apart, each followed by one EPI block per echo at
+/// `echo_times_ms` from that excitation (strictly increasing). `excitation_time_ms` reserves the
+/// excitation pulse, centred on the excitation. Transverse magnetization is taken to be spoiled
+/// between excitations (no stimulated echoes); the longitudinal state is the caller's, as a
+/// weight per excitation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExcitationTrain {
+    pub kz_segments: usize,
+    pub kz_order: KzOrder,
+    pub exc_spacing_ms: f64,
+    pub echo_times_ms: Vec<f64>,
+    pub excitation_time_ms: f64,
+}
+
+/// The in-plane readout of each echo of a 3D gradient-echo train: GRASE's block
+/// ([`grase_block`]), `ny / ky_segments` interleaved lines centred on the echo, at the actual line
+/// spacing `t_line_ms`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ge3dReadout {
+    pub ky_segments: usize,
+    pub t_line_ms: f64,
+    pub reverse_phase: bool,
+}
+
+/// One acquired line of a 3D gradient-echo train (the same line at every echo).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ge3dLine {
+    /// Canonical shot index `sy kz_segments + sz`, as GRASE's.
+    pub shot: usize,
+    /// The excitation within its shot that reads it, 0-based.
+    pub excitation: usize,
+    /// Time from the echo centre (ms).
+    pub t_ms: f64,
+    pub polarity: i8,
+}
+
+/// Every acquired line of a 3D gradient-echo train, indexed `p * ny + ky`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ge3dTable {
+    pub ny: usize,
+    pub nz: usize,
+    pub lines: Vec<Ge3dLine>,
+    pub block: GraseBlock,
+    pub n_shots: usize,
+    /// Excitations per shot: `nz / kz_segments`.
+    pub n_exc: usize,
+    /// The excitation that reads the kz centre, 0-based.
+    pub e_c: usize,
+}
+
+impl Ge3dTable {
+    pub fn line(&self, p: usize, ky: usize) -> &Ge3dLine {
+        &self.lines[p * self.ny + ky]
+    }
+
+    /// The within-echo timing the relaxation-free 2D forward reads, as GRASE's (`t` and polarity
+    /// per `ky`, the same for every partition and excitation).
+    pub fn within_echo_timing(&self) -> crate::kspace::LineTiming {
+        crate::kspace::LineTiming {
+            t_ms: self.block.t_ms.clone(),
+            trf_ms: self.block.t_ms.clone(),
+            tread_ms: self.block.t_ms.clone(),
+            polarity: self.block.polarity.clone(),
+        }
+    }
+}
+
+/// The line table of a 3D gradient-echo train on `ny x nz`: shot `(sy, sz)` excites the
+/// partitions `kz_order[sz + kz_segments j]`, `j = 0 .. nz / kz_segments`, each read at in-plane
+/// interleave `sy`.
+pub fn ge3d_lines(train: &ExcitationTrain, readout: &Ge3dReadout, ny: usize, nz: usize) -> Result<Ge3dTable, String> {
+    if nz < 2 {
+        return Err(format!("a 3D gradient-echo train on {nz} partition is a 2D readout"));
+    }
+    let block = grase_block(ny, readout.ky_segments, readout.t_line_ms, readout.reverse_phase)?;
+    if train.kz_segments == 0 || !nz.is_multiple_of(train.kz_segments) {
+        return Err(format!("{nz} partitions do not divide into {} kz segments", train.kz_segments));
+    }
+    let n_exc = nz / train.kz_segments;
+    let order = kz_order(nz, train.kz_order);
+    let mut lines = vec![Ge3dLine { shot: 0, excitation: 0, t_ms: 0.0, polarity: 0 }; ny * nz];
+    let mut seen = vec![false; ny * nz];
+    for sy in 0..readout.ky_segments {
+        for sz in 0..train.kz_segments {
+            let shot = sy * train.kz_segments + sz;
+            for j in 0..n_exc {
+                let p = order[sz + train.kz_segments * j];
+                for i in 0..block.epi {
+                    let ky = sy + readout.ky_segments * i;
+                    let at = p * ny + ky;
+                    assert!(!seen[at], "line ({p}, {ky}) read twice");
+                    seen[at] = true;
+                    lines[at] = Ge3dLine { shot, excitation: j, t_ms: block.t_ms[ky], polarity: block.polarity[ky] };
+                }
+            }
+        }
+    }
+    assert!(seen.iter().all(|&s| s), "a line was never read");
+    let n_c = order.iter().position(|&p| p == nz / 2).expect("the centre is a partition");
+    Ok(Ge3dTable { ny, nz, lines, block, n_shots: readout.ky_segments * train.kz_segments, n_exc, e_c: n_c / train.kz_segments })
+}
+
+/// The timing checks of a 3D gradient-echo train on its actual intervals (P7 addendum, part C), in
+/// ms, `t_exc_ms` the shot's first excitation from the start of the repetition: the echo times
+/// strictly increasing; the first block after the end of its excitation pulse; no two blocks of
+/// one excitation overlapping; the last block before the next excitation pulse starts; the last
+/// excitation's last block within the repetition.
+pub fn check_ge3d_timing(train: &ExcitationTrain, table: &Ge3dTable, t_exc_ms: f64, tr_ms: f64) -> Result<(), String> {
+    let tes = &train.echo_times_ms;
+    if tes.is_empty() {
+        return Err("a 3D gradient-echo train needs at least one echo time".to_string());
+    }
+    let half = table.block.t_ms.iter().fold(0.0f64, |m, t| m.max(t.abs())) + table.block.t_line_ms / 2.0;
+    let pulse = train.excitation_time_ms / 2.0;
+    let block = |e: usize| (tes[e] - half, tes[e] + half);
+    if block(0).0 < pulse - 1e-9 {
+        return Err(format!(
+            "echo 1 at {:.4} ms: its {}-line block starts {:.4} ms after the excitation, inside the excitation pulse \
+             (half of {:.3} ms); a later echo time or a shorter block would fit", tes[0], table.block.epi, block(0).0,
+            train.excitation_time_ms));
+    }
+    for e in 1..tes.len() {
+        if block(e).0 < block(e - 1).1 - 1e-9 {
+            return Err(format!(
+                "echo {} at {:.4} ms and echo {} at {:.4} ms: their blocks of {:.4} ms each side overlap", e, tes[e - 1],
+                e + 1, tes[e], half));
+        }
+    }
+    let end = block(tes.len() - 1).1;
+    if end > train.exc_spacing_ms - pulse + 1e-9 {
+        return Err(format!(
+            "the last echo's block ends {:.4} ms after its excitation, after the next excitation pulse starts at {:.4} ms \
+             (excitation spacing {:.4} ms, pulse {:.3} ms): the spacing must be at least {:.4} ms", end,
+            train.exc_spacing_ms - pulse, train.exc_spacing_ms, train.excitation_time_ms, end + pulse));
+    }
+    let last = t_exc_ms + (table.n_exc as f64 - 1.0) * train.exc_spacing_ms + end;
+    if last > tr_ms + 1e-9 {
+        return Err(format!(
+            "the train ends at {:.4} ms ({} excitations {:.4} ms apart from {:.4} ms), after the {:.4} ms repetition",
+            last, table.n_exc, train.exc_spacing_ms, t_exc_ms, tr_ms));
+    }
+    Ok(())
+}
+
 // ---- the stack of spirals (P5 addendum, part C) ----
 
 /// An Archimedean constant-density spiral-out design on a square `nx x nx` matrix, in cycles/FOV:
@@ -730,5 +877,76 @@ mod tests {
         // the GRASE and spiral tables refuse each other's readouts
         assert!(grase_lines(&train, &ro, 64, 20).is_err());
         assert!(spiral_lines(&train, &Readout3d::Grase { ky_segments: 1, t_line_ms: 0.5, reverse_phase: false }, 64, 64, 20).is_err());
+    }
+
+    // ---- P7 part C: the 3D gradient-echo train
+
+    fn ge_train(kz_segments: usize, order: KzOrder, tes: Vec<f64>) -> ExcitationTrain {
+        ExcitationTrain { kz_segments, kz_order: order, exc_spacing_ms: 40.0, echo_times_ms: tes, excitation_time_ms: 2.0 }
+    }
+
+    /// Every line is read once, by the excitation of its shot that reads its partition; shots are
+    /// GRASE's canonical index; the kz centre's excitation; centric and linear orders, one, two and
+    /// `nz` kz segments, two ky segments.
+    #[test]
+    fn ge3d_line_tables() {
+        let ro = Ge3dReadout { ky_segments: 2, t_line_ms: 0.5, reverse_phase: false };
+        let (ny, nz) = (16, 8);
+        for order in [KzOrder::Centric, KzOrder::Linear] {
+            for kz_segments in [1, 2, nz] {
+                let train = ge_train(kz_segments, order, vec![12.0]);
+                let t = ge3d_lines(&train, &ro, ny, nz).unwrap();
+                assert_eq!((t.n_shots, t.n_exc), (2 * kz_segments, nz / kz_segments));
+                let ord = kz_order(nz, order);
+                for p in 0..nz {
+                    let pos = ord.iter().position(|&q| q == p).unwrap();
+                    for ky in 0..ny {
+                        let l = t.line(p, ky);
+                        let (sy, sz) = (ky % 2, pos % kz_segments);
+                        assert_eq!((l.shot, l.excitation), (sy * kz_segments + sz, pos / kz_segments), "{order:?} {kz_segments} ({p}, {ky})");
+                        assert_eq!((l.t_ms, l.polarity), (t.block.t_ms[ky], t.block.polarity[ky]));
+                    }
+                }
+                let centre = ord.iter().position(|&q| q == nz / 2).unwrap();
+                assert_eq!(t.e_c, centre / kz_segments);
+            }
+        }
+        // centric reads the centre first
+        assert_eq!(ge3d_lines(&ge_train(1, KzOrder::Centric, vec![12.0]), &ro, ny, nz).unwrap().e_c, 0);
+        // refusals: a partition count the segments do not divide; one partition; ky segments
+        assert!(ge3d_lines(&ge_train(3, KzOrder::Linear, vec![12.0]), &ro, ny, nz).unwrap_err().contains("kz segments"));
+        assert!(ge3d_lines(&ge_train(1, KzOrder::Linear, vec![12.0]), &ro, ny, 1).unwrap_err().contains("2D"));
+        let ro3 = Ge3dReadout { ky_segments: 3, ..ro };
+        assert!(ge3d_lines(&ge_train(1, KzOrder::Linear, vec![12.0]), &ro3, ny, nz).unwrap_err().contains("ky segments"));
+    }
+
+    /// The timing checks, each refusal and a boundary that just fits. Blocks of 8 lines at 0.5 ms
+    /// span -1.75 .. 1.75 ms, so with half a line each reaches 2 ms from its echo; the pulse
+    /// reserves 1 ms after the excitation.
+    #[test]
+    fn ge3d_timing() {
+        let ro = Ge3dReadout { ky_segments: 2, t_line_ms: 0.5, reverse_phase: false };
+        let t = ge3d_lines(&ge_train(2, KzOrder::Linear, vec![12.0]), &ro, 16, 8).unwrap();
+        let half = t.block.t_ms.iter().fold(0.0f64, |m, x| m.max(x.abs())) + 0.25;
+        assert!((half - 2.0).abs() < 1e-12, "{half}");
+        let check = |tes: Vec<f64>, spacing: f64, tr: f64| {
+            let mut tr_ = ge_train(2, KzOrder::Linear, tes);
+            tr_.exc_spacing_ms = spacing;
+            check_ge3d_timing(&tr_, &t, 1000.0, tr)
+        };
+        check(vec![12.0, 22.0], 40.0, 2000.0).unwrap();
+        // the first block inside the excitation pulse: 2.5 - 2 = 0.5 < 1
+        assert!(check(vec![2.5], 40.0, 2000.0).unwrap_err().contains("excitation pulse"));
+        check(vec![3.0], 40.0, 2000.0).unwrap();
+        // overlapping echoes: 15.5 - 2 = 13.5 < 12 + 2
+        assert!(check(vec![12.0, 15.5], 40.0, 2000.0).unwrap_err().contains("overlap"));
+        check(vec![12.0, 16.0], 40.0, 2000.0).unwrap();
+        // the last block into the next excitation pulse: 32 + 2 = 34 > 34.9 - 1
+        assert!(check(vec![12.0, 32.0], 34.9, 2000.0).unwrap_err().contains("next excitation pulse"));
+        check(vec![12.0, 32.0], 35.0, 2000.0).unwrap();
+        // the train past the repetition: 1000 + 3 x 40 + 14 = 1134
+        assert!(check(vec![12.0], 40.0, 1133.9).unwrap_err().contains("repetition"));
+        check(vec![12.0], 40.0, 1134.0).unwrap();
+        assert!(check(vec![], 40.0, 2000.0).is_err());
     }
 }
