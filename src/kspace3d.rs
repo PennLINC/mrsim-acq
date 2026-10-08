@@ -321,6 +321,9 @@ fn plan<'a>(
     assert_eq!(acq.echo, EchoFormation::Spin, "the 3D echo trains are spin-echo trains");
     assert!(acq.eddy_strength == 0.0 && acq.eddy_quad == 0.0 && acq.eddy_phase == 0.0,
             "the eddy model is not available in 3D (an echo-dependent eddy evolution breaks the z factorization)");
+    // Scanner partial Fourier skips the first lines of a 2D EPI train; a GRASE block is not one
+    assert!(acq.partial_fourier >= 1.0 || acq.pf_mode != crate::kspace::PartialFourierMode::Scanner,
+            "Scanner partial Fourier is defined by the 2D EPI train; the 3D readouts take FiberfoxCompatible or Contiguous");
     let Readout3d::Grase { reverse_phase, .. } = *readout else {
         panic!("the spiral path is not implemented yet (P5 milestone C, Task 13)");
     };
@@ -1689,6 +1692,31 @@ mod tests {
         let acq = Acquisition { do_distortions: true, ..Acquisition::default() };
         let e = spiral_segmentation([s, s, nz], [n, n, nz], &t2, None, &wild, None, &acq, &tr, &spiral_ro()).unwrap_err();
         assert!(e.contains("slice 0") && e.contains("64 segments"), "{e}");
+    }
+
+    /// GRASE refuses Scanner partial Fourier (defined by the 2D EPI train's line order) and keeps
+    /// the other two modes (TRXScan re-sync, Task 2).
+    #[test]
+    fn grase_refuses_scanner_partial_fourier() {
+        let (n, nz) = (8usize, 4usize);
+        let images = vec![vec![1.0f32; n * n * nz]];
+        let fmap = vec![0.0f32; n * n * nz];
+        let t2 = [T2Volume::Uniform(80.0)];
+        let tr = train(nz, 1, KzOrder::Centric, 12.0, 180.0);
+        let ro = Readout3d::Grase { ky_segments: 1, t_line_ms: 0.5, reverse_phase: false };
+        let phase = PhaseModel::none();
+        use crate::kspace::PartialFourierMode;
+        let run = |mode: PartialFourierMode| {
+            let acq = Acquisition { partial_fourier: 0.75, pf_mode: mode, ..Acquisition::default() };
+            std::panic::catch_unwind(|| {
+                simulate_acquisition_3d_complex([n, n, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq, &tr, &ro,
+                                                None, None, &phase, 1)
+            })
+        };
+        let e = run(PartialFourierMode::Scanner).expect_err("Scanner on GRASE");
+        let text = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap();
+        assert!(text.contains("Scanner partial Fourier"), "{text}");
+        assert!(run(PartialFourierMode::FiberfoxCompatible).is_ok() && run(PartialFourierMode::Contiguous).is_ok());
     }
 
     // ---- P7 part C: the 3D gradient-echo train

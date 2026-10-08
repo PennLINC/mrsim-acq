@@ -91,8 +91,28 @@ pub enum PartialFourierMode {
     /// Conventional contiguous zero-filled partial Fourier: keep exactly `round(ny * pf)`
     /// consecutive lines from one end. This is what a scanner produces, and it is the more
     /// relevant condition for benchmarking PF-aware reconstruction -- especially now the object is
-    /// genuinely complex and has no Hermitian symmetry to exploit.
+    /// genuinely complex and has no Hermitian symmetry to exploit. The kept lines are the ones
+    /// acquired *before* the centre, so timing is unchanged (the centre is reached as late as at
+    /// full Fourier).
     Contiguous,
+    /// What a scanner does (TRXScan's default; ported from TRXScan `main`): the train **starts
+    /// late** and skips the first `ny - round(ny*pf)` lines it would have acquired, so the k-space
+    /// centre is reached `ny*(1-pf)` line times sooner and the readout is that much shorter.
+    /// Exactly `round(ny*pf)` consecutive lines are kept: the centre plus the side acquired *after*
+    /// it. `t_echo` is still the caller's number. The eddy-decay clock (time since the readout
+    /// began) counts from the first acquired line ([`LineTiming::for_acquisition`]). Defined by the
+    /// 2D EPI train's line order, so the 3D readouts refuse it.
+    Scanner,
+}
+
+/// How many lines at the start of the EPI train a [`PartialFourierMode::Scanner`] acquisition
+/// skips (0 for the other modes and at full Fourier).
+pub fn pf_skipped_lines(ny: usize, acq: &Acquisition) -> usize {
+    if acq.partial_fourier < 1.0 && acq.pf_mode == PartialFourierMode::Scanner {
+        ny - ((ny as f64 * acq.partial_fourier).round() as usize).min(ny)
+    } else {
+        0
+    }
 }
 
 /// Scanner-side reconstruction apodization. Distinct transfer functions with distinct PSFs, so
@@ -284,15 +304,24 @@ impl LineTiming {
         LineTiming { t_ms, trf_ms, tread_ms, polarity }
     }
 
-    /// The table [`build_coil_kspace`] uses for an [`Acquisition`] on an `nx x ny` matrix.
+    /// The table [`build_coil_kspace`] uses for an [`Acquisition`] on an `nx x ny` matrix. Under
+    /// [`PartialFourierMode::Scanner`] the readout starts `skip` lines into the nominal train, so
+    /// the eddy-decay clock (`tread_ms`) starts there; `t_ms` and `trf_ms` are unchanged.
     pub fn for_acquisition(acq: &Acquisition, nx: usize, ny: usize) -> LineTiming {
-        LineTiming::from_epi(&SingleShotEpi {
+        let mut lt = LineTiming::from_epi(&SingleShotEpi {
             kx_max: nx,
             ky_max: ny,
             t_line: acq.t_line,
             t_echo: acq.t_echo,
             reverse_phase: acq.reverse_phase,
-        })
+        });
+        let offset = pf_skipped_lines(ny, acq) as f64 * acq.t_line;
+        if offset > 0.0 {
+            for v in lt.tread_ms.iter_mut() {
+                *v -= offset;
+            }
+        }
+        lt
     }
 }
 
@@ -327,7 +356,8 @@ pub fn validate_t2_map(m: &[f32]) -> Result<(), String> {
 
 /// `trf = t_echo + t` must be positive on every acquired line. A negative `trf` is a readout
 /// that begins before the excitation, and the forward model answers it with signal growth.
-/// Partial Fourier does not help: it drops low-ky lines, which this trajectory reads LAST.
+/// Partial Fourier helps only in Scanner mode, which skips the first lines of the train; the
+/// Fiberfox and Contiguous modes drop lines this trajectory reads LAST.
 pub fn validate_acquisition_timing(acq: &Acquisition, nx: usize, ny: usize) -> Result<(), String> {
     // The same table `build_coil_kspace` reads, or the timing this validates is not the timing
     // that runs.
@@ -344,7 +374,8 @@ pub fn validate_acquisition_timing(acq: &Acquisition, nx: usize, ny: usize) -> R
         return Err(format!(
             "trf = {worst:.3} ms <= 0 on an acquired line: the readout starts before the \
              excitation. Raise t_echo above {need:.3} ms or shorten t_line. Partial Fourier \
-             does not help: it drops low-ky lines, which this trajectory reads last."));
+             helps only in Scanner mode (it skips the first lines); the Fiberfox and Contiguous \
+             modes drop lines this trajectory reads last."));
     }
     Ok(())
 }
@@ -472,11 +503,18 @@ pub fn sampling_mask(nx: usize, ny: usize, acq: &Acquisition) -> Vec<bool> {
     let accel = acq.accel.max(1);
     let acs_half = (acq.acs_lines / 2) as i64;
     let mut m = vec![false; nx * ny];
-    // Contiguous mode: exactly round(ny*pf) consecutive lines, dropped from the low-ky end
-    // (high-ky when the polarity is reversed).
+    // Scanner mode: exactly round(ny*pf) consecutive lines; the FIRST lines of the train are
+    // skipped. The forward train starts at high ky, so the skipped block is the high-ky end;
+    // reversed polarity starts at low ky and skips there. Contiguous mode keeps the same count
+    // but drops the LAST lines instead (the low-ky end; high-ky when the polarity is reversed).
     let keep_n = (ny as f64 * acq.partial_fourier).round() as usize;
     for kyi in 0..ny {
-        if acq.partial_fourier < 1.0 && acq.pf_mode == PartialFourierMode::Contiguous {
+        if acq.partial_fourier < 1.0 && acq.pf_mode == PartialFourierMode::Scanner {
+            let skip = if acq.reverse_phase { kyi < ny - keep_n } else { kyi >= keep_n };
+            if skip {
+                continue;
+            }
+        } else if acq.partial_fourier < 1.0 && acq.pf_mode == PartialFourierMode::Contiguous {
             let skip = if acq.reverse_phase { kyi >= keep_n } else { kyi < ny - keep_n };
             if skip {
                 continue;
@@ -3585,5 +3623,86 @@ mod echo_tests {
     fn echo_times_must_increase() {
         let (imgs, fm) = (images(), fmap(true));
         echoes(&base(), &imgs, &fm, &[30.0, 30.0], 1, None, None, zero);
+    }
+}
+
+/// Scanner partial Fourier (TRXScan re-sync, Task 2), ported from TRXScan `main`.
+#[cfg(test)]
+mod scanner_pf_tests {
+    use super::*;
+    use crate::readout::Readout;
+
+    /// The lines in acquisition order, from the train itself.
+    fn order(nx: usize, ny: usize, acq: &Acquisition) -> Vec<usize> {
+        let epi = SingleShotEpi { kx_max: nx, ky_max: ny, t_line: acq.t_line, t_echo: acq.t_echo, reverse_phase: acq.reverse_phase };
+        (0..nx * ny).map(|tick| epi.kspace_index(tick)).filter(|&(kx, _)| kx == nx / 2).map(|(_, ky)| ky).collect()
+    }
+
+    fn kept(nx: usize, ny: usize, acq: &Acquisition) -> Vec<usize> {
+        let m = sampling_mask(nx, ny, acq);
+        (0..ny).filter(|&ky| m[nx * ky]).collect()
+    }
+
+    /// TRXScan main's `scanner_partial_fourier_skips_the_first_lines_and_reaches_the_centre_sooner`,
+    /// the order from the train and the timing from `LineTiming::for_acquisition`: exactly
+    /// `round(ny*pf)` contiguous lines with the centre, the skipped ones the FIRST acquired, the
+    /// eddy clock starting at the first acquired line (the centre reached `skip` lines sooner, the
+    /// echo-relative times unchanged); Contiguous keeps the same count, drops the LAST lines and
+    /// leaves the timing alone.
+    #[test]
+    fn scanner_partial_fourier_skips_the_first_lines_and_reaches_the_centre_sooner() {
+        let (nx, ny, pf) = (16usize, 32usize, 0.75f64);
+        for reverse in [false, true] {
+            let acq = Acquisition { partial_fourier: pf, pf_mode: PartialFourierMode::Scanner, reverse_phase: reverse,
+                                    t_line: 2.0, ..Default::default() };
+            let full = Acquisition { partial_fourier: 1.0, ..acq.clone() };
+            let k = kept(nx, ny, &acq);
+            assert_eq!(k.len(), (ny as f64 * pf).round() as usize);
+            assert!(k.windows(2).all(|w| w[1] == w[0] + 1), "kept lines are contiguous");
+            assert!(k.contains(&(ny / 2)), "the centre line is kept");
+            let ord = order(nx, ny, &acq);
+            let skip = pf_skipped_lines(ny, &acq);
+            assert_eq!(skip, ny / 4);
+            assert!(ord[..skip].iter().all(|ky| !k.contains(ky)), "first {skip} lines skipped: {:?}", &ord[..skip]);
+            assert!(ord[skip..].iter().all(|ky| k.contains(ky)));
+            let (tp, tf) = (LineTiming::for_acquisition(&acq, nx, ny), LineTiming::for_acquisition(&full, nx, ny));
+            assert_eq!((&tp.t_ms, &tp.trf_ms, &tp.polarity), (&tf.t_ms, &tf.trf_ms, &tf.polarity));
+            let c = ny / 2;
+            assert!((tp.tread_ms[c] - (tf.tread_ms[c] - skip as f64 * 2.0)).abs() < 1e-9);
+            let first = ord[skip];
+            assert!(tp.tread_ms[first] > 0.0 && tp.tread_ms[first] < 2.0, "the first acquired line reads at the start of its own train");
+            let contiguous = Acquisition { pf_mode: PartialFourierMode::Contiguous, ..acq.clone() };
+            let kc = kept(nx, ny, &contiguous);
+            assert_eq!(kc.len(), k.len());
+            assert!(ord[ny - skip..].iter().all(|ky| !kc.contains(ky)), "Contiguous drops the last lines");
+            assert_eq!(LineTiming::for_acquisition(&contiguous, nx, ny), tf);
+            assert_eq!(pf_skipped_lines(ny, &contiguous), 0);
+            // the fall-through trap: Scanner has its own mask, not Fiberfox's
+            let fiberfox = Acquisition { pf_mode: PartialFourierMode::FiberfoxCompatible, ..acq.clone() };
+            assert_ne!(sampling_mask(nx, ny, &fiberfox), sampling_mask(nx, ny, &acq));
+            // at full Fourier every mode is the same mask and timing
+            for mode in [PartialFourierMode::FiberfoxCompatible, PartialFourierMode::Contiguous, PartialFourierMode::Scanner] {
+                let a = Acquisition { pf_mode: mode, ..full.clone() };
+                assert_eq!(sampling_mask(nx, ny, &a), sampling_mask(nx, ny, &full), "{mode:?}");
+                assert_eq!(LineTiming::for_acquisition(&a, nx, ny), tf, "{mode:?}");
+                assert_eq!(pf_skipped_lines(ny, &a), 0);
+            }
+        }
+    }
+
+    /// The timing check reads Scanner's mask: an echo too early for the first lines of the full
+    /// train passes once Scanner skips them, and still fails under Contiguous and Fiberfox, which
+    /// keep those lines.
+    #[test]
+    fn scanner_partial_fourier_relaxes_the_timing_check() {
+        let (nx, ny) = (16usize, 32usize);
+        let early = Acquisition { partial_fourier: 0.75, pf_mode: PartialFourierMode::Scanner, t_line: 2.0, t_echo: 20.0,
+                                  ..Default::default() };
+        assert!(validate_acquisition_timing(&Acquisition { partial_fourier: 1.0, ..early.clone() }, nx, ny).is_err());
+        validate_acquisition_timing(&early, nx, ny).unwrap();
+        for mode in [PartialFourierMode::Contiguous, PartialFourierMode::FiberfoxCompatible] {
+            let e = validate_acquisition_timing(&Acquisition { pf_mode: mode, ..early.clone() }, nx, ny).unwrap_err();
+            assert!(e.contains("Scanner"), "{e}");
+        }
     }
 }
