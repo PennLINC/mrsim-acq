@@ -35,7 +35,7 @@ pub(crate) fn statics(inp: &SliceInput, acq: &Acquisition, coil: usize, ncoils: 
     let [nx, ny] = inp.acq_matrix;
     assert!(snx % nx == 0 && sny % ny == 0, "sim grid must be an integer multiple of the acquired matrix");
     assert_eq!(acq.echo, EchoFormation::Spin, "the spiral train is a spin-echo train");
-    assert!(inp.eddy_drive.is_none() && inp.eddy_lin.is_none(), "the eddy model is not available for spirals");
+    assert!(inp.eddy_drive.is_none(), "the eddy model is not available for spirals");
     let (ox, oy) = (snx / nx, sny / ny);
     let (sxs, sys) = (ox * (nx / 2), oy * (ny / 2));
     let (xoff, yoff) = ((ox as f64 - 1.0) / 2.0, (oy as f64 - 1.0) / 2.0);
@@ -209,7 +209,7 @@ mod tests {
                        acq_matrix: [usize; 2]) -> SliceInput<'a> {
         SliceInput {
             compartments: comps, t2, t_inhom: None, fmap, phase0: Some(phase0), sim, acq_matrix, z: 0, nz: 1,
-            eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None,
+            eddy_drive: None, prep_drive: None, slice_seed: 0,
         }
     }
 

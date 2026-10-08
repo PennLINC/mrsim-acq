@@ -23,7 +23,6 @@ use std::f64::consts::TAU;
 use std::sync::Arc;
 
 pub struct Nufft1 {
-    n: usize,
     nf: usize,
     w: usize,
     beta: f64,
@@ -63,7 +62,7 @@ impl Nufft1 {
             }
             corr.push(1.0 / s);
         }
-        Nufft1 { n, nf, w, beta, k_lo, n_out, fft, scratch, corr, kern: vec![0.0; w], grid: Vec::new() }
+        Nufft1 { nf, w, beta, k_lo, n_out, fft, scratch, corr, kern: vec![0.0; w], grid: Vec::new() }
     }
 
     /// `pos[j]` in cells (any real; periodic modulo `n`). `weights`: any number of `(re, im)`
@@ -110,7 +109,6 @@ impl Nufft1 {
         }
     }
 
-    pub fn n(&self) -> usize { self.n }
     pub fn kernel_width(&self) -> usize { self.w }
 }
 

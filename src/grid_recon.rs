@@ -315,7 +315,7 @@ mod tests {
     fn inp<'a>(comps: &'a [&'a [f32]], t2: &'a [T2Slice<'a>], fmap: &'a [f32], ph: &'a [f64], n: usize, o: usize) -> SliceInput<'a> {
         SliceInput {
             compartments: comps, t2, t_inhom: None, fmap, phase0: Some(ph), sim: [n * o, n * o], acq_matrix: [n, n], z: 0,
-            nz: 1, eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None,
+            nz: 1, eddy_drive: None, prep_drive: None, slice_seed: 0,
         }
     }
 

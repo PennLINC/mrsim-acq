@@ -54,33 +54,31 @@ fn outputs() -> Vec<(String, Vec<u32>)> {
         let mapped = [T2Slice::Map(&t2_map), T2Slice::Uniform(100.0), T2Slice::Map(&t2_map)];
         let ti_mapped = [T2Slice::Map(&ti_map), T2Slice::Uniform(45.0), T2Slice::Map(&ti_map)];
         #[allow(clippy::type_complexity)]
-        let cases: Vec<(&str, Acquisition, Option<[f64; 3]>, Option<[f64; 3]>, bool)> = vec![
-            ("clean", Acquisition { do_distortions: false, do_relaxation: false, ..full.clone() }, None, None, false),
-            ("distortion+relaxation", full.clone(), None, None, false),
-            ("reverse", Acquisition { reverse_phase: true, ..full.clone() }, None, None, false),
-            ("ghost", Acquisition { ghost_offset: 0.015, ..full.clone() }, None, None, false),
+        let cases: Vec<(&str, Acquisition, Option<[f64; 3]>, bool)> = vec![
+            ("clean", Acquisition { do_distortions: false, do_relaxation: false, ..full.clone() }, None, false),
+            ("distortion+relaxation", full.clone(), None, false),
+            ("reverse", Acquisition { reverse_phase: true, ..full.clone() }, None, false),
+            ("ghost", Acquisition { ghost_offset: 0.015, ..full.clone() }, None, false),
             ("eddy-poly", Acquisition { eddy_strength: 3.0, eddy_quad: 0.4, eddy_tau: 70.0, ..full.clone() },
-                Some([0.3, -0.8, 0.5]), None, false),
-            ("eddy-phase", Acquisition { eddy_phase: 0.2, ..full.clone() }, Some([0.6, 0.6, 0.5]), None, false),
-            ("eddy-trace", full.clone(), Some([0.6, 0.6, 0.5]), Some([0.03, -0.05, 0.02]), false),
-            ("pf-fiberfox", Acquisition { partial_fourier: 0.75, ..full.clone() }, None, None, false),
+                Some([0.3, -0.8, 0.5]), false),
+            ("eddy-phase", Acquisition { eddy_phase: 0.2, ..full.clone() }, Some([0.6, 0.6, 0.5]), false),
+            ("pf-fiberfox", Acquisition { partial_fourier: 0.75, ..full.clone() }, None, false),
             ("pf-contiguous-reverse", Acquisition { partial_fourier: 0.75, pf_mode: PartialFourierMode::Contiguous,
-                reverse_phase: true, ..full.clone() }, None, None, false),
-            ("grappa-coils", Acquisition { accel: 2, acs_lines: 6, n_coils: 4, ..full.clone() }, None, None, false),
-            ("grappa3", Acquisition { accel: 3, acs_lines: 8, n_coils: 4, ..full.clone() }, None, None, false),
+                reverse_phase: true, ..full.clone() }, None, false),
+            ("grappa-coils", Acquisition { accel: 2, acs_lines: 6, n_coils: 4, ..full.clone() }, None, false),
+            ("grappa3", Acquisition { accel: 3, acs_lines: 8, n_coils: 4, ..full.clone() }, None, false),
             ("everything", Acquisition { ghost_offset: 0.02, eddy_strength: 2.0, eddy_quad: 0.3, eddy_phase: 0.1,
                 partial_fourier: 0.8, accel: 2, acs_lines: 8, n_coils: 3, ..full.clone() },
-                Some([0.5, 0.5, 0.7]), Some([0.02, 0.04, -0.01]), false),
-            ("maps", full.clone(), None, None, true),
+                Some([0.5, 0.5, 0.7]), false),
+            ("maps", full.clone(), None, true),
             ("maps-coils-noise", Acquisition { n_coils: 3, noise_variance: 4.0, ..full.clone() },
-                None, None, true),
+                None, true),
         ];
-        for (name, acq, eddy_drive, eddy_lin, maps) in cases {
+        for (name, acq, eddy_drive, maps) in cases {
             let inp = SliceInput {
                 compartments: &comp_refs, t2: if maps { &mapped } else { &uniform },
                 t_inhom: if maps { Some(&ti_mapped) } else { None }, fmap: &fmap, phase0: Some(&phase0),
                 sim: [snx, sny], acq_matrix: [nx, ny], z: 3, nz: 9, eddy_drive, prep_drive: None, slice_seed: 7,
-                eddy_lin,
             };
             let img = simulate_slice(&inp, &acq);
             let bits = img.iter().flat_map(|(re, im)| [re.to_bits(), im.to_bits()]).collect();
@@ -120,7 +118,7 @@ fn outputs() -> Vec<(String, Vec<u32>)> {
                        ("mapped", vec![T2Volume::Map(&t2map), T2Volume::Uniform(160.0)])] {
         let (mag, ph) = simulate_acquisition_oversampled(
             [snx, sny, nz], [nx, ny, nz], nv, &images, &t2, &fmap, None, &acq, &vec![None; nv], &vec![None; nv],
-            &PhaseModel::hbcd_like(), 42, None, None);
+            &PhaseModel::hbcd_like(), 42, None);
         let bits = mag.iter().chain(&ph).map(|x| x.to_bits()).collect();
         out.push((format!("series-{name}"), bits));
     }

@@ -486,11 +486,6 @@ pub struct SliceInput<'a> {
     /// shot is realised at the entry point and arrives here through `phase0`.
     pub prep_drive: Option<(f64, [f64; 3])>,
     pub slice_seed: u64,
-    /// Optional per-volume linear eddy shear `[a_x, a_y, a_z]` (dimensionless: PE shift in acquired
-    /// voxels per acquired voxel of position). Replays a real DIFFPREP/TORTOISE eddy estimate
-    /// (`--eddy-trace`), applied as a geometric PE distortion `shift = a·pos`, INSTEAD of the
-    /// gradient-model `--eddy` — real eddy does not track the diffusion-gradient direction.
-    pub eddy_lin: Option<[f64; 3]>,
 }
 
 /// A rectangle with sub-voxel-positioned edges on all four sides, with exact fractional occupancy
@@ -630,7 +625,6 @@ pub(crate) fn build_coil_kspace_timed(
     // eddy currents affect volumes with a prep gradient only (`None` = the old b0 branch)
     let do_eddy = eddy_enabled(acq, inp.eddy_drive);
     let do_eddy_phase = acq.eddy_phase != 0.0 && inp.eddy_drive.is_some();
-    let trt_s = acq.t_line * ny as f64 / 1000.0; // total readout time (s), for the shift<->phase map
     // acquired-matrix centres (k-space indexing) and sim-grid centres (image indexing)
     // Centred k-space indexing: the acquired band is [-n/2, n/2-1], asymmetric about k=0 by one
     // sample. This is deliberate, not an off-by-one -- real even-matrix Cartesian acquisitions
@@ -723,19 +717,11 @@ pub(crate) fn build_coil_kspace_timed(
             }
             if acq.echo == EchoFormation::Gradient && acq.do_distortions {
                 // Unrefocused off-resonance accrued from the RF to the echo: static per voxel,
-                // so it joins the object phase. B0 only: the replayed eddy shear that shares
-                // `rate` below is a readout-gradient effect and accrues nothing before the readout.
+                // so it joins the object phase.
                 p0 += TAU * fmap[i] as f64 * (acq.t_echo / 1000.0);
             }
             phi0[i] = p0;
-            let mut r = if acq.do_distortions { fmap[i] as f64 } else { 0.0 };
-            if let Some(a) = inp.eddy_lin {
-                // Replay a real per-volume linear eddy shear as a PE geometric shift: a
-                // phase (a·pos / TRT)·t behaves like a fieldmap of that value, giving
-                // shift = a·pos acquired voxels (a is dimensionless shift-per-position).
-                r += (a[0] * xc + a[1] * yc + a[2] * zc) / trt_s;
-            }
-            rate[i] = r;
+            rate[i] = if acq.do_distortions { fmap[i] as f64 } else { 0.0 };
         }
     }
     // Centred, half-cell-registered sim-grid coordinates in ACQUIRED-voxel units, per axis.
@@ -1555,7 +1541,7 @@ fn grappa_reconstruct(coil: &mut [Vec<C>], nx: usize, ny: usize, ys: usize, acce
 /// `images` and `fmap` are on the **simulation** grid `sim_dims = [nx*o, ny*o, nz]`; the output is
 /// on `acq_dims = [nx, ny, nz]`. `o` is derived and must divide both in-plane axes.
 ///
-/// This is the path that makes ringing intrinsic. [`simulate_acquisition_legacy`] does not.
+/// This is the path that makes ringing intrinsic.
 ///
 /// **Simulate a whole series in ONE call.** Every random stream here is keyed on the volume
 /// index `g` *within this call*: `slice_seed` (k-space noise and spikes), the image-space noise
@@ -1589,12 +1575,9 @@ pub fn simulate_acquisition_oversampled(
     // written SD map is the exact ground truth for a denoiser's estimated noise level. This is the
     // image-space, spatially-varying counterpart to `Acquisition::noise_variance` (uniform, k-space).
     noise_sigma: Option<&[f32]>,
-    // Optional per-volume linear eddy shear `[a_x,a_y,a_z]` (one per gradient) to REPLAY a real
-    // DIFFPREP eddy estimate as a geometric PE distortion (see `SliceInput::eddy_lin`).
-    eddy_trace: Option<&[[f64; 3]]>,
 ) -> (Vec<f32>, Vec<f32>) {
     acquire_volumes(sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, acq, eddy_drive, prep_drive, phase,
-                    seed, seed, noise_sigma, eddy_trace)
+                    seed, seed, noise_sigma)
 }
 
 /// The 2D acquisition's inputs, by name (TRXScan re-sync): what [`simulate_acquisition_oversampled`]
@@ -1620,8 +1603,6 @@ pub struct AcquisitionInput<'a> {
     pub seed: u64,
     /// Per-voxel image-space noise SD on the acquired grid; see [`simulate_acquisition_oversampled`].
     pub noise_sigma: Option<&'a [f32]>,
-    /// Per-volume linear eddy shear to replay; see [`simulate_acquisition_oversampled`].
-    pub eddy_trace: Option<&'a [[f64; 3]]>,
 }
 
 /// Options for [`simulate_acquisition_complex`] beyond the object and protocol (ported from
@@ -1710,11 +1691,10 @@ fn acquire_volumes(
     excitation_seed: u64,
     receiver_seed: u64,
     noise_sigma: Option<&[f32]>,
-    eddy_trace: Option<&[[f64; 3]]>,
 ) -> (Vec<f32>, Vec<f32>) {
     let inp = AcquisitionInput {
         sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, eddy_drive, prep_drive, phase, seed: receiver_seed,
-        noise_sigma, eddy_trace,
+        noise_sigma,
     };
     let out = acquire_volumes_complex(&inp, acq, &AcquisitionOptions::default(), excitation_seed, receiver_seed);
     let n = out.re.len();
@@ -1737,7 +1717,7 @@ fn acquire_volumes_complex(
     receiver_seed: u64,
 ) -> AcquisitionOutput {
     let AcquisitionInput {
-        sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, eddy_drive, prep_drive, phase, noise_sigma, eddy_trace, ..
+        sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, eddy_drive, prep_drive, phase, noise_sigma, ..
     } = *inp;
     let [snx, sny, nz] = sim_dims;
     let [nx, ny, nzo] = acq_dims;
@@ -1771,10 +1751,6 @@ fn acquire_volumes_complex(
                "eddy_drive has {} entries for {} volumes", eddy_drive.len(), n_volumes);
     assert_eq!(prep_drive.len(), n_volumes,
                "prep_drive has {} entries for {} volumes", prep_drive.len(), n_volumes);
-    if let Some(tr) = eddy_trace {
-        assert_eq!(tr.len(), n_volumes,
-                   "eddy_trace has {} entries for {} volumes", tr.len(), n_volumes);
-    }
     if let Some(sz) = opts.slice_z {
         assert_eq!(sz.len(), nz, "slice_z must name every local slice");
     }
@@ -1844,7 +1820,6 @@ fn acquire_volumes_complex(
                     eddy_drive: eddy_drive[g],
                     prep_drive: prep_drive[g],
                     slice_seed,
-                    eddy_lin: eddy_trace.map(|tr| tr[g]),
                 },
                 acq_g,
                 cap,
@@ -1982,13 +1957,12 @@ pub fn simulate_acquisition_echoes(
     phase: &PhaseModel,
     seed: u64,
     noise_sigma: Option<&[f32]>,
-    eddy_trace: Option<&[[f64; 3]]>,
 ) -> Vec<(Vec<f32>, Vec<f32>)> {
     for (e, w) in echo_times_ms.windows(2).enumerate() {
         assert!(w[0] < w[1], "echo times must increase strictly: echo {e} at {} ms, echo {} at {} ms", w[0], e + 1, w[1]);
     }
     echoes_with_salt(sim_dims, acq_dims, n_volumes, images_per_echo, t2, fmap, t_inhom, acq, echo_times_ms,
-                     eddy_drive, prep_drive, phase, seed, noise_sigma, eddy_trace, echo_salt, |_| 0)
+                     eddy_drive, prep_drive, phase, seed, noise_sigma, echo_salt, |_| 0)
 }
 
 /// [`simulate_acquisition_echoes`] with the per-echo salts of the receiver and excitation seeds as
@@ -2009,7 +1983,6 @@ fn echoes_with_salt(
     phase: &PhaseModel,
     seed: u64,
     noise_sigma: Option<&[f32]>,
-    eddy_trace: Option<&[[f64; 3]]>,
     receiver_salt: fn(usize) -> u64,
     excitation_salt: fn(usize) -> u64,
 ) -> Vec<(Vec<f32>, Vec<f32>)> {
@@ -2023,118 +1996,9 @@ fn echoes_with_salt(
         .map(|(e, (&te, images))| {
             let acq_e = Acquisition { t_echo: te, ..acq.clone() };
             acquire_volumes(sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, &acq_e, eddy_drive, prep_drive,
-                            phase, seed ^ excitation_salt(e), seed ^ receiver_salt(e), noise_sigma, eddy_trace)
+                            phase, seed ^ excitation_salt(e), seed ^ receiver_salt(e), noise_sigma)
         })
         .collect()
-}
-
-/// **Legacy path: no intrinsic Gibbs ringing and no object phase.**
-///
-/// Runs the acquisition with the object already on the reconstruction matrix (`o = 1`) and
-/// `phase0: None`. At `o = 1` the forward and inverse transforms are an exact round trip, so this
-/// produces **zero** ringing (measured: +0.0000% overshoot on a step edge) and a real-valued image.
-///
-/// Retained only for backward comparison. Production callers must use
-/// [`simulate_acquisition_oversampled`], which is what gives ringing intrinsic to the acquisition
-/// and a genuinely complex object.
-#[allow(clippy::too_many_arguments)]
-pub fn simulate_acquisition_legacy(
-    dims: [usize; 3],
-    n_volumes: usize,
-    images: &[Vec<f32>],
-    t2: &[T2Volume],
-    fmap: &[f32],
-    t_inhom: Option<&[T2Volume]>,
-    acq: &Acquisition,
-    gradients: &[[f64; 3]],
-) -> (Vec<f32>, Vec<f32>) {
-    let [nx, ny, nz] = dims;
-    let nvox = nx * ny * nz;
-    let ncomp = images.len();
-    assert_eq!(t2.len(), ncomp, "t2 has {} entries for {ncomp} compartments", t2.len());
-    validate_t2_volumes("T2", t2, nvox);
-    if let Some(ti) = t_inhom {
-        assert_eq!(ti.len(), ncomp, "t_inhom has {} entries for {ncomp} compartments", ti.len());
-        validate_t2_volumes("T2'", ti, nvox);
-    }
-    validate_acquisition_timing(acq, nx, ny).unwrap_or_else(|e| panic!("{e}"));
-    // returns (magnitude, phase) for one volume
-    let per_vol = |g: usize| -> (Vec<f32>, Vec<f32>) {
-        let (mut mag, mut phase) = (vec![0.0f32; nvox], vec![0.0f32; nvox]);
-        let mut cslices = vec![vec![0.0f32; nx * ny]; ncomp];
-        let mut fslice = vec![0.0f32; nx * ny];
-        // split the scaled gradient into a unit direction and a magnitude; the forward model
-        // recombines them, so this preserves the previous behaviour exactly
-        let gr = gradients[g];
-        let bval = (gr[0] * gr[0] + gr[1] * gr[1] + gr[2] * gr[2]).sqrt();
-        let bvec =
-            if bval > 1e-12 { [gr[0] / bval, gr[1] / bval, gr[2] / bval] } else { [0.0; 3] };
-        // (g/|g|)*|g| is not bit-equal to g: keep forming the product the forward model formed.
-        let eddy_drive = if bval.abs() > 1e-9 {
-            Some([bvec[0] * bval, bvec[1] * bval, bvec[2] * bval])
-        } else {
-            None
-        };
-        for z in 0..nz {
-            for y in 0..ny {
-                for x in 0..nx {
-                    let vox = x + nx * (y + ny * z);
-                    for (c, img) in images.iter().enumerate() {
-                        cslices[c][x + nx * y] = img[vox * n_volumes + g];
-                    }
-                    fslice[x + nx * y] = fmap[vox];
-                }
-            }
-            let refs: Vec<&[f32]> = cslices.iter().map(|v| v.as_slice()).collect();
-            let t2_slice = t2_slices(t2, z, nx * ny);
-            let ti_slice = t_inhom.map(|ti| t2_slices(ti, z, nx * ny));
-            let seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37)
-                .wrapping_add(acq.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let inp = SliceInput {
-                compartments: &refs,
-                t2: &t2_slice,
-                t_inhom: ti_slice.as_deref(),
-                fmap: &fslice,
-                phase0: None,
-                // v1 acquisition path: the object is already on the acquired matrix (o = 1).
-                sim: [nx, ny],
-                acq_matrix: [nx, ny],
-                z,
-                nz,
-                eddy_drive,
-                prep_drive: None,
-                slice_seed: seed,
-                eddy_lin: None,
-            };
-            let out = simulate_slice(&inp, acq);
-            for y in 0..ny {
-                for x in 0..nx {
-                    let (re, im) = out[x + nx * y];
-                    let vox = x + nx * (y + ny * z);
-                    mag[vox] = (re * re + im * im).sqrt();
-                    phase[vox] = im.atan2(re);
-                }
-            }
-        }
-        (mag, phase)
-    };
-
-    #[cfg(feature = "par")]
-    let vols: Vec<(Vec<f32>, Vec<f32>)> = {
-        use rayon::prelude::*;
-        (0..n_volumes).into_par_iter().map(per_vol).collect()
-    };
-    #[cfg(not(feature = "par"))]
-    let vols: Vec<(Vec<f32>, Vec<f32>)> = (0..n_volumes).map(per_vol).collect();
-
-    let (mut magd, mut phased) = (vec![0.0f32; nvox * n_volumes], vec![0.0f32; nvox * n_volumes]);
-    for (g, (m, p)) in vols.iter().enumerate() {
-        for vox in 0..nvox {
-            magd[vox * n_volumes + g] = m[vox];
-            phased[vox * n_volumes + g] = p[vox];
-        }
-    }
-    (magd, phased)
 }
 
 #[cfg(test)]
@@ -2166,9 +2030,7 @@ mod tests {
         // eddy currents affect volumes with a prep gradient only (`None` = the old b0 branch)
         let do_eddy = eddy_enabled(acq, inp.eddy_drive);
         let do_eddy_phase = acq.eddy_phase != 0.0 && inp.eddy_drive.is_some();
-        let do_eddy_trace = inp.eddy_lin.is_some();
-        let trt_s = acq.t_line * ny as f64 / 1000.0; // total readout time (s), for the shift<->phase map
-        // acquired-matrix centres (k-space indexing) and sim-grid centres (image indexing)
+            // acquired-matrix centres (k-space indexing) and sim-grid centres (image indexing)
         // Centred k-space indexing: the acquired band is [-n/2, n/2-1], asymmetric about k=0 by one
         // sample. This is deliberate, not an off-by-one -- real even-matrix Cartesian acquisitions
         // cover exactly this range. It gives a real object a small deterministic imaginary component,
@@ -2271,7 +2133,7 @@ mod tests {
                     // Pre-readout object phase, already in radians, so it is added outside the TAU
                     // factor that scales the distortion/eddy term.
                     let mut phi0 = inp.phase0.map_or(0.0, |p| p[at(x, y)]);
-                    if do_eddy || do_eddy_phase || do_eddy_trace {
+                    if do_eddy || do_eddy_phase {
                         // centre on the sim grid, then express in ACQUIRED voxel units so that the
                         // eddy scales keep their meaning independent of oversampling
                         let (xc, yc, zc) = (
@@ -2297,13 +2159,6 @@ mod tests {
                             let zc_c = z as f64 - (inp.nz as f64 - 1.0) / 2.0;
                             phi0 += acq.eddy_phase
                                 * (gradient[0] * xc + gradient[1] * yc + gradient[2] * zc_c);
-                        }
-                        if let Some(a) = inp.eddy_lin {
-                            // Replay a real per-volume linear eddy shear as a PE geometric shift: a
-                            // phase (a·pos / TRT)·t behaves like a fieldmap of that value, giving
-                            // shift = a·pos acquired voxels (a is dimensionless shift-per-position).
-                            let shear = a[0] * xc + a[1] * yc + a[2] * zc;
-                            phi += shear * (t / trt_s);
                         }
                     }
                     modimg[at(x, y)] = C::cis(TAU * phi + phi0).scale(f_real);
@@ -2376,7 +2231,6 @@ mod tests {
                 eddy_drive,
                 prep_drive: None,
                 slice_seed,
-                eddy_lin: None,
             },
             acq,
         )
@@ -2733,7 +2587,7 @@ mod tests {
         SliceInput {
             compartments: comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap, phase0,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
+            eddy_drive: None, prep_drive: None, slice_seed: 0
         }
     }
 
@@ -2752,7 +2606,7 @@ mod tests {
             &SliceInput {
                 compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                 sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                eddy_drive: None, prep_drive: None, slice_seed: 9, eddy_lin: None
+                eddy_drive: None, prep_drive: None, slice_seed: 9
             },
             &acq,
         );
@@ -2778,7 +2632,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    eddy_drive: None, prep_drive: None, slice_seed: 3, eddy_lin: None
+                    eddy_drive: None, prep_drive: None, slice_seed: 3
                 },
                 &acq,
             );
@@ -2820,7 +2674,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    eddy_drive: None, prep_drive: None, slice_seed: 1000 + t as u64, eddy_lin: None
+                    eddy_drive: None, prep_drive: None, slice_seed: 1000 + t as u64
                 },
                 &acq,
             );
@@ -2888,7 +2742,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
+                    eddy_drive: None, prep_drive: None, slice_seed: 0
                 },
                 &Acquisition { partial_fourier: pf, ..clean() },
             )
@@ -2951,7 +2805,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                     sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    eddy_drive: None, prep_drive: None, slice_seed: 5, eddy_lin: None
+                    eddy_drive: None, prep_drive: None, slice_seed: 5
                 },
                 &Acquisition { noise_variance: 1.0, window: w, ..clean() },
             );
@@ -2974,7 +2828,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
+                    eddy_drive: None, prep_drive: None, slice_seed: 0
                 },
                 &Acquisition { window: w, ..clean() },
             );
@@ -3069,7 +2923,6 @@ mod tests {
                 eddy_drive: None,
                 prep_drive: None,
                 slice_seed: 0,
-                eddy_lin: None,
             };
             let out = simulate_slice(&inp, &acq);
 
@@ -3093,7 +2946,7 @@ mod tests {
         let inp = SliceInput {
             compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
             sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
+            eddy_drive: None, prep_drive: None, slice_seed: 0
         };
         let out = simulate_slice(&inp, &clean());
         let row = ny / 2;
@@ -3116,7 +2969,7 @@ mod tests {
                 &SliceInput {
                     compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
                     sim: [snx, sny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                    eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None
+                    eddy_drive: None, prep_drive: None, slice_seed: 0
                 },
                 &acq,
             )
@@ -3155,7 +3008,6 @@ mod tests {
             [snx, sny, nz], [nx, ny, nz], 1, &[img], &[T2Volume::Uniform(100.0)], &fmap, None, &acq,
             &[Some([1000.0, 0.0, 0.0])], &[Some((1000.0, [1.0, 0.0, 0.0]))], &model, 7,
             None,
-            None,
         );
         let row: Vec<f64> = (nx / 2 + 1..nx).map(|x| mag[(x + nx * (ny / 2)) * 1] as f64).collect();
         let over = row.iter().cloned().fold(f64::MIN, f64::max) - 1.0;
@@ -3168,29 +3020,6 @@ mod tests {
         let spread = bright.iter().cloned().fold(f64::MIN, f64::max)
             - bright.iter().cloned().fold(f64::MAX, f64::min);
         assert!(spread > 0.1, "object phase should vary across the image, spread {spread}");
-    }
-
-    #[test]
-    fn legacy_path_is_documented_as_ringing_free() {
-        // Pins WHY the legacy path must not be the production one, so nobody re-wires it.
-        let (nx, ny, nz) = (32usize, 32usize, 1usize);
-        let mut img = vec![0.0f32; nx * ny * nz];
-        for y in 0..ny {
-            for x in nx / 2..nx {
-                img[x + nx * y] = 1.0;
-            }
-        }
-        let acq = Acquisition {
-            signal_scale: 1.0, do_distortions: false, do_relaxation: false, ..Default::default()
-        };
-        let (mag, _) = simulate_acquisition_legacy(
-            [nx, ny, nz], 1, &[img], &[T2Volume::Uniform(100.0)], &vec![0.0f32; nx * ny * nz], None, &acq,
-            &[[0.0, 0.0, 0.0]],
-        );
-        let over = (nx / 2 + 1..nx)
-            .map(|x| mag[(x + nx * (ny / 2)) * 1] as f64)
-            .fold(f64::MIN, f64::max) - 1.0;
-        assert!(over.abs() < 1e-4, "legacy path is an exact round trip by construction: {over}");
     }
 
     #[test]
@@ -3227,7 +3056,7 @@ mod tests {
             &SliceInput {
                 compartments: &comps, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &vec![0.0f32; nx * ny], phase0: None,
                 sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-                eddy_drive: None, prep_drive: None, slice_seed: 5, eddy_lin: None
+                eddy_drive: None, prep_drive: None, slice_seed: 5
             },
             &acq,
         );
@@ -3338,36 +3167,35 @@ mod tests {
                 ..Acquisition::default()
             };
             // eddy_drive is bvec*bval of the old table; every drive there had bval 1.0 or 0.0.
-            let cases: Vec<(&str, Acquisition, Option<[f64; 3]>, Option<[f64; 3]>, usize, usize)> = vec![
-                ("clean", Acquisition { do_distortions: false, do_relaxation: false, ..full.clone() }, None, None, 0, 1),
-                ("distortion+relaxation", full.clone(), None, None, 0, 1),
-                ("reverse", Acquisition { reverse_phase: true, ..full.clone() }, None, None, 0, 1),
-                ("ghost", Acquisition { ghost_offset: 0.015, ..full.clone() }, None, None, 0, 1),
+            let cases: Vec<(&str, Acquisition, Option<[f64; 3]>, usize, usize)> = vec![
+                ("clean", Acquisition { do_distortions: false, do_relaxation: false, ..full.clone() }, None, 0, 1),
+                ("distortion+relaxation", full.clone(), None, 0, 1),
+                ("reverse", Acquisition { reverse_phase: true, ..full.clone() }, None, 0, 1),
+                ("ghost", Acquisition { ghost_offset: 0.015, ..full.clone() }, None, 0, 1),
                 ("eddy-poly", Acquisition { eddy_strength: 3.0, eddy_quad: 0.4, eddy_tau: 70.0, ..full.clone() },
-                    Some([0.3, -0.8, 0.5]), None, 0, 1),
-                ("eddy-phase", Acquisition { eddy_phase: 0.2, ..full.clone() }, Some([0.6, 0.6, 0.5]), None, 0, 1),
-                ("eddy-trace", full.clone(), Some([0.6, 0.6, 0.5]), Some([0.03, -0.05, 0.02]), 0, 1),
-                ("pf-fiberfox", Acquisition { partial_fourier: 0.75, ..full.clone() }, None, None, 0, 1),
+                    Some([0.3, -0.8, 0.5]), 0, 1),
+                ("eddy-phase", Acquisition { eddy_phase: 0.2, ..full.clone() }, Some([0.6, 0.6, 0.5]), 0, 1),
+                ("pf-fiberfox", Acquisition { partial_fourier: 0.75, ..full.clone() }, None, 0, 1),
                 ("pf-contiguous-reverse", Acquisition { partial_fourier: 0.75, pf_mode: PartialFourierMode::Contiguous,
-                    reverse_phase: true, ..full.clone() }, None, None, 0, 1),
-                ("grappa-coils", Acquisition { accel: 2, acs_lines: 6, n_coils: 4, ..full.clone() }, None, None, 2, 4),
-                ("grappa3", Acquisition { accel: 3, acs_lines: 8, n_coils: 4, ..full.clone() }, None, None, 1, 4),
+                    reverse_phase: true, ..full.clone() }, None, 0, 1),
+                ("grappa-coils", Acquisition { accel: 2, acs_lines: 6, n_coils: 4, ..full.clone() }, None, 2, 4),
+                ("grappa3", Acquisition { accel: 3, acs_lines: 8, n_coils: 4, ..full.clone() }, None, 1, 4),
                 ("everything", Acquisition { ghost_offset: 0.02, eddy_strength: 2.0, eddy_quad: 0.3, eddy_phase: 0.1,
                     partial_fourier: 0.8, accel: 2, acs_lines: 8, n_coils: 3, ..full.clone() },
-                    Some([0.5, 0.5, 0.7]), Some([0.02, 0.04, -0.01]), 0, 3),
+                    Some([0.5, 0.5, 0.7]), 0, 3),
                 // gradient echo (P5 part A): decay from the RF and the static fmap*TE phase
                 ("ge-clean", Acquisition { echo: EchoFormation::Gradient, do_distortions: false, do_relaxation: false,
-                    ..full.clone() }, None, None, 0, 1),
-                ("ge-distortion+relaxation", Acquisition { echo: EchoFormation::Gradient, ..full.clone() }, None, None, 0, 1),
+                    ..full.clone() }, None, 0, 1),
+                ("ge-distortion+relaxation", Acquisition { echo: EchoFormation::Gradient, ..full.clone() }, None, 0, 1),
                 ("ge-everything", Acquisition { echo: EchoFormation::Gradient, ghost_offset: 0.02, eddy_strength: 2.0,
                     eddy_quad: 0.3, eddy_phase: 0.1, partial_fourier: 0.8, accel: 2, acs_lines: 8, n_coils: 3,
                     reverse_phase: true, ..full.clone() },
-                    Some([0.5, 0.5, 0.7]), Some([0.02, 0.04, -0.01]), 0, 3),
+                    Some([0.5, 0.5, 0.7]), 0, 3),
             ];
-            for (name, acq, eddy_drive, eddy_lin, coil, ncoils) in cases {
+            for (name, acq, eddy_drive, coil, ncoils) in cases {
                 let inp = SliceInput {
                     compartments: &comp_refs, t2: &t2, t_inhom: None, fmap: &fmap, phase0: Some(&phase0),
-                    sim: [snx, sny], acq_matrix: [nx, ny], z: 3, nz: 9, eddy_drive, prep_drive: None, slice_seed: 0, eddy_lin,
+                    sim: [snx, sny], acq_matrix: [nx, ny], z: 3, nz: 9, eddy_drive, prep_drive: None, slice_seed: 0,
                 };
                 let a = build_coil_kspace(&inp, &acq, coil, ncoils);
                 let b = reference_coil_kspace(&inp, &acq, coil, ncoils);
@@ -3441,7 +3269,7 @@ mod tests {
             compartments: &comp_refs, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
             sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
             eddy_drive: Some([bvec[0] * bval, bvec[1] * bval, bvec[2] * bval]),
-            prep_drive: None, slice_seed: 7, eddy_lin: None,
+            prep_drive: None, slice_seed: 7,
         };
         let got = simulate_slice_kspace(&inp, &acq);
         for (i, (re, im)) in got.iter().take(8).enumerate() {
@@ -3463,7 +3291,7 @@ mod tests {
         let make = |drive| SliceInput {
             compartments: &comp_refs, t2: &[T2Slice::Uniform(100.0)], t_inhom: None, fmap: &fmap, phase0: None,
             sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            eddy_drive: drive, prep_drive: None, slice_seed: 7, eddy_lin: None,
+            eddy_drive: drive, prep_drive: None, slice_seed: 7,
         };
         let none = simulate_slice(&make(None), &acq);
         let zero = simulate_slice(&make(Some([0.0; 3])), &acq);
@@ -3493,7 +3321,7 @@ mod tests {
         SliceInput {
             compartments: comps, t2, t_inhom, fmap, phase0: None,
             sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            eddy_drive: None, prep_drive: None, slice_seed: seed, eddy_lin: None,
+            eddy_drive: None, prep_drive: None, slice_seed: seed,
         }
     }
 
@@ -3535,7 +3363,7 @@ mod tests {
         let inp = SliceInput {
             compartments: &comp_refs, t2: &[T2Slice::Map(&map)], t_inhom: Some(&[T2Slice::Map(&tmap)]),
             fmap: &fmap, phase0: None, sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            eddy_drive: None, prep_drive: None, slice_seed: 5, eddy_lin: None,
+            eddy_drive: None, prep_drive: None, slice_seed: 5,
         };
         let got = simulate_slice_kspace(&inp, &acq);
         // (inp, acq, coil, ncoils) -> Vec<C>; single coil here.
@@ -3561,7 +3389,7 @@ mod tests {
         let inp = SliceInput {
             compartments: &comp_refs, t2: &[T2Slice::Map(&map)], t_inhom: Some(&[T2Slice::Map(&tmap)]),
             fmap: &fmap, phase0: None, sim: [nx, ny], acq_matrix: [nx, ny], z: 0, nz: 1,
-            eddy_drive: None, prep_drive: None, slice_seed: 5, eddy_lin: None,
+            eddy_drive: None, prep_drive: None, slice_seed: 5,
         };
         let got = simulate_slice_kspace(&inp, &acq);
         let want = reference_coil_kspace(&inp, &acq, 0, 1);
@@ -3589,7 +3417,7 @@ mod tests {
         let zero = vec![0.0f32; 4 * nx * ny];
         let with_fmap = SliceInput {
             compartments: &comp_refs, t2: &t2, t_inhom: None, fmap: &fmap, phase0: Some(&phase0), sim: [2 * nx, 2 * ny],
-            acq_matrix: [nx, ny], z: 0, nz: 1, eddy_drive: None, prep_drive: None, slice_seed: 1, eddy_lin: None,
+            acq_matrix: [nx, ny], z: 0, nz: 1, eddy_drive: None, prep_drive: None, slice_seed: 1,
         };
         let without = SliceInput { fmap: &zero, ..with_fmap };
         let base = Acquisition { do_relaxation: false, t_echo: 40.0, t_line: 0.5, ..Acquisition::default() };
@@ -3620,27 +3448,6 @@ mod tests {
         for ((ar, ai), (br, bi)) in s1.iter().zip(&s2) {
             assert!((br - t2_only * ar).hypot(bi - t2_only * ai) <= 1e-12 * peak, "spin echo decay");
         }
-    }
-
-    /// The static gradient-echo term is B0 only: the replayed eddy shear shares `rate` but is a
-    /// readout-gradient effect, so with no fieldmap and no decay the gradient echo is the spin
-    /// echo exactly, shear and all.
-    #[test]
-    fn gradient_echo_static_phase_excludes_the_eddy_shear() {
-        let (nx, ny) = (16, 16);
-        let comps = [box_hires(nx, ny, 4.0, 12.0, 4.0, 12.0)];
-        let comp_refs: Vec<&[f32]> = comps.iter().map(|v| v.as_slice()).collect();
-        let fmap = vec![0.0f32; nx * ny];
-        let t2 = [T2Slice::Uniform(80.0)];
-        let inp = SliceInput {
-            compartments: &comp_refs, t2: &t2, t_inhom: None, fmap: &fmap, phase0: None, sim: [nx, ny],
-            acq_matrix: [nx, ny], z: 2, nz: 5, eddy_drive: None, prep_drive: None, slice_seed: 1,
-            eddy_lin: Some([0.05, -0.03, 0.02]),
-        };
-        let spin = Acquisition { do_relaxation: false, ..Acquisition::default() };
-        let a = simulate_slice_kspace(&inp, &spin);
-        let b = simulate_slice_kspace(&inp, &Acquisition { echo: EchoFormation::Gradient, ..spin.clone() });
-        assert_eq!(a, b);
     }
 
     /// The NUFFT path (uniform relaxation) and the rotor path (a constant map) agree under the
@@ -3728,23 +3535,16 @@ mod tests {
         let r = std::panic::catch_unwind(|| {
             simulate_acquisition_oversampled(
                 dims, dims, 2, &images, &t2, &fmap, None, &acq,
-                &[None], &[None, None], &phase, 1, None, None)
+                &[None], &[None, None], &phase, 1, None)
         });
         assert!(message(r).contains("eddy_drive has 1 entries for 2 volumes"));
 
         let r = std::panic::catch_unwind(|| {
             simulate_acquisition_oversampled(
                 dims, dims, 2, &images, &t2, &fmap, None, &acq,
-                &[None, None], &[None], &phase, 1, None, None)
+                &[None, None], &[None], &phase, 1, None)
         });
         assert!(message(r).contains("prep_drive has 1 entries for 2 volumes"));
-
-        let r = std::panic::catch_unwind(|| {
-            simulate_acquisition_oversampled(
-                dims, dims, 2, &images, &t2, &fmap, None, &acq,
-                &[None, None], &[None, None], &phase, 1, None, Some(&[[0.0; 3]]))
-        });
-        assert!(message(r).contains("eddy_trace has 1 entries for 2 volumes"));
     }
 }
 
@@ -3808,7 +3608,7 @@ mod echo_tests {
         let (s, a) = dims();
         let (eddy, prep) = drives();
         simulate_acquisition_oversampled(s, a, NV, imgs, &t2(), fm, None, acq, &eddy, &prep, &PhaseModel::hbcd_like(),
-                                         seed, sigma, None)
+                                         seed, sigma)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3820,9 +3620,9 @@ mod echo_tests {
         match rsalt {
             // the public entry unless a test overrides a salt
             None if xsalt(1) == 0 => simulate_acquisition_echoes(s, a, NV, &per, &t2(), fm, None, acq, tes, &eddy, &prep,
-                                                                 &PhaseModel::hbcd_like(), seed, sigma, None),
+                                                                 &PhaseModel::hbcd_like(), seed, sigma),
             r => echoes_with_salt(s, a, NV, &per, &t2(), fm, None, acq, tes, &eddy, &prep, &PhaseModel::hbcd_like(),
-                                  seed, sigma, None, r.unwrap_or(echo_salt), xsalt),
+                                  seed, sigma, r.unwrap_or(echo_salt), xsalt),
         }
     }
 
@@ -3935,7 +3735,7 @@ mod echo_tests {
         let (eddy, prep) = drives();
         let run = |xsalt: fn(usize) -> u64| {
             echoes_with_salt(s, a, NV, &[&one, &one], &[T2Volume::Uniform(80.0)], &fm, None, &acq, &[30.0, 55.0],
-                             &eddy, &prep, &PhaseModel::hbcd_like(), 21, None, None, echo_salt, xsalt)
+                             &eddy, &prep, &PhaseModel::hbcd_like(), 21, None, echo_salt, xsalt)
         };
         let worst = |out: &[(Vec<f32>, Vec<f32>)]| {
             let (c0, c1) = (complex(&out[0].0, &out[0].1), complex(&out[1].0, &out[1].1));
@@ -4064,7 +3864,7 @@ mod capture_tests {
     fn input<'a>(comps: &'a [&'a [f32]], t2: &'a [T2Slice<'a>], fmap: &'a [f32]) -> SliceInput<'a> {
         SliceInput {
             compartments: comps, t2, t_inhom: None, fmap, phase0: None, sim: [32, 32], acq_matrix: [16, 16], z: 1, nz: 3,
-            eddy_drive: Some([0.0, 600.0, 800.0]), prep_drive: None, slice_seed: 17, eddy_lin: None,
+            eddy_drive: Some([0.0, 600.0, 800.0]), prep_drive: None, slice_seed: 17,
         }
     }
 
@@ -4223,7 +4023,7 @@ mod complex_tests {
                  sim: [usize; 3], acq: [usize; 3]) -> AcquisitionInput<'a> {
         AcquisitionInput {
             sim_dims: sim, acq_dims: acq, n_volumes: 2, images, t2: &T2, fmap, t_inhom: None, eddy_drive: &EDDY,
-            prep_drive: &PREP, phase, seed: 5, noise_sigma, eddy_trace: None,
+            prep_drive: &PREP, phase, seed: 5, noise_sigma,
         }
     }
 
@@ -4252,7 +4052,7 @@ mod complex_tests {
         let inp = input(&images, &fmap, &phase, Some(&ns), sim, acqd);
         let (mag, ph) = mag_phase(&simulate_acquisition_complex(&inp, &acq, &AcquisitionOptions::default()));
         let (om, op) = simulate_acquisition_oversampled(sim, acqd, 2, &images, &T2, &fmap, None, &acq, &EDDY, &PREP, &phase,
-                                                        5, Some(&ns), None);
+                                                        5, Some(&ns));
         assert_eq!((bits(&mag), bits(&ph)), (bits(&om), bits(&op)));
         let ngrad = 2;
         for g in 0..ngrad {
@@ -4277,7 +4077,7 @@ mod complex_tests {
                 let out = simulate_slice(
                     &SliceInput {
                         compartments: &refs, t2: &t2s, t_inhom: None, fmap: &fs, phase0: Some(&phi), sim: [snx, sny],
-                        acq_matrix: [nx, ny], z, nz, eddy_drive: EDDY[g], prep_drive: PREP[g], slice_seed, eddy_lin: None,
+                        acq_matrix: [nx, ny], z, nz, eddy_drive: EDDY[g], prep_drive: PREP[g], slice_seed,
                     },
                     &acq,
                 );

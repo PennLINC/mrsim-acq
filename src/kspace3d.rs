@@ -139,7 +139,7 @@ impl Plan<'_> {
                 let inp = SliceInput {
                     compartments: &refs, t2: &t2s, t_inhom: tis.as_ref().map(|a| a.as_slice()),
                     fmap: &self.fmap[z * nplane..(z + 1) * nplane], phase0: Some(&phis[z]), sim: [snx, sny],
-                    acq_matrix: [nx, ny], z, nz, eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None,
+                    acq_matrix: [nx, ny], z, nz, eddy_drive: None, prep_drive: None, slice_seed: 0,
                 };
                 build_coil_kspace_timed(&inp, acq, q, ncoils, &self.within, la)
             };
@@ -571,7 +571,7 @@ impl GePlan<'_> {
                 let inp = SliceInput {
                     compartments: &refs, t2: &t2s, t_inhom: tis.as_ref().map(|a| a.as_slice()),
                     fmap: &self.fmap[z * nplane..(z + 1) * nplane], phase0: Some(&phis[z]), sim: [snx, sny],
-                    acq_matrix: [nx, ny], z, nz, eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None,
+                    acq_matrix: [nx, ny], z, nz, eddy_drive: None, prep_drive: None, slice_seed: 0,
                 };
                 build_coil_kspace_timed(&inp, acq_c, q, ncoils, &within, None)
             }).collect();
@@ -828,7 +828,7 @@ impl SpiralPlan<'_> {
                 let inp = SliceInput {
                     compartments: &refs, t2: &t2s, t_inhom: tis.as_ref().map(|a| a.as_slice()),
                     fmap: &self.fmap[z * nplane..(z + 1) * nplane], phase0: Some(&phis[z]), sim: [snx, sny],
-                    acq_matrix: [n, n], z, nz, eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None,
+                    acq_matrix: [n, n], z, nz, eddy_drive: None, prep_drive: None, slice_seed: 0,
                 };
                 let (x, r) = segment_inputs(&inp, self.acq, q, ncoils, la, voxel);
                 let fwd = if voxel { &self.voxel_fwd[z] } else { &self.class_fwd[z] };
@@ -1117,7 +1117,7 @@ mod tests {
             let acq = Acquisition { do_relaxation: false, n_coils, accel, acs_lines: 6, signal_scale: 100.0,
                                     ..Acquisition::default() };
             let (m2, p2) = simulate_acquisition_oversampled([snx, sny, nz], [nx, ny, nz], nv, &images, &t2, &fmap, None,
-                                                            &acq, &vec![None; nv], &vec![None; nv], &phase, 9, None, None);
+                                                            &acq, &vec![None; nv], &vec![None; nv], &phase, 9, None);
             let pk = m2.iter().fold(0.0f32, |a, b| a.max(*b)) as f64;
             for ky_segments in [1usize, 2, 4] {
                 for kz_segments in [1usize, 2] {
@@ -1176,7 +1176,7 @@ mod tests {
                     let t2s = [T2Slice::Uniform(80.0)];
                     let inp = SliceInput { compartments: &refs, t2: &t2s, t_inhom: None, fmap: &fmap[z * nplane..(z + 1) * nplane],
                                            phase0: Some(&phi), sim: [snx, sny], acq_matrix: [nx, ny], z, nz, eddy_drive: None,
-                                           prep_drive: None, slice_seed: 0, eddy_lin: None };
+                                           prep_drive: None, slice_seed: 0 };
                     build_coil_kspace_timed(&inp, &acq, 0, 1, tim, None)
                 }).collect();
                 let zs = (nz / 2) as f64;
@@ -1235,7 +1235,7 @@ mod tests {
             let acq = Acquisition { do_relaxation: false, reverse_phase, t_line: 0.5, t_echo: 30.0, ..Acquisition::default() };
             let none = Acquisition { do_distortions: false, ..acq.clone() };
             let run2 = |a: &Acquisition| simulate_acquisition_oversampled([snx, sny, nz], [nx, ny, nz], 1, &images, &t2, &fmap, None,
-                                                                         a, &[None], &[None], &PhaseModel::none(), 1, None, None).0;
+                                                                         a, &[None], &[None], &PhaseModel::none(), 1, None).0;
             let tr = train(nz, 1, KzOrder::Centric, 30.0, 180.0);
             let ro = Readout3d::Grase { ky_segments: 1, t_line_ms: 0.5, reverse_phase };
             let run3 = |a: &Acquisition| simulate_acquisition_3d([snx, sny, nz], [nx, ny, nz], 1, &images, &t2, None, &fmap, None,
@@ -1321,7 +1321,7 @@ mod tests {
             let v3 = simulate_acquisition_3d_complex([nx, ny, nz], [nx, ny, nz], 1, &images, &t2, None, &fmap, None, &acq, &tr, &ro,
                                                      None, None, &PhaseModel::none(), seed).remove(0);
             let (m2, p2) = simulate_acquisition_oversampled([nx, ny, nz], [nx, ny, nz], 1, &images, &t2, &fmap, None, &acq,
-                                                            &[None], &[None], &PhaseModel::none(), seed, None, None);
+                                                            &[None], &[None], &PhaseModel::none(), seed, None);
             for i in 0..nvox {
                 s3 += v3[i].0 * v3[i].0;
                 let re2 = m2[i] as f64 * (p2[i] as f64).cos();
@@ -1498,7 +1498,7 @@ mod tests {
                     let refs = [pl.as_slice()];
                     let t2s = [T2Slice::Uniform(80.0)];
                     let inp = SliceInput { compartments: &refs, t2: &t2s, t_inhom: None, fmap: sl, phase0: Some(&phi), sim: [s, s],
-                                           acq_matrix: [n, n], z, nz, eddy_drive: None, prep_drive: None, slice_seed: 0, eddy_lin: None };
+                                           acq_matrix: [n, n], z, nz, eddy_drive: None, prep_drive: None, slice_seed: 0 };
                     let (x, r) = segment_inputs(&inp, &acq, q, 2, None, false);
                     for (a, b) in acc.iter_mut().zip(fwd.apply(&x, &r)) {
                         *a = a.add(b);
@@ -1782,7 +1782,7 @@ mod tests {
                 let inp = SliceInput {
                     compartments: &refs, t2: &t2s, t_inhom: Some(&tis), fmap: &fmap[z * nplane..(z + 1) * nplane],
                     phase0: Some(&phi), sim: [snx, sny], acq_matrix: [nx, ny], z, nz, eddy_drive: None, prep_drive: None,
-                    slice_seed: 0, eddy_lin: None,
+                    slice_seed: 0,
                 };
                 build_coil_kspace_timed(&inp, &a, q, ncoils, &timing, None)
             }).collect();
