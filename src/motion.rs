@@ -349,9 +349,44 @@ pub fn apply_multiband_motion(
     law: &DropoutLaw,
     events: &[MotionEvent],
 ) -> Vec<DroppedShot> {
+    apply_multiband_motion_slab(images, dims, ngrad, v2w, mb, interleaved, law, events, None, None)
+}
+
+/// [`apply_multiband_motion`] on a slab of a larger volume (ported from TRXScan `main`):
+/// `slice_z` gives the full-FOV z index of each local slice and `nz_full` the full slice count, so
+/// the multiband shot schedule (and therefore which shots touch which slices) is the full
+/// volume's. Shots whose slices lie outside the slab are skipped; the returned
+/// [`DroppedShot::slices`] are full-FOV indices. The geometric jump resamples within the slab, so
+/// keep a few slices of context around the ones of interest.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_multiband_motion_slab(
+    images: &mut [Vec<f32>],
+    dims: [usize; 3],
+    ngrad: usize,
+    v2w: [[f64; 4]; 4],
+    mb: usize,
+    interleaved: bool,
+    law: &DropoutLaw,
+    events: &[MotionEvent],
+    slice_z: Option<&[usize]>,
+    nz_full: Option<usize>,
+) -> Vec<DroppedShot> {
     let [nx, ny, nz] = dims;
     let nvox = nx * ny * nz;
-    let schedule = slice_schedule(nz, mb, interleaved);
+    let nz_full = nz_full.unwrap_or(nz);
+    if let Some(sz) = slice_z {
+        assert_eq!(sz.len(), nz, "slice_z must name every local slice");
+    }
+    // full-FOV schedule, then each shot's slices mapped to LOCAL indices (dropping any outside)
+    let schedule_full = slice_schedule(nz_full, mb, interleaved);
+    let local_of = |zg: usize| -> Option<usize> {
+        match slice_z {
+            None => (zg < nz).then_some(zg),
+            Some(sz) => sz.iter().position(|&z| z == zg),
+        }
+    };
+    let schedule: Vec<Vec<usize>> =
+        schedule_full.iter().map(|shot| shot.iter().filter_map(|&z| local_of(z)).collect()).collect();
     let n_shots = schedule.len();
     let at3 = |x: usize, y: usize, z: usize| x + nx * (y + ny * z);
     let mut gt = Vec::new();
@@ -406,7 +441,7 @@ pub fn apply_multiband_motion(
                     }
                 }
             }
-            gt.push(DroppedShot { volume: g, shot: e.shot, slices: schedule[e.shot].clone(), attenuation: atten });
+            gt.push(DroppedShot { volume: g, shot: e.shot, slices: schedule_full[e.shot].clone(), attenuation: atten });
         }
     }
     gt
@@ -556,5 +591,37 @@ mod tests {
             assert!((u.attenuation(g, 0.5) - 0.5).abs() < 1e-12,
                     "Uniform must not vary with the volume index");
         }
+    }
+
+    /// TRXScan main's `multiband_slab_matches_the_full_volume_where_no_jump_crosses_the_edge`: pure
+    /// dropout on a 2-slice slab of a 6-slice volume at mb 2 sees the full volume's schedule, so the
+    /// same slices attenuate by the same factor, reported in full-FOV indices; the event's shot is
+    /// chosen to reach into the slab, so the check is not vacuous.
+    #[test]
+    fn multiband_slab_matches_the_full_volume_where_no_jump_crosses_the_edge() {
+        let (nx, ny, nz, ngrad) = (4usize, 3usize, 6usize, 2usize);
+        let v2w = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+        let mk = || vec![(0..nx * ny * nz * ngrad).map(|i| 1.0 + (i % 13) as f32).collect::<Vec<f32>>()];
+        let law = DropoutLaw::Scaled { drive: vec![0.0, 2000.0], floor: 50.0 };
+        let shot = slice_schedule(nz, 2, true).iter().position(|s| s.contains(&4)).unwrap();
+        let events = [MotionEvent { volume: 1, shot, severity: 0.8, jump_mm: [0.0; 3], jump_deg: [0.0; 3] }];
+        let mut full = mk();
+        let gt_full = apply_multiband_motion(&mut full, [nx, ny, nz], ngrad, v2w, 2, true, &law, &events);
+        let orig = mk();
+        let slab_range = nx * ny * 4 * ngrad..nx * ny * 6 * ngrad;
+        let mut slab = vec![orig[0][slab_range.clone()].to_vec()];
+        let gt_slab = apply_multiband_motion_slab(&mut slab, [nx, ny, 2], ngrad, v2w, 2, true, &law, &events,
+                                                  Some(&[4, 5]), Some(nz));
+        assert_eq!(slab[0], full[0][slab_range.clone()].to_vec());
+        assert_ne!(slab[0], orig[0][slab_range].to_vec(), "the event's shot reaches into the slab");
+        assert_eq!((gt_full.len(), gt_slab.len()), (1, 1));
+        assert_eq!(gt_full[0].slices, gt_slab[0].slices, "dropped slices are reported in full-FOV indices");
+        assert!(gt_slab[0].slices.contains(&4));
+        assert_eq!(gt_full[0].attenuation, gt_slab[0].attenuation);
+        // without a slab the slab variant is the plain one
+        let (mut a, mut b) = (mk(), mk());
+        let ga = apply_multiband_motion(&mut a, [nx, ny, nz], ngrad, v2w, 2, true, &law, &events);
+        let gb = apply_multiband_motion_slab(&mut b, [nx, ny, nz], ngrad, v2w, 2, true, &law, &events, None, None);
+        assert_eq!((a, ga.len()), (b, gb.len()));
     }
 }
