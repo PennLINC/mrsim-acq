@@ -325,6 +325,56 @@ impl LineTiming {
     }
 }
 
+/// The per-line timing of the single-shot EPI readout an [`Acquisition`] implies on an
+/// `nx` x `ny` matrix: what the forward model uses for relaxation, T2* decay and eddy decay
+/// ([`LineTiming::for_acquisition`]), with the acquisition order. Public so front ends can
+/// annotate k-space figures with the simulator's own timing (ported from TRXScan `main`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EpiTiming {
+    /// ms from the k-space centre (echo) at the centre of each ky line, indexed by ky.
+    pub t_ms: Vec<f64>,
+    /// ms since the RF pulse, indexed by ky (`t_echo + t_ms`).
+    pub t_rf_ms: Vec<f64>,
+    /// ms since the readout started (drives eddy-current decay), indexed by ky. With
+    /// [`PartialFourierMode::Scanner`] the clock starts at the first *acquired* line, so the
+    /// skipped lines carry negative values.
+    pub t_read_ms: Vec<f64>,
+    /// ky lines in the order they are acquired (`ny` entries).
+    pub order: Vec<usize>,
+    /// ms per PE line.
+    pub t_line: f64,
+    /// Echo time (ms).
+    pub t_echo: f64,
+    /// ms per k-space sample (`t_line / nx`).
+    pub dt: f64,
+}
+
+/// Readout timing per ky line for `acq` on an `nx` x `ny` matrix. See [`EpiTiming`].
+pub fn epi_timing(nx: usize, ny: usize, acq: &Acquisition) -> EpiTiming {
+    let epi = SingleShotEpi {
+        kx_max: nx, ky_max: ny, t_line: acq.t_line, t_echo: acq.t_echo, reverse_phase: acq.reverse_phase,
+    };
+    let lt = LineTiming::for_acquisition(acq, nx, ny);
+    let order = (0..ny).map(|line| epi.kspace_index(line * nx).1).collect();
+    EpiTiming { t_ms: lt.t_ms, t_rf_ms: lt.trf_ms, t_read_ms: lt.tread_ms, order, t_line: acq.t_line, t_echo: acq.t_echo,
+                dt: epi.dt() }
+}
+
+/// The full k-space trajectory: `(kx, ky, ms from the echo)` for every sample tick, in
+/// acquisition order (`nx * ny` entries). Partial Fourier / GRAPPA line skipping is a property
+/// of [`sampling_mask`], not of the trajectory.
+pub fn epi_trajectory(nx: usize, ny: usize, acq: &Acquisition) -> Vec<(usize, usize, f64)> {
+    let epi = SingleShotEpi {
+        kx_max: nx, ky_max: ny, t_line: acq.t_line, t_echo: acq.t_echo, reverse_phase: acq.reverse_phase,
+    };
+    (0..nx * ny)
+        .map(|tick| {
+            let (kx, ky) = epi.kspace_index(tick);
+            (kx, ky, epi.time_from_max_echo(tick))
+        })
+        .collect()
+}
+
 /// Per-compartment T2 (or T2') for ONE slice. Goes in [`SliceInput`].
 #[derive(Debug, Clone, Copy)]
 pub enum T2Slice<'a> {
@@ -1144,6 +1194,47 @@ pub fn phase_slice(
     v
 }
 
+/// Which intermediates [`simulate_slice_full`] should retain besides the combined image (ported
+/// from TRXScan `main`). Everything off is what the production path uses; each flag costs one
+/// `n_coils * nx * ny` complex buffer per slice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SliceCapture {
+    /// Per-coil k-space as acquired: after spikes and k-space noise, BEFORE GRAPPA, unwindowed;
+    /// un-acquired lines (partial Fourier, undersampling) are exactly zero.
+    pub acquired: bool,
+    /// Per-coil k-space as reconstructed: after GRAPPA and the reconstruction window — what is
+    /// inverse-transformed.
+    pub reconstructed: bool,
+    /// Per-coil complex images, before the Roemer combine.
+    pub coil_images: bool,
+}
+
+impl SliceCapture {
+    pub const ALL: SliceCapture = SliceCapture { acquired: true, reconstructed: true, coil_images: true };
+}
+
+/// One slice's reconstruction with the requested intermediates. Complex values are `[re, im]`
+/// pairs (the memory layout of `numpy.complex128`); all 2-D buffers are `kx + nx*ky` /
+/// `x + nx*y`.
+#[derive(Debug, Clone)]
+pub struct SliceRecon {
+    pub nx: usize,
+    pub ny: usize,
+    pub n_coils: usize,
+    /// Which k-space samples were acquired (= [`sampling_mask`]).
+    pub mask: Vec<bool>,
+    /// Per coil; see [`SliceCapture::acquired`].
+    pub acquired: Option<Vec<Vec<[f64; 2]>>>,
+    /// Per coil; see [`SliceCapture::reconstructed`].
+    pub reconstructed: Option<Vec<Vec<[f64; 2]>>>,
+    /// Per coil; see [`SliceCapture::coil_images`].
+    pub coil_images: Option<Vec<Vec<[f64; 2]>>>,
+    /// Per coil, the real sensitivity on the acquired grid (what the combine divides by).
+    pub sensitivities: Vec<Vec<f64>>,
+    /// The Roemer-combined complex image, before the `f32` cast [`simulate_slice`] applies.
+    pub combined: Vec<[f64; 2]>,
+}
+
 /// Simulate one slice: compartment images on the SIM grid (each `snx*sny`, layout `x + snx*y`) →
 /// complex image on the ACQUIRED matrix (`nx*ny`). `t2` is the per-compartment T2 (ms), scalar
 /// or map, as is the optional `t_inhom`; `fmap` is
@@ -1151,29 +1242,49 @@ pub fn phase_slice(
 /// grid's k-space is evaluated, so truncation to the nominal band happens during the forward
 /// transform rather than by discarding a computed k-space (spec 3.1).
 pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
+    simulate_slice_full(inp, acq, SliceCapture::default())
+        .combined
+        .iter()
+        .map(|c| (c[0] as f32, c[1] as f32))
+        .collect()
+}
+
+/// [`simulate_slice`] with the intermediates selected by `cap` retained. The combined image is
+/// identical to `simulate_slice`'s before its `f32` cast; capturing changes no arithmetic.
+pub fn simulate_slice_full(inp: &SliceInput, acq: &Acquisition, cap: SliceCapture) -> SliceRecon {
     // Build each coil's k-space (undersampled for GRAPPA when accel>1), reconstruct, then combine.
     let ncoils = acq.n_coils.max(1);
     let mut coil_kspace: Vec<Vec<C>> = Vec::with_capacity(ncoils);
     for coil in 0..ncoils {
         coil_kspace.push(build_coil_kspace(inp, acq, coil, ncoils));
     }
-    reconstruct_coils(coil_kspace, acq, inp.acq_matrix)
-        .into_iter()
-        .map(|c| (c.re as f32, c.im as f32))
-        .collect()
+    reconstruct_coils_full(coil_kspace, acq, inp.acq_matrix, cap)
 }
 
 /// One slice's (or partition's) reconstruction from its coils' acquired k-spaces: GRAPPA, the
 /// window, the inverse transform and the Roemer combine, returning the combined complex image
 /// on the acquired matrix in `f64`. [`simulate_slice`]'s reconstruction, moved here unchanged so
 /// the 3D path (`kspace3d`) reconstructs each partition by the same code.
-pub(crate) fn reconstruct_coils(mut coil_kspace: Vec<Vec<C>>, acq: &Acquisition, acq_matrix: [usize; 2]) -> Vec<C> {
+pub(crate) fn reconstruct_coils(coil_kspace: Vec<Vec<C>>, acq: &Acquisition, acq_matrix: [usize; 2]) -> Vec<C> {
+    reconstruct_coils_full(coil_kspace, acq, acq_matrix, SliceCapture::default())
+        .combined
+        .into_iter()
+        .map(|c| C { re: c[0], im: c[1] })
+        .collect()
+}
+
+/// [`reconstruct_coils`] with the intermediates selected by `cap` retained.
+fn reconstruct_coils_full(mut coil_kspace: Vec<Vec<C>>, acq: &Acquisition, acq_matrix: [usize; 2], cap: SliceCapture)
+    -> SliceRecon
+{
     let [nx, ny] = acq_matrix;
     let (xs, ys) = (nx / 2, ny / 2);
     let kat = |kx: usize, ky: usize| kx + nx * ky; // acquired k-space / acquired-image index
+    let pairs = |v: &[C]| -> Vec<[f64; 2]> { v.iter().map(|c| [c.re, c.im]).collect() };
     let ncoils = acq.n_coils.max(1);
     let accel = acq.accel.max(1);
     assert_eq!(coil_kspace.len(), ncoils, "one k-space per coil");
+    let acquired = cap.acquired.then(|| coil_kspace.iter().map(|k| pairs(k)).collect());
 
     // GRAPPA: fill the un-acquired PE lines with a kernel calibrated on the ACS band across coils.
     if accel > 1 {
@@ -1201,11 +1312,16 @@ pub(crate) fn reconstruct_coils(mut coil_kspace: Vec<Vec<C>>, acq: &Acquisition,
             }
         }
     }
+    let reconstructed = cap.reconstructed.then(|| coil_kspace.iter().map(|k| pairs(k)).collect());
 
     // inverse each coil, then phase-preserving Roemer combine with the known sensitivities:
     //   combined = Σ_c image_c · sens_c / Σ_c sens_c²  (real sensitivities here)
+    let sensitivities: Vec<Vec<f64>> = (0..ncoils)
+        .map(|coil| (0..nx * ny).map(|i| coil_sensitivity(coil, ncoils, (i % nx) as f64, (i / nx) as f64, nx, ny)).collect())
+        .collect();
     let mut wsum = vec![C::ZERO; nx * ny];
     let mut ssum = vec![0.0f64; nx * ny];
+    let mut coil_images: Option<Vec<Vec<[f64; 2]>>> = cap.coil_images.then(Vec::new);
     for (coil, ks) in coil_kspace.iter().enumerate() {
         #[cfg(feature = "kspace")]
         let img = inverse_2d_fft(ks, nx, ny, xs, ys);
@@ -1213,19 +1329,26 @@ pub(crate) fn reconstruct_coils(mut coil_kspace: Vec<Vec<C>>, acq: &Acquisition,
         let img = inverse_2d(ks, nx, ny, xs, ys);
         for y in 0..ny {
             for x in 0..nx {
-                let s = coil_sensitivity(coil, ncoils, x as f64, y as f64, nx, ny);
                 let i = kat(x, y);
+                let s = sensitivities[coil][i];
                 wsum[i] = wsum[i].add(img[i].scale(s));
                 ssum[i] += s * s;
             }
         }
+        if let Some(ci) = coil_images.as_mut() {
+            ci.push(pairs(&img));
+        }
     }
-    (0..nx * ny)
+    let combined = (0..nx * ny)
         .map(|i| {
             let s = ssum[i].max(1e-12);
-            C { re: wsum[i].re / s, im: wsum[i].im / s }
+            [wsum[i].re / s, wsum[i].im / s]
         })
-        .collect()
+        .collect();
+    SliceRecon {
+        nx, ny, n_coils: ncoils, mask: sampling_mask(nx, ny, acq), acquired, reconstructed, coil_images, sensitivities,
+        combined,
+    }
 }
 
 /// Exact FFT reconstruction (feature `kspace`, backed by the well-tested `rustfft` crate).
@@ -3703,6 +3826,137 @@ mod scanner_pf_tests {
         for mode in [PartialFourierMode::Contiguous, PartialFourierMode::FiberfoxCompatible] {
             let e = validate_acquisition_timing(&Acquisition { pf_mode: mode, ..early.clone() }, nx, ny).unwrap_err();
             assert!(e.contains("Scanner"), "{e}");
+        }
+    }
+}
+
+/// EPI timing and the per-slice capture (TRXScan re-sync, Task 3), ported from TRXScan `main` at
+/// the slice level; the acquisition-level capture tests come with the complex entry point.
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    /// One slice, two compartments at o = 2, every in-plane artifact on (noise, partial Fourier,
+    /// ghosting, eddy, a spike, four coils, GRAPPA).
+    fn artifact_slice() -> (Vec<Vec<f32>>, Vec<f32>, Acquisition) {
+        let (snx, sny) = (32usize, 32usize);
+        let a = box_hires(snx, sny, 6.0, 20.0, 8.0, 24.0);
+        let b: Vec<f32> = box_hires(snx, sny, 12.0, 26.0, 4.0, 18.0).iter().map(|v| 0.5 * v).collect();
+        let fmap: Vec<f32> = (0..snx * sny).map(|i| 3.0 * (((i % snx) as f64 - 16.0) / 16.0) as f32).collect();
+        let acq = Acquisition {
+            signal_scale: 1.0, noise_variance: 1e-4, partial_fourier: 0.75, pf_mode: PartialFourierMode::Contiguous,
+            ghost_offset: 0.01, eddy_strength: 0.01, eddy_quad: 0.002, eddy_phase: 2e-5, n_spikes: 1,
+            spike_amplitude: 0.2, n_coils: 4, accel: 2, acs_lines: 8, seed: 11, ..Default::default()
+        };
+        (vec![a, b], fmap, acq)
+    }
+
+    fn input<'a>(comps: &'a [&'a [f32]], t2: &'a [T2Slice<'a>], fmap: &'a [f32]) -> SliceInput<'a> {
+        SliceInput {
+            compartments: comps, t2, t_inhom: None, fmap, phase0: None, sim: [32, 32], acq_matrix: [16, 16], z: 1, nz: 3,
+            eddy_drive: Some([0.0, 600.0, 800.0]), prep_drive: None, slice_seed: 17, eddy_lin: None,
+        }
+    }
+
+    /// Capturing changes no arithmetic: the combined image is the same with every capture on, and
+    /// `simulate_slice` is its `f32` cast.
+    #[test]
+    fn capturing_changes_no_arithmetic() {
+        let (imgs, fmap, acq) = artifact_slice();
+        let comps: Vec<&[f32]> = imgs.iter().map(|v| v.as_slice()).collect();
+        let t2 = [T2Slice::Uniform(80.0), T2Slice::Uniform(60.0)];
+        let inp = input(&comps, &t2, &fmap);
+        let plain = simulate_slice_full(&inp, &acq, SliceCapture::default());
+        let all = simulate_slice_full(&inp, &acq, SliceCapture::ALL);
+        assert_eq!(plain.combined, all.combined);
+        assert!(plain.acquired.is_none() && plain.reconstructed.is_none() && plain.coil_images.is_none());
+        let s = simulate_slice(&inp, &acq);
+        assert!(s.iter().zip(&plain.combined).all(|(a, c)| a.0 == c[0] as f32 && a.1 == c[1] as f32));
+        assert_eq!((all.nx, all.ny, all.n_coils), (16, 16, 4));
+        assert_eq!(all.acquired.as_ref().unwrap().len(), 4);
+    }
+
+    /// The captured reconstructed k-space inverts to the captured coil images, which combine with
+    /// the captured sensitivities to the combined image.
+    #[test]
+    fn captured_reconstructed_kspace_inverts_to_combined() {
+        let (imgs, fmap, acq) = artifact_slice();
+        let comps: Vec<&[f32]> = imgs.iter().map(|v| v.as_slice()).collect();
+        let t2 = [T2Slice::Uniform(80.0), T2Slice::Uniform(60.0)];
+        let r = simulate_slice_full(&input(&comps, &t2, &fmap), &acq, SliceCapture::ALL);
+        let (nx, ny) = (r.nx, r.ny);
+        let (rec, cimg) = (r.reconstructed.as_ref().unwrap(), r.coil_images.as_ref().unwrap());
+        let mut wsum = vec![C::ZERO; nx * ny];
+        let mut ssum = vec![0.0f64; nx * ny];
+        for coil in 0..r.n_coils {
+            let ks: Vec<C> = rec[coil].iter().map(|v| C { re: v[0], im: v[1] }).collect();
+            let img = inverse_2d(&ks, nx, ny, nx / 2, ny / 2);
+            for i in 0..nx * ny {
+                let ci = cimg[coil][i];
+                assert!((img[i].re - ci[0]).abs() < 1e-9 && (img[i].im - ci[1]).abs() < 1e-9, "coil image mismatch");
+                let sv = r.sensitivities[coil][i];
+                wsum[i] = wsum[i].add(img[i].scale(sv));
+                ssum[i] += sv * sv;
+            }
+        }
+        for i in 0..nx * ny {
+            let c = r.combined[i];
+            let (re, im) = (wsum[i].re / ssum[i].max(1e-12), wsum[i].im / ssum[i].max(1e-12));
+            assert!((re - c[0]).abs() < 1e-9 && (im - c[1]).abs() < 1e-9, "combined mismatch at {i}");
+        }
+    }
+
+    /// The captured acquired k-space is pre-GRAPPA (zero off the mask), the mask is the sampling
+    /// mask, and GRAPPA fills un-acquired samples in the reconstructed k-space.
+    #[test]
+    fn acquired_kspace_is_pre_grappa_and_mask_is_the_sampling_mask() {
+        let (imgs, fmap, acq) = artifact_slice();
+        let comps: Vec<&[f32]> = imgs.iter().map(|v| v.as_slice()).collect();
+        let t2 = [T2Slice::Uniform(80.0), T2Slice::Uniform(60.0)];
+        let r = simulate_slice_full(&input(&comps, &t2, &fmap), &acq, SliceCapture::ALL);
+        assert_eq!(r.mask, sampling_mask(r.nx, r.ny, &acq));
+        let (a, rec) = (r.acquired.as_ref().unwrap(), r.reconstructed.as_ref().unwrap());
+        let mut filled = 0;
+        for coil in 0..r.n_coils {
+            for (i, &m) in r.mask.iter().enumerate() {
+                if !m {
+                    assert_eq!(a[coil][i], [0.0, 0.0], "un-acquired sample must be zero in `acquired`");
+                    if rec[coil][i] != [0.0, 0.0] {
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        assert!(filled > 0, "GRAPPA must have synthesised un-acquired lines in `reconstructed`");
+    }
+
+    /// TRXScan main's `epi_timing_agrees_with_line_times_and_the_trajectory`, against
+    /// `LineTiming::for_acquisition`, and with Scanner partial Fourier's clock.
+    #[test]
+    fn epi_timing_agrees_with_line_times_and_the_trajectory() {
+        for reverse in [false, true] {
+            for pf in [1.0, 0.75] {
+                let acq = Acquisition { t_line: 0.8, t_echo: 75.0, reverse_phase: reverse, partial_fourier: pf,
+                                        pf_mode: PartialFourierMode::Scanner, ..Default::default() };
+                let (nx, ny) = (12usize, 10usize);
+                let t = epi_timing(nx, ny, &acq);
+                let lt = LineTiming::for_acquisition(&acq, nx, ny);
+                assert_eq!((&t.t_ms, &t.t_rf_ms, &t.t_read_ms), (&lt.t_ms, &lt.trf_ms, &lt.tread_ms));
+                let mut seen = t.order.clone();
+                seen.sort_unstable();
+                assert_eq!(seen, (0..ny).collect::<Vec<_>>(), "order must visit every line once");
+                for w in t.order.windows(2) {
+                    assert!(t.t_read_ms[w[1]] > t.t_read_ms[w[0]], "readout time must increase along the acquisition order");
+                }
+                for ky in 0..ny {
+                    assert!((t.t_rf_ms[ky] - (t.t_echo + t.t_ms[ky])).abs() < 1e-12);
+                }
+                assert!((t.dt - 0.8 / nx as f64).abs() < 1e-15);
+                let traj = epi_trajectory(nx, ny, &acq);
+                assert_eq!(traj.len(), nx * ny);
+                assert!(traj.windows(2).all(|w| w[1].2 > w[0].2));
+                assert_eq!(traj[0].1, t.order[0]);
+            }
         }
     }
 }
