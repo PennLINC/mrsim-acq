@@ -344,6 +344,34 @@ three newest `main` commits (`0b917e6`, `be68c24`, `acb7506`) touch no moved mod
   other golden file is bit-identical, and the six eddy-trace files were removed.
 - The TRXScan P0 gate is retired here: the frozen tree calls the removed legacy path.
 
+**aslscan regress gates.**
+- `2304c06` (Task 2): 67 of 67.
+- `df447f6` (Tasks 3-5): 67 of 67. The snapshot read mrsim-acq as `+local`, with CRLF-only differences
+  from a Windows-git checkout; see Traps.
+- aslscan `8291945` + mrsim-acq `b45a719` (Task 7): see below.
+
+**Task 8: the Claude adversarial review of the implementation (2026-10-08; Codex out of credits).**
+- Eight findings, each verified against the source. Fixed in mrsim-acq `f796d43` and TRXScan `de8cf2c`,
+  `7328e0e` and `22f038e`:
+  1. The Python timing pre-check that Task 6 required was missing; the acquisition panicked instead.
+     Now `ValueError`, per volume with `te_per_volume`, with a test. It also showed the reach of the
+     refusal: Python's default protocol (TE 90 ms, 1 ms per line) is refused from about 180 lines.
+  2. The facade's `b_max` refusal was a second behaviour difference, reachable from Python (a nominal
+     `b_max` with jittered b-values). Fixed exactly: mrsim-acq gained `DropoutLaw::ScaledTo` with an
+     explicit normaliser, and the facade passes the caller's `b_max`. No refusal is left.
+  3. The aslscan gates after Task 2 were unrecorded (recorded above).
+  4. The literal-sum oracle had lost Scanner coverage. It now applies Scanner's shifted eddy clock and
+     has two Scanner + eddy cases.
+  5. One comparison in the per-slice-loop test was a tautology. Its doc now says so.
+  6. Facade asserts on the lengths of `bvals`/`bvecs`, where `main` accepted longer arrays. Replaced by
+     reading the first `ngrad`, as `main` did.
+  7. Stale `Acquisition::hbcd`/`default()` references in TRXScan's docs and Python comments; the
+     dependency and README items are left for landing.
+  8. Baseline coverage. The baselines were regenerated from `main` in a temporary worktree and extended:
+     the `trxscan-benchmark` binary, a multi-slice, non-sorted, multi-coil capture, and the
+     jittered-`b_max` dropout. That is CLI 594 and Python 177 entries, all identical on this branch.
+- Left as is: mrsim-acq's own `t2.len() == ncomp` assert, which comes from P0.
+
 **Deviations from the plan.**
 - **Scanner partial Fourier is refused on GRASE** (Task 2), instead of GRASE reading the shifted clock.
   The skip is defined by the 2D EPI train's line order, which a GRASE echo block does not follow. GRASE
@@ -356,7 +384,7 @@ three newest `main` commits (`0b917e6`, `be68c24`, `acb7506`) touch no moved mod
   - The user chose to keep the refusal. The two tests take the default TE instead (TRXScan `507aaf3`).
     Their acquisitions have relaxation and distortion off, so TE has no effect on what they check.
   - A gate on relaxation alone was written and reverted. It would not have saved these tests.
-- **The motion facade's `b_max`** (Task 6). mrsim-acq's `DropoutLaw::Scaled` normalises by the largest
+- **The motion facade's `b_max`** (Task 6; superseded by the review's fix 2, `ScaledTo`). mrsim-acq's `DropoutLaw::Scaled` normalises by the largest
   drive, while `main` divides by the caller's `b_max`.
   - `diffusion_dropout_law` appends `b_max` after the volumes' b-values (zero-padded to `ngrad`), which is
     exact whenever `b_max` is at least the largest b-value. Every caller satisfies this: the scheme's
