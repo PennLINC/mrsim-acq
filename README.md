@@ -31,7 +31,10 @@ reconstructing an image from it. The following effects are included:
   gradient echo (T2' decaying from the excitation, with the fieldmap phase of the echo time).
 - **Gibbs ringing.** The object is simulated on a finer grid than the scan and truncated in
   k-space, so ringing appears as it does in real data.
-- **Partial Fourier** acquisition and k-space **windowing** (Hann, Tukey, or Fermi filters).
+- **Partial Fourier** acquisition and k-space **windowing** (Hann, Tukey, or Fermi filters). Partial
+  Fourier can follow Fiberfox's rule (the default), drop the end of the EPI train (`Contiguous`), or
+  start the train late as a scanner does (`Scanner`), which reaches the k-space centre sooner and
+  restarts the eddy-current clock at the first acquired line.
 - **Multiple receive coils**, combined into one image, and **GRAPPA** parallel imaging.
 - **Artifacts:** Nyquist ghosting, eddy currents, and k-space spikes.
 - **Noise**, added in k-space or, optionally, in image space with a spatially varying level.
@@ -84,11 +87,12 @@ speed:
 
 ## Usage
 
-There are three entry points, each simulating a whole series of volumes in one call:
+There are five entry points, each simulating a whole series of volumes in one call:
 
 | Function | Readout |
 |---|---|
 | `kspace::simulate_acquisition_oversampled` | 2D EPI, one echo |
+| `kspace::simulate_acquisition_complex` | 2D EPI, one echo, complex output, with options (below) |
 | `kspace::simulate_acquisition_echoes` | 2D EPI, several echo times per excitation |
 | `kspace3d::simulate_acquisition_3d` | 3D GRASE or stack-of-spirals, optionally segmented into shots |
 | `kspace3d::simulate_acquisition_3d_ge` | 3D gradient-echo EPI train, one or more echo times per excitation |
@@ -107,6 +111,21 @@ The 2D entry point's inputs are:
 - **A random seed.**
 
 It returns the magnitude and phase images on the scan grid.
+
+`simulate_acquisition_complex` takes the same inputs by name (`kspace::AcquisitionInput`) and
+returns the real and imaginary parts instead. Its `kspace::AcquisitionOptions` add:
+
+- **K-space capture** for chosen slices: each coil's k-space as acquired (before GRAPPA) and as
+  reconstructed, the coil images and sensitivities, and the combined image. Capturing changes no
+  output value.
+- **Slabs.** Simulating a few slices of a larger volume (`slice_z`, `nz_full`) gives exactly those
+  slices of the full run: the seeds, the object phase and the eddy terms follow each slice's
+  position in the full volume.
+- **A different echo time per volume**, and a **progress callback**.
+
+`kspace::epi_timing` and `kspace::epi_trajectory` return the readout timing and k-space trajectory
+the forward model uses, for annotating figures. `kspace::simulate_slice_full` is the single-slice
+version of the capture.
 
 The 3D gradient-echo entry point takes the train (`readout::ExcitationTrain`: the kz segments and
 their order, the spacing of the excitations, the echo times) and its in-plane readout
