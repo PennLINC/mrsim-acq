@@ -425,7 +425,8 @@ pub fn check_ge3d_timing(train: &ExcitationTrain, table: &Ge3dTable, t_exc_ms: f
         }
     }
     let end = block(tes.len() - 1).1;
-    if end > train.exc_spacing_ms - pulse + 1e-9 {
+    // (a train of one excitation has no next one; its end is the repetition's check)
+    if table.n_exc > 1 && end > train.exc_spacing_ms - pulse + 1e-9 {
         return Err(format!(
             "the last echo's block ends {:.4} ms after its excitation, after the next excitation pulse starts at {:.4} ms \
              (excitation spacing {:.4} ms, pulse {:.3} ms): the spacing must be at least {:.4} ms", end,
@@ -948,5 +949,13 @@ mod tests {
         assert!(check(vec![12.0], 40.0, 1133.9).unwrap_err().contains("repetition"));
         check(vec![12.0], 40.0, 1134.0).unwrap();
         assert!(check(vec![], 40.0, 2000.0).is_err());
+        // one excitation per shot (8 kz segments of 8 partitions): no next pulse to reach, so a
+        // spacing shorter than the block passes; the repetition still bounds it (1000 + 14)
+        let one = ge3d_lines(&ge_train(8, KzOrder::Linear, vec![12.0]), &ro, 16, 8).unwrap();
+        assert_eq!(one.n_exc, 1);
+        let mut tr1 = ge_train(8, KzOrder::Linear, vec![12.0]);
+        tr1.exc_spacing_ms = 10.0;
+        check_ge3d_timing(&tr1, &one, 1000.0, 2000.0).unwrap();
+        assert!(check_ge3d_timing(&tr1, &one, 1000.0, 1013.9).unwrap_err().contains("repetition"));
     }
 }
