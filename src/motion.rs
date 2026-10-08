@@ -314,6 +314,10 @@ pub enum DropoutLaw {
     /// b-values and a floor of 50.0, reproducing the previous b0-exempt behavior exactly
     /// (`drive_max` is the same `fold(0, max)` the scheme's `b_max` was).
     Scaled { drive: Vec<f64>, floor: f64 },
+    /// `1 - severity * (drive / max)` with a given normaliser, `drive < floor` exempt, and nothing
+    /// attenuated when `max <= 0`; a volume missing from `drive` has drive 0. TRXScan's diffusion
+    /// dropout divides by the caller's `b_max` this way.
+    ScaledTo { drive: Vec<f64>, max: f64, floor: f64 },
     /// `1 - severity`, applied to every volume alike.
     Uniform,
 }
@@ -327,6 +331,10 @@ impl DropoutLaw {
                 let d = drive.get(volume).copied().unwrap_or(0.0);
                 let d_max = drive.iter().cloned().fold(0.0f64, f64::max);
                 if d < *floor || d_max <= 0.0 { 1.0 } else { 1.0 - severity * (d / d_max) as f32 }
+            }
+            DropoutLaw::ScaledTo { drive, max, floor } => {
+                let d = drive.get(volume).copied().unwrap_or(0.0);
+                if d < *floor || *max <= 0.0 { 1.0 } else { 1.0 - severity * (d / max) as f32 }
             }
         }
     }
@@ -623,5 +631,16 @@ mod tests {
         let ga = apply_multiband_motion(&mut a, [nx, ny, nz], ngrad, v2w, 2, true, &law, &events);
         let gb = apply_multiband_motion_slab(&mut b, [nx, ny, nz], ngrad, v2w, 2, true, &law, &events, None, None);
         assert_eq!((a, ga.len()), (b, gb.len()));
+    }
+
+    /// `ScaledTo` divides by its given normaliser, even one below the largest drive; the floor,
+    /// a volume beyond `drive` and `max <= 0` attenuate nothing.
+    #[test]
+    fn scaled_to_divides_by_the_given_maximum() {
+        let law = DropoutLaw::ScaledTo { drive: vec![0.0, 1005.0, 30.0], max: 1000.0, floor: 50.0 };
+        assert_eq!(law.attenuation(1, 0.5).to_bits(), (1.0 - 0.5 * (1005.0f64 / 1000.0) as f32).to_bits());
+        assert_eq!((law.attenuation(0, 0.5), law.attenuation(2, 0.5), law.attenuation(7, 0.5)), (1.0, 1.0, 1.0));
+        let off = DropoutLaw::ScaledTo { drive: vec![1000.0], max: 0.0, floor: 50.0 };
+        assert_eq!(off.attenuation(0, 0.9), 1.0);
     }
 }

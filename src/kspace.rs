@@ -2025,7 +2025,13 @@ mod tests {
             t_echo: acq.t_echo,
             reverse_phase: acq.reverse_phase,
         };
-        let (t_ms, trf_ms, tread_ms) = line_times(&epi);
+        let (t_ms, trf_ms, mut tread_ms) = line_times(&epi);
+        // Scanner partial Fourier: the eddy clock starts at the first acquired line (spelled out
+        // here, not taken from `LineTiming::for_acquisition`, so the oracle checks that table too)
+        let skip = pf_skipped_lines(ny, acq) as f64 * acq.t_line;
+        for v in tread_ms.iter_mut() {
+            *v -= skip;
+        }
         let gradient = inp.eddy_drive.unwrap_or([0.0; 3]);
         // eddy currents affect volumes with a prep gradient only (`None` = the old b0 branch)
         let do_eddy = eddy_enabled(acq, inp.eddy_drive);
@@ -3176,6 +3182,12 @@ mod tests {
                     Some([0.3, -0.8, 0.5]), 0, 1),
                 ("eddy-phase", Acquisition { eddy_phase: 0.2, ..full.clone() }, Some([0.6, 0.6, 0.5]), 0, 1),
                 ("pf-fiberfox", Acquisition { partial_fourier: 0.75, ..full.clone() }, None, 0, 1),
+                // Scanner partial Fourier with the eddy model: the shifted eddy clock (TRXScan's default)
+                ("pf-scanner-eddy", Acquisition { partial_fourier: 0.75, pf_mode: PartialFourierMode::Scanner,
+                    eddy_strength: 3.0, eddy_quad: 0.4, eddy_phase: 0.1, ..full.clone() }, Some([0.3, -0.8, 0.5]), 0, 1),
+                ("pf-scanner-reverse-grappa", Acquisition { partial_fourier: 0.8, pf_mode: PartialFourierMode::Scanner,
+                    reverse_phase: true, eddy_strength: 2.0, accel: 2, acs_lines: 8, n_coils: 3, ..full.clone() },
+                    Some([0.5, 0.5, 0.7]), 1, 3),
                 ("pf-contiguous-reverse", Acquisition { partial_fourier: 0.75, pf_mode: PartialFourierMode::Contiguous,
                     reverse_phase: true, ..full.clone() }, None, 0, 1),
                 ("grappa-coils", Acquisition { accel: 2, acs_lines: 6, n_coils: 4, ..full.clone() }, None, 2, 4),
@@ -4040,7 +4052,9 @@ mod complex_tests {
     /// TRXScan main's `simulate_acquisition_is_bit_identical_to_the_per_slice_loop`: the literal
     /// loop the acquisition used to be (`simulate_slice` per (g, z), the image-space noise keyed
     /// on the voxel, then `f32` magnitude and phase) against the complex entry point, sample for
-    /// sample; and `simulate_acquisition_oversampled` is the complex output's magnitude and phase.
+    /// sample. (That `simulate_acquisition_oversampled` is the complex output's magnitude and phase
+    /// is only a wiring check: both run `acquire_volumes_complex`. The literal loop and the golden
+    /// record are what pin the bits.)
     #[test]
     fn simulate_acquisition_is_bit_identical_to_the_per_slice_loop() {
         let (images, fmap, acq, sim, acqd) = artifact_fixture();
