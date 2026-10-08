@@ -298,7 +298,82 @@ three newest `main` commits (`0b917e6`, `be68c24`, `acb7506`) touch no moved mod
 
 ## Measurements
 
-(filled in during implementation)
+**Task 0 (2026-10-08).**
+- TRXScan worktree `../TRXScan-resync` on `resync-mrsim-acq` from `origin/main` `acb7506`. Its upstream
+  is unset, so a stray push cannot reach `main`. mrsim-acq tagged `pre-resync` at `d839703`.
+- Python environment: the micromamba env `rust-trx`, created for this work (user request):
+  - python 3.12, maturin 1.15, pytest, numpy, scipy, nibabel, pooch, dipy and patchelf from conda-forge;
+  - trx-python from pip.
+- TRXScan P0 gate at the start: 62 of 62.
+- `main`'s CI matrix before any change:
+  - `cargo test`: 134;
+  - `--features cli --all-targets`: 141;
+  - `--features cli,par --all-targets`: 141;
+  - `--features kspace`: 137 passed, 2 ignored;
+  - `pytest scripts`: 73 passed, 1 skipped;
+  - `pytest` in `python/`: 48 passed, 1 skipped, 4 deselected;
+  - clippy: 57 warnings.
+
+**Task 1 (TRXScan `1a5414d`).**
+- `tools/run_resync_baseline.sh` covers the P0 fixture through the CLI under both feature sets: the P0
+  cases (with "legacy" renamed `o1`), the three `--pf-mode`s, a noise map, `--gre-out` and `--gnl`. That
+  is 162 checksums, identical across two runs.
+- `tools/resync_python_baseline.py` gives 158 hashes, identical across two runs.
+- Self-tests:
+  - `hbcd`'s `ghost_offset` 0.015 → 0.016 changes 44 CLI checksums (every magnitude and phase image) and
+    the `hbcd` hash.
+  - The default `t_inhom` + 1 ms changes 34 Python hashes (every `simulate` case).
+  - Both were restored, and the restored build reproduces the baselines.
+
+**Tasks 2-5 (mrsim-acq `2304c06`, `be1dc2c`, `7ffb1d2`, `df447f6`).**
+- TRXScan P0 62 of 62 after each.
+- aslscan regress at `2304c06`: 67 of 67 identical.
+- mrsim-acq tests: 121 default and 146 under `io,kspace,par` at `df447f6`. Clippy is at baseline.
+
+**Task 6 (TRXScan `bf64888`, `3379956`, `507aaf3`, `8efbd91`, `d929d79`).**
+- Every step: CLI 162 of 162 and Python 158 of 158 identical.
+- At the end:
+  - `cargo test`: 68 / 75 (`cli`) / 75 (`cli,par`) / 68 (`kspace`). The moved modules' tests now run in
+    mrsim-acq.
+  - pytest 48 passed; `pytest scripts` 73 passed.
+  - Clippy: 35 warnings. Those in the touched files are code carried over verbatim.
+
+**Task 7 (mrsim-acq `5561ecf`, aslscan `8291945`, TRXScan `ef56b0d`).**
+- TRXScan baselines identical.
+- The golden record's six "everything" files were re-recorded, because their eddy shear is gone. Every
+  other golden file is bit-identical, and the six eddy-trace files were removed.
+- The TRXScan P0 gate is retired here: the frozen tree calls the removed legacy path.
+
+**Deviations from the plan.**
+- **Scanner partial Fourier is refused on GRASE** (Task 2), instead of GRASE reading the shifted clock.
+  The skip is defined by the 2D EPI train's line order, which a GRASE echo block does not follow. GRASE
+  also never reads the eddy clock. The 3D gradient-echo and spiral paths already refuse partial Fourier.
+- **mrsim-acq is a path dependency during the work** (Task 6). The commits are unpushed, so a git
+  dependency cannot resolve yet. It is pinned to a tag at landing (Task 8).
+- **The timing refusal reached `main`'s own tests** (Task 6).
+  - `main`'s Python clean b0 runs with relaxation on at the protocol's TE. Two tests use TE 0, so their
+    clean b0 started its readout before the excitation, which mrsim-acq refuses.
+  - The user chose to keep the refusal. The two tests take the default TE instead (TRXScan `507aaf3`).
+    Their acquisitions have relaxation and distortion off, so TE has no effect on what they check.
+  - A gate on relaxation alone was written and reverted. It would not have saved these tests.
+- **The motion facade's `b_max`** (Task 6). mrsim-acq's `DropoutLaw::Scaled` normalises by the largest
+  drive, while `main` divides by the caller's `b_max`.
+  - `diffusion_dropout_law` appends `b_max` after the volumes' b-values (zero-padded to `ngrad`), which is
+    exact whenever `b_max` is at least the largest b-value. Every caller satisfies this: the scheme's
+    maximum, or 1000 for a b0-only Python scheme.
+  - `b_max <= 0` attenuates nothing, as on `main`.
+  - A smaller `b_max` is refused. A test pins the law against `main`'s formula bit for bit.
+- **Two `main` `SliceInput`/`BackgroundPhase` literals** named mrsim-acq's `eddy_lin` and `smooth` from
+  Task 6 until Task 7 removed them (`benchmark.rs`).
+
+**Traps.**
+- **The regress harness's base worktree.**
+  - The P7 cleanup ran `git worktree prune`, which unregistered `../p5-base/aslscan` but left the
+    directory, so the harness refused it.
+  - Removing the directory let the harness recreate it. Its targets in `../p5-base/target-*` survive.
+- **CRLF from Windows git.** A `git checkout --` from Windows git rewrote `kspace.rs` with CRLF. WSL git,
+  which the regress harness uses, saw that as a local change ("`+local`" in the Tasks 3-5 gate's
+  snapshot). Restore files with WSL git.
 
 ## Claude adversarial review of this plan (2026-10-08)
 
