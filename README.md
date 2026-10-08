@@ -42,11 +42,15 @@ reconstructing an image from it. The following effects are included:
   gridding and iterative least squares, with a certified error bound on the off-resonance time
   segmentation; spirals need the `kspace` feature.
   A segmented acquisition can give each shot its own weight and pose.
-- **Several echo times** read from the same excitation, each with independent receiver noise.
+- **3D gradient-echo EPI** (a stack of EPI): a train of excitations, each followed by an EPI readout
+  of one partition's k-space plane (or one segment of it). The caller supplies a weight for every
+  excitation and compartment, so the train's longitudinal state, such as the approach to steady state
+  or the depletion of a label, comes from the caller's model.
+- **Several echo times** read from the same excitation, each with independent receiver noise, for
+  2D EPI and for the 3D gradient-echo EPI train.
 - **Output** as BIDS `part-mag` and `part-phase` NIfTI files with JSON sidecars.
 
-The 2D readout is single-shot EPI. Multi-echo 3D trains and 3D gradient-echo readouts are not
-modeled.
+The 2D readout is single-shot EPI. Multi-echo spin-echo trains (GRASE or spiral) are not modeled.
 
 ## Installation
 
@@ -87,6 +91,7 @@ There are three entry points, each simulating a whole series of volumes in one c
 | `kspace::simulate_acquisition_oversampled` | 2D EPI, one echo |
 | `kspace::simulate_acquisition_echoes` | 2D EPI, several echo times per excitation |
 | `kspace3d::simulate_acquisition_3d` | 3D GRASE or stack-of-spirals, optionally segmented into shots |
+| `kspace3d::simulate_acquisition_3d_ge` | 3D gradient-echo EPI train, one or more echo times per excitation |
 
 The 2D entry point's inputs are:
 
@@ -102,6 +107,15 @@ The 2D entry point's inputs are:
 - **A random seed.**
 
 It returns the magnitude and phase images on the scan grid.
+
+The 3D gradient-echo entry point takes the train (`readout::ExcitationTrain`: the kz segments and
+their order, the spacing of the excitations, the echo times) and its in-plane readout
+(`readout::Ge3dReadout`). It does not take the images of every volume at once. Instead it calls a
+function you supply, once per volume, which returns that volume's compartment images and its weight
+per excitation and compartment (`kspace3d::GeVolume`). Memory then grows with the volumes being
+simulated at the same moment, not with the length of the series. `readout::check_ge3d_timing`
+checks that the echoes' readouts fit between the excitation pulses and that the train fits in the
+repetition time.
 
 ```rust
 use mrsim_acq::kspace::Acquisition;
