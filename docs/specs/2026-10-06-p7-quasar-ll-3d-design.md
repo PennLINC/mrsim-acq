@@ -772,6 +772,10 @@ preparation.
   transverse coherence.
 - **Smooth `T1` maps under `"epi3d"`.** They are refused rather than approximated. A low-rank or
   node expansion in `T1` would admit them.
+- **Per-volume `FlipAngle` arrays for `"epi3d"` without Look-Locker** (Part C above allows them;
+  deferred at implementation, user decision 2026-10-08). They are refused: an array is read only
+  with `LookLocker: true`. Admitting them needs the separate M0's flip (`[m0] flip_angle`, as under
+  Look-Locker) and, under Hadamard, one flip per encoding cycle.
 - **Compat** for every P7 feature: simasl models none of them.
 - From P6, still deferred: velocity-selective ASL, vessel encoding, non-Sylvester and
   Walsh-ordered matrices, dummy cycles, and a multi-echo EPI's own k-space.
