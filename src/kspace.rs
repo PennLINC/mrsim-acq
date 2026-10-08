@@ -1597,11 +1597,103 @@ pub fn simulate_acquisition_oversampled(
                     seed, seed, noise_sigma, eddy_trace)
 }
 
+/// The 2D acquisition's inputs, by name (TRXScan re-sync): what [`simulate_acquisition_oversampled`]
+/// takes positionally. `images` and `fmap` are on the simulation grid `sim_dims = [nx*o, ny*o, nz]`
+/// (images `(x + snx*(y + sny*z))*n_volumes + g`); the output is on `acq_dims = [nx, ny, nz]`.
+#[derive(Clone, Copy)]
+pub struct AcquisitionInput<'a> {
+    pub sim_dims: [usize; 3],
+    pub acq_dims: [usize; 3],
+    pub n_volumes: usize,
+    pub images: &'a [Vec<f32>],
+    /// Per-compartment T2 (ms), scalar or a map on the simulation grid.
+    pub t2: &'a [T2Volume<'a>],
+    pub fmap: &'a [f32],
+    /// Per-compartment T2' (ms); `None` uses `Acquisition::t_inhom` throughout.
+    pub t_inhom: Option<&'a [T2Volume<'a>]>,
+    /// Per-volume eddy drive (`SliceInput::eddy_drive`).
+    pub eddy_drive: &'a [Option<[f64; 3]>],
+    /// Per-volume prep-gradient drive for `phase.prep` (`SliceInput::prep_drive`).
+    pub prep_drive: &'a [Option<(f64, [f64; 3])>],
+    pub phase: &'a PhaseModel,
+    /// Mixed into every per-slice seed; see [`simulate_acquisition_oversampled`].
+    pub seed: u64,
+    /// Per-voxel image-space noise SD on the acquired grid; see [`simulate_acquisition_oversampled`].
+    pub noise_sigma: Option<&'a [f32]>,
+    /// Per-volume linear eddy shear to replay; see [`simulate_acquisition_oversampled`].
+    pub eddy_trace: Option<&'a [[f64; 3]]>,
+}
+
+/// Options for [`simulate_acquisition_complex`] beyond the object and protocol (ported from
+/// TRXScan `main`). `Default` is exactly what [`simulate_acquisition_oversampled`] does.
+#[derive(Clone, Copy, Default)]
+pub struct AcquisitionOptions<'a> {
+    /// Full-FOV z index of each local slice (length `acq_dims[2]`), so a slab or a single slice
+    /// sees the same eddy z-terms, object phase, per-slice seeds and image-noise stream as the
+    /// full-volume run. The data (images, fieldmap, T2 maps) stay local. `None` = `0..nz`.
+    pub slice_z: Option<&'a [usize]>,
+    /// Full-FOV slice count when `slice_z` is given. `None` = `acq_dims[2]`.
+    pub nz_full: Option<usize>,
+    /// LOCAL slice indices whose k-space is retained (in this order). `None` = none.
+    pub kspace_slices: Option<&'a [usize]>,
+    /// Which per-coil intermediates to keep for those slices.
+    pub capture: SliceCapture,
+    /// Per-volume echo time (ms), length `n_volumes`; `None` = `acq.t_echo` for every volume. Each
+    /// volume's timing is checked as [`validate_acquisition_timing`] checks one.
+    pub t_echo_per_volume: Option<&'a [f64]>,
+    /// Called after each volume completes with `(done, total)`. Volumes run in parallel under
+    /// `par`, so it must be `Sync`; completion order is not volume order.
+    pub progress: Option<&'a (dyn Fn(usize, usize) + Sync)>,
+}
+
+/// K-space and per-coil intermediates for the captured slices. Complex arrays are `[re, im]`
+/// pairs in C order over the axes named; `nsl = slices.len()`.
+#[derive(Debug, Clone)]
+pub struct KspaceCapture {
+    /// The local slice indices captured, in array order.
+    pub slices: Vec<usize>,
+    pub nx: usize,
+    pub ny: usize,
+    pub n_coils: usize,
+    /// `[ky, kx]`, shared by every slice and volume (= [`sampling_mask`]).
+    pub mask: Vec<bool>,
+    /// `[coil, y, x]` real coil sensitivities on the acquired grid.
+    pub sensitivities: Vec<f32>,
+    /// `[vol, slice, coil, ky, kx]`; see [`SliceCapture::acquired`].
+    pub acquired: Option<Vec<[f32; 2]>>,
+    /// `[vol, slice, coil, ky, kx]`; see [`SliceCapture::reconstructed`].
+    pub reconstructed: Option<Vec<[f32; 2]>>,
+    /// `[vol, slice, coil, y, x]`; see [`SliceCapture::coil_images`].
+    pub coil_images: Option<Vec<[f32; 2]>>,
+    /// `[vol, slice, y, x]`: the Roemer-combined complex image before any image-space noise.
+    pub combined: Vec<[f32; 2]>,
+}
+
+/// The complex acquisition output: real and imaginary parts in the 4-D layout
+/// `(x + nx*(y + ny*z))*n_volumes + g`, after image-space noise, plus the optional k-space capture.
+#[derive(Debug, Clone)]
+pub struct AcquisitionOutput {
+    pub re: Vec<f32>,
+    pub im: Vec<f32>,
+    pub kspace: Option<KspaceCapture>,
+}
+
+/// [`simulate_acquisition_oversampled`] returning the complex image and, on request, the k-space
+/// of selected slices, per-volume echo times, slab-aware slice indexing and a progress callback
+/// (ported from TRXScan `main`). With default options its magnitude and phase are
+/// `simulate_acquisition_oversampled`'s, bit for bit.
+pub fn simulate_acquisition_complex(inp: &AcquisitionInput, acq: &Acquisition, opts: &AcquisitionOptions)
+    -> AcquisitionOutput
+{
+    acquire_volumes_complex(inp, acq, opts, inp.seed, inp.seed)
+}
+
 /// The body of [`simulate_acquisition_oversampled`] with its one seed split in two: the
 /// **excitation** seed draws the per-shot phase realization (`PrepPhase::shot`), the **receiver**
 /// seed the k-space noise and spikes (`slice_seed`) and the image-space noise. The public entries
 /// pass the same seed to both, except [`simulate_acquisition_echoes`], whose echoes share one
-/// excitation and draw independent receiver noise.
+/// excitation and draw independent receiver noise. Magnitude and phase of
+/// [`acquire_volumes_complex`], with the same `f32` arithmetic as before it existed.
 #[allow(clippy::too_many_arguments)]
 fn acquire_volumes(
     sim_dims: [usize; 3],
@@ -1620,6 +1712,33 @@ fn acquire_volumes(
     noise_sigma: Option<&[f32]>,
     eddy_trace: Option<&[[f64; 3]]>,
 ) -> (Vec<f32>, Vec<f32>) {
+    let inp = AcquisitionInput {
+        sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, eddy_drive, prep_drive, phase, seed: receiver_seed,
+        noise_sigma, eddy_trace,
+    };
+    let out = acquire_volumes_complex(&inp, acq, &AcquisitionOptions::default(), excitation_seed, receiver_seed);
+    let n = out.re.len();
+    let (mut mag, mut ph) = (vec![0.0f32; n], vec![0.0f32; n]);
+    for i in 0..n {
+        let (re, im) = (out.re[i], out.im[i]);
+        mag[i] = (re * re + im * im).sqrt();
+        ph[i] = im.atan2(re);
+    }
+    (mag, ph)
+}
+
+/// The acquisition's one body: every (volume, slice) through [`simulate_slice_full`], complex out.
+/// `inp.seed` is not read; the two seeds are explicit (see [`acquire_volumes`]).
+fn acquire_volumes_complex(
+    inp: &AcquisitionInput,
+    acq: &Acquisition,
+    opts: &AcquisitionOptions,
+    excitation_seed: u64,
+    receiver_seed: u64,
+) -> AcquisitionOutput {
+    let AcquisitionInput {
+        sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, eddy_drive, prep_drive, phase, noise_sigma, eddy_trace, ..
+    } = *inp;
     let [snx, sny, nz] = sim_dims;
     let [nx, ny, nzo] = acq_dims;
     assert_eq!(nz, nzo, "slice count must match; z is never oversampled");
@@ -1638,7 +1757,16 @@ fn acquire_volumes(
         assert_eq!(ti.len(), ncomp, "t_inhom has {} entries for {ncomp} compartments", ti.len());
         validate_t2_volumes("T2'", ti, nvox_sim);
     }
-    validate_acquisition_timing(acq, nx, ny).unwrap_or_else(|e| panic!("{e}"));
+    match opts.t_echo_per_volume {
+        None => validate_acquisition_timing(acq, nx, ny).unwrap_or_else(|e| panic!("{e}")),
+        Some(t) => {
+            assert_eq!(t.len(), n_volumes, "t_echo_per_volume must have one entry per volume");
+            for (g, &te) in t.iter().enumerate() {
+                validate_acquisition_timing(&Acquisition { t_echo: te, ..acq.clone() }, nx, ny)
+                    .unwrap_or_else(|e| panic!("volume {g}: {e}"));
+            }
+        }
+    }
     assert_eq!(eddy_drive.len(), n_volumes,
                "eddy_drive has {} entries for {} volumes", eddy_drive.len(), n_volumes);
     assert_eq!(prep_drive.len(), n_volumes,
@@ -1647,15 +1775,40 @@ fn acquire_volumes(
         assert_eq!(tr.len(), n_volumes,
                    "eddy_trace has {} entries for {} volumes", tr.len(), n_volumes);
     }
+    if let Some(sz) = opts.slice_z {
+        assert_eq!(sz.len(), nz, "slice_z must name every local slice");
+    }
+    let nz_full = opts.nz_full.unwrap_or(nz);
+    if let Some(sz) = opts.slice_z {
+        assert!(sz.iter().all(|&z| z < nz_full), "slice_z entries must be below nz_full {nz_full}");
+    }
+    let global_z = |zl: usize| opts.slice_z.map_or(zl, |s| s[zl]);
+    let captured: Vec<usize> = opts.kspace_slices.map(|s| s.to_vec()).unwrap_or_default();
+    for &zl in &captured {
+        assert!(zl < nz, "kspace_slices index {zl} out of range for {nz} slices");
+    }
+    let done = std::sync::atomic::AtomicUsize::new(0);
 
-    let per_vol = |g: usize| -> (Vec<f32>, Vec<f32>) {
-        let (mut mag, mut ph) = (vec![0.0f32; nvox_acq], vec![0.0f32; nvox_acq]);
+    let per_vol = |g: usize| -> (Vec<f32>, Vec<f32>, Vec<SliceRecon>) {
+        let acq_owned;
+        let acq_g: &Acquisition = match opts.t_echo_per_volume {
+            Some(t) => {
+                acq_owned = Acquisition { t_echo: t[g], ..acq.clone() };
+                &acq_owned
+            }
+            None => acq,
+        };
+        let (mut re_out, mut im_out) = (vec![0.0f32; nvox_acq], vec![0.0f32; nvox_acq]);
+        let mut recons = Vec::with_capacity(captured.len());
         let mut cslices = vec![vec![0.0f32; snx * sny]; ncomp];
         let mut fslice = vec![0.0f32; snx * sny];
-        for z in 0..nz {
+        for zl in 0..nz {
+            // the data are local; everything keyed on position (seeds, shot phase, eddy z-terms,
+            // the object phase) is the full-FOV slice's
+            let z = global_z(zl);
             for y in 0..sny {
                 for x in 0..snx {
-                    let vox = x + snx * (y + sny * z);
+                    let vox = x + snx * (y + sny * zl);
                     for (c, img) in images.iter().enumerate() {
                         cslices[c][x + snx * y] = img[vox * n_volumes + g];
                     }
@@ -1663,19 +1816,21 @@ fn acquire_volumes(
                 }
             }
             let refs: Vec<&[f32]> = cslices.iter().map(|v| v.as_slice()).collect();
-            let t2_slice = t2_slices(t2, z, snx * sny);
-            let ti_slice = t_inhom.map(|ti| t2_slices(ti, z, snx * sny));
+            let t2_slice = t2_slices(t2, zl, snx * sny);
+            let ti_slice = t_inhom.map(|ti| t2_slices(ti, zl, snx * sny));
             let shot = match (&phase.prep, prep_drive[g]) {
                 (Some(p), Some((mag, dir))) => p.shot(mag, dir, g, z, excitation_seed),
                 _ => ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] },
             };
-            let phi = phase_slice(phase, &shot, snx, sny, o, z, nz);
+            let phi = phase_slice(phase, &shot, snx, sny, o, z, nz_full);
             let slice_seed = (g as u64)
                 .wrapping_mul(0x100_0001)
                 .wrapping_add(z as u64)
                 .wrapping_mul(0x9E37)
                 ^ receiver_seed;
-            let out = simulate_slice(
+            let want = captured.contains(&zl);
+            let cap = if want { opts.capture } else { SliceCapture::default() };
+            let out = simulate_slice_full(
                 &SliceInput {
                     compartments: &refs,
                     t2: &t2_slice,
@@ -1685,54 +1840,109 @@ fn acquire_volumes(
                     sim: [snx, sny],
                     acq_matrix: [nx, ny],
                     z,
-                    nz,
+                    nz: nz_full,
                     eddy_drive: eddy_drive[g],
                     prep_drive: prep_drive[g],
                     slice_seed,
                     eddy_lin: eddy_trace.map(|tr| tr[g]),
                 },
-                acq,
+                acq_g,
+                cap,
             );
             for y in 0..ny {
                 for x in 0..nx {
-                    let (mut re, mut im) = out[x + nx * y];
-                    let vox = x + nx * (y + ny * z);
+                    let c = out.combined[x + nx * y];
+                    let (mut re, mut im) = (c[0] as f32, c[1] as f32);
+                    let vox = x + nx * (y + ny * zl);
                     if let Some(ns) = noise_sigma {
                         let sd = ns[vox] as f64;
                         if sd > 0.0 {
-                            // deterministic per (volume, voxel); parallel-safe (per_vol is over g)
+                            // deterministic per (volume, FULL-FOV voxel); parallel-safe (per_vol is over g)
+                            let vox_g = x + nx * (y + ny * z);
                             let mut rng = Rng(
                                 receiver_seed ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                                    ^ (vox as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) | 1,
+                                    ^ (vox_g as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) | 1,
                             );
                             re += (rng.gauss() * sd) as f32;
                             im += (rng.gauss() * sd) as f32;
                         }
                     }
-                    mag[vox] = (re * re + im * im).sqrt();
-                    ph[vox] = im.atan2(re);
+                    re_out[vox] = re;
+                    im_out[vox] = im;
                 }
             }
+            if want {
+                recons.push(out);
+            }
         }
-        (mag, ph)
+        if let Some(p) = opts.progress {
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            p(n, n_volumes);
+        }
+        (re_out, im_out, recons)
     };
 
     #[cfg(feature = "par")]
-    let vols: Vec<(Vec<f32>, Vec<f32>)> = {
+    let vols: Vec<(Vec<f32>, Vec<f32>, Vec<SliceRecon>)> = {
         use rayon::prelude::*;
         (0..n_volumes).into_par_iter().map(per_vol).collect()
     };
     #[cfg(not(feature = "par"))]
-    let vols: Vec<(Vec<f32>, Vec<f32>)> = (0..n_volumes).map(per_vol).collect();
+    let vols: Vec<(Vec<f32>, Vec<f32>, Vec<SliceRecon>)> = (0..n_volumes).map(per_vol).collect();
 
-    let (mut magd, mut phased) = (vec![0.0f32; nvox_acq * n_volumes], vec![0.0f32; nvox_acq * n_volumes]);
-    for (g, (m, p)) in vols.iter().enumerate() {
+    let (mut red, mut imd) = (vec![0.0f32; nvox_acq * n_volumes], vec![0.0f32; nvox_acq * n_volumes]);
+    for (g, (r, i, _)) in vols.iter().enumerate() {
         for vox in 0..nvox_acq {
-            magd[vox * n_volumes + g] = m[vox];
-            phased[vox * n_volumes + g] = p[vox];
+            red[vox * n_volumes + g] = r[vox];
+            imd[vox * n_volumes + g] = i[vox];
         }
     }
-    (magd, phased)
+
+    let kspace = if captured.is_empty() {
+        None
+    } else {
+        // per_vol keeps the captured slices in local-slice order; emit them in the requested order
+        let nsl = captured.len();
+        let ncoils = acq.n_coils.max(1);
+        let per_slice = nx * ny;
+        let f = |v: &[f64; 2]| [v[0] as f32, v[1] as f32];
+        let mut acquired = opts.capture.acquired.then(|| Vec::with_capacity(n_volumes * nsl * ncoils * per_slice));
+        let mut reconstructed = opts.capture.reconstructed.then(|| Vec::with_capacity(n_volumes * nsl * ncoils * per_slice));
+        let mut coil_images = opts.capture.coil_images.then(|| Vec::with_capacity(n_volumes * nsl * ncoils * per_slice));
+        let mut combined = Vec::with_capacity(n_volumes * nsl * per_slice);
+        let mut sorted_local: Vec<usize> = captured.clone();
+        sorted_local.sort_unstable();
+        sorted_local.dedup();
+        let pos_in_run = |zl: usize| sorted_local.iter().position(|&s| s == zl).expect("a captured slice");
+        for (_, _, recons) in &vols {
+            for &zl in &captured {
+                let r = &recons[pos_in_run(zl)];
+                if let Some(a) = acquired.as_mut() {
+                    for coil in r.acquired.as_ref().expect("acquired captured") {
+                        a.extend(coil.iter().map(f));
+                    }
+                }
+                if let Some(a) = reconstructed.as_mut() {
+                    for coil in r.reconstructed.as_ref().expect("reconstructed captured") {
+                        a.extend(coil.iter().map(f));
+                    }
+                }
+                if let Some(a) = coil_images.as_mut() {
+                    for coil in r.coil_images.as_ref().expect("coil images captured") {
+                        a.extend(coil.iter().map(f));
+                    }
+                }
+                combined.extend(r.combined.iter().map(f));
+            }
+        }
+        let first = &vols[0].2[0];
+        let sensitivities = first.sensitivities.iter().flat_map(|c| c.iter().map(|&v| v as f32)).collect();
+        Some(KspaceCapture {
+            slices: captured, nx, ny, n_coils: ncoils, mask: first.mask.clone(), sensitivities, acquired, reconstructed,
+            coil_images, combined,
+        })
+    };
+    AcquisitionOutput { re: red, im: imd, kspace }
 }
 
 /// The receiver-seed salt of echo `e` in [`simulate_acquisition_echoes`]: zero for the first echo,
@@ -3958,5 +4168,307 @@ mod capture_tests {
                 assert_eq!(traj[0].1, t.order[0]);
             }
         }
+    }
+}
+
+/// The complex entry point and its options (TRXScan re-sync, Task 4), ported from TRXScan `main`
+/// with the diffusion drives explicit: eddy drive `bvec * bval`, prep drive `(bval, bvec)`.
+#[cfg(test)]
+mod complex_tests {
+    use super::*;
+
+    const EDDY: [Option<[f64; 3]>; 2] = [Some([0.0, 0.0, 0.0]), Some([600.0, 800.0, 0.0])];
+    const PREP: [Option<(f64, [f64; 3])>; 2] = [Some((0.0, [0.0, 0.0, 0.0])), Some((1000.0, [0.6, 0.8, 0.0]))];
+
+    /// Images, fieldmap, acquisition, simulation and acquired dimensions.
+    type Fixture = (Vec<Vec<f32>>, Vec<f32>, Acquisition, [usize; 3], [usize; 3]);
+
+    /// TRXScan main's `artifact_fixture`: 3 slices, 2 compartments at o = 2, every in-plane artifact
+    /// on, distinct per slice; two volumes.
+    fn artifact_fixture() -> Fixture {
+        let (nx, ny, nz, o) = (16usize, 16usize, 3usize, 2usize);
+        let (snx, sny) = (nx * o, ny * o);
+        let ngrad = 2;
+        let mut fiber = vec![0.0f32; snx * sny * nz * ngrad];
+        let mut gm = vec![0.0f32; snx * sny * nz * ngrad];
+        let mut fmap = vec![0.0f32; snx * sny * nz];
+        for z in 0..nz {
+            let sh = z as f64 * 3.0;
+            let a = box_hires(snx, sny, 6.0 + sh, 20.0 + sh, 8.0, 24.0 - sh);
+            let b = box_hires(snx, sny, 12.0, 26.0, 4.0 + sh, 18.0);
+            for y in 0..sny {
+                for x in 0..snx {
+                    let i = x + snx * y;
+                    let vox = x + snx * (y + sny * z);
+                    for g in 0..ngrad {
+                        let att = if g == 0 { 1.0 } else { 0.6 };
+                        fiber[vox * ngrad + g] = a[i] * att;
+                        gm[vox * ngrad + g] = 0.5 * b[i] * att;
+                    }
+                    fmap[vox] = 3.0 * ((x as f64 - 16.0) / 16.0) as f32 + z as f32;
+                }
+            }
+        }
+        let acq = Acquisition {
+            signal_scale: 1.0, noise_variance: 1e-4, partial_fourier: 0.75, pf_mode: PartialFourierMode::Contiguous,
+            ghost_offset: 0.01, eddy_strength: 0.01, eddy_quad: 0.002, eddy_phase: 2e-5, n_spikes: 1,
+            spike_amplitude: 0.2, n_coils: 4, accel: 2, acs_lines: 8, seed: 11, ..Default::default()
+        };
+        (vec![fiber, gm], fmap, acq, [snx, sny, nz], [nx, ny, nz])
+    }
+
+    const T2: [T2Volume<'static>; 2] = [T2Volume::Uniform(80.0), T2Volume::Uniform(60.0)];
+
+    fn input<'a>(images: &'a [Vec<f32>], fmap: &'a [f32], phase: &'a PhaseModel, noise_sigma: Option<&'a [f32]>,
+                 sim: [usize; 3], acq: [usize; 3]) -> AcquisitionInput<'a> {
+        AcquisitionInput {
+            sim_dims: sim, acq_dims: acq, n_volumes: 2, images, t2: &T2, fmap, t_inhom: None, eddy_drive: &EDDY,
+            prep_drive: &PREP, phase, seed: 5, noise_sigma, eddy_trace: None,
+        }
+    }
+
+    fn mag_phase(out: &AcquisitionOutput) -> (Vec<f32>, Vec<f32>) {
+        let mag = out.re.iter().zip(&out.im).map(|(re, im)| (re * re + im * im).sqrt()).collect();
+        let ph = out.re.iter().zip(&out.im).map(|(re, im)| im.atan2(*re)).collect();
+        (mag, ph)
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// TRXScan main's `simulate_acquisition_is_bit_identical_to_the_per_slice_loop`: the literal
+    /// loop the acquisition used to be (`simulate_slice` per (g, z), the image-space noise keyed
+    /// on the voxel, then `f32` magnitude and phase) against the complex entry point, sample for
+    /// sample; and `simulate_acquisition_oversampled` is the complex output's magnitude and phase.
+    #[test]
+    fn simulate_acquisition_is_bit_identical_to_the_per_slice_loop() {
+        let (images, fmap, acq, sim, acqd) = artifact_fixture();
+        let [snx, sny, nz] = sim;
+        let [nx, ny, _] = acqd;
+        let o = snx / nx;
+        let phase = PhaseModel::hbcd_like();
+        let ns: Vec<f32> = (0..nx * ny * nz).map(|v| 0.01 * ((v % 7) as f32)).collect();
+        let inp = input(&images, &fmap, &phase, Some(&ns), sim, acqd);
+        let (mag, ph) = mag_phase(&simulate_acquisition_complex(&inp, &acq, &AcquisitionOptions::default()));
+        let (om, op) = simulate_acquisition_oversampled(sim, acqd, 2, &images, &T2, &fmap, None, &acq, &EDDY, &PREP, &phase,
+                                                        5, Some(&ns), None);
+        assert_eq!((bits(&mag), bits(&ph)), (bits(&om), bits(&op)));
+        let ngrad = 2;
+        for g in 0..ngrad {
+            for z in 0..nz {
+                let mut cs = vec![vec![0.0f32; snx * sny]; images.len()];
+                let mut fs = vec![0.0f32; snx * sny];
+                for y in 0..sny {
+                    for x in 0..snx {
+                        let vox = x + snx * (y + sny * z);
+                        for (c, img) in images.iter().enumerate() {
+                            cs[c][x + snx * y] = img[vox * ngrad + g];
+                        }
+                        fs[x + snx * y] = fmap[vox];
+                    }
+                }
+                let refs: Vec<&[f32]> = cs.iter().map(|v| v.as_slice()).collect();
+                let (pm, pd) = PREP[g].unwrap();
+                let shot = phase.prep.as_ref().unwrap().shot(pm, pd, g, z, 5);
+                let phi = phase_slice(&phase, &shot, snx, sny, o, z, nz);
+                let slice_seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37) ^ 5;
+                let t2s = [T2Slice::Uniform(80.0), T2Slice::Uniform(60.0)];
+                let out = simulate_slice(
+                    &SliceInput {
+                        compartments: &refs, t2: &t2s, t_inhom: None, fmap: &fs, phase0: Some(&phi), sim: [snx, sny],
+                        acq_matrix: [nx, ny], z, nz, eddy_drive: EDDY[g], prep_drive: PREP[g], slice_seed, eddy_lin: None,
+                    },
+                    &acq,
+                );
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let (mut re, mut im) = out[x + nx * y];
+                        let vox = x + nx * (y + ny * z);
+                        let sd = ns[vox] as f64;
+                        if sd > 0.0 {
+                            let mut rng = Rng(5 ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                                              ^ (vox as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) | 1);
+                            re += (rng.gauss() * sd) as f32;
+                            im += (rng.gauss() * sd) as f32;
+                        }
+                        let i = vox * ngrad + g;
+                        assert_eq!(mag[i].to_bits(), (re * re + im * im).sqrt().to_bits(), "mag at g={g} z={z} x={x} y={y}");
+                        assert_eq!(ph[i].to_bits(), im.atan2(re).to_bits(), "phase at g={g} z={z} x={x} y={y}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// TRXScan main's `a_single_slice_run_is_bit_identical_to_its_slice_of_the_full_run`: with
+    /// `slice_z`/`nz_full` the eddy z-terms, object phase, per-slice seeds and the noise-map stream
+    /// see the slice's full-FOV position; without them it is not the same slice.
+    #[test]
+    fn a_single_slice_run_is_bit_identical_to_its_slice_of_the_full_run() {
+        let (images, fmap, acq, sim, acqd) = artifact_fixture();
+        let [snx, sny, nz] = sim;
+        let [nx, ny, _] = acqd;
+        let phase = PhaseModel::hbcd_like();
+        let ns: Vec<f32> = (0..nx * ny * nz).map(|v| 0.02 * ((v % 5) as f32)).collect();
+        let full = simulate_acquisition_complex(&input(&images, &fmap, &phase, Some(&ns), sim, acqd), &acq,
+                                                &AcquisitionOptions::default());
+        let (zl, ngrad) = (1usize, 2usize);
+        let sub_images: Vec<Vec<f32>> =
+            images.iter().map(|img| img[snx * sny * zl * ngrad..snx * sny * (zl + 1) * ngrad].to_vec()).collect();
+        let sub_fmap = fmap[snx * sny * zl..snx * sny * (zl + 1)].to_vec();
+        let sub_ns = ns[nx * ny * zl..nx * ny * (zl + 1)].to_vec();
+        let sub = input(&sub_images, &sub_fmap, &phase, Some(&sub_ns), [snx, sny, 1], [nx, ny, 1]);
+        let z_of = [zl];
+        let one = simulate_acquisition_complex(&sub, &acq,
+                                               &AcquisitionOptions { slice_z: Some(&z_of), nz_full: Some(nz), ..Default::default() });
+        for y in 0..ny {
+            for x in 0..nx {
+                for g in 0..ngrad {
+                    let (vf, vs) = ((x + nx * (y + ny * zl)) * ngrad + g, (x + nx * y) * ngrad + g);
+                    assert_eq!(full.re[vf].to_bits(), one.re[vs].to_bits(), "re at x={x} y={y} g={g}");
+                    assert_eq!(full.im[vf].to_bits(), one.im[vs].to_bits(), "im at x={x} y={y} g={g}");
+                }
+            }
+        }
+        let naive = simulate_acquisition_complex(&sub, &acq, &AcquisitionOptions::default());
+        assert_ne!(naive.re, one.re);
+    }
+
+    /// TRXScan main's `per_volume_te_equals_separate_runs`; and a per-volume echo time too early
+    /// for the readout is refused, naming the volume.
+    #[test]
+    fn per_volume_te_equals_separate_runs() {
+        let (images, fmap, acq, sim, acqd) = artifact_fixture();
+        let phase = PhaseModel::hbcd_like();
+        let inp = input(&images, &fmap, &phase, None, sim, acqd);
+        let tes = [70.0, 110.0];
+        let both = simulate_acquisition_complex(&inp, &acq, &AcquisitionOptions { t_echo_per_volume: Some(&tes), ..Default::default() });
+        let nvox = acqd[0] * acqd[1] * acqd[2];
+        for (g, te) in tes.iter().enumerate() {
+            let one = simulate_acquisition_complex(&inp, &Acquisition { t_echo: *te, ..acq.clone() }, &AcquisitionOptions::default());
+            for vox in 0..nvox {
+                assert_eq!(both.re[vox * 2 + g].to_bits(), one.re[vox * 2 + g].to_bits());
+                assert_eq!(both.im[vox * 2 + g].to_bits(), one.im[vox * 2 + g].to_bits());
+            }
+        }
+        let same = simulate_acquisition_complex(&inp, &acq, &AcquisitionOptions::default());
+        assert_ne!(same.re, both.re, "a different TE must change the relaxation weighting");
+        let early = [70.0, 1.0];
+        let r = std::panic::catch_unwind(|| {
+            simulate_acquisition_complex(&inp, &acq, &AcquisitionOptions { t_echo_per_volume: Some(&early), ..Default::default() })
+        });
+        let e = r.expect_err("a 1 ms echo");
+        let text = e.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(text.contains("volume 1") && text.contains("before the excitation"), "{text}");
+    }
+
+    /// TRXScan main's `capturing_kspace_changes_no_arithmetic`: capture leaves the image alone, and
+    /// `combined` for each captured slice is that slice's pre-noise image, in the requested order.
+    #[test]
+    fn capturing_kspace_changes_no_arithmetic() {
+        let (images, fmap, acq, sim, acqd) = artifact_fixture();
+        let phase = PhaseModel::hbcd_like();
+        let inp = input(&images, &fmap, &phase, None, sim, acqd);
+        let plain = simulate_acquisition_complex(&inp, &acq, &AcquisitionOptions::default());
+        let slices = [1usize, 0];
+        let cap = simulate_acquisition_complex(&inp, &acq,
+                                               &AcquisitionOptions { kspace_slices: Some(&slices), capture: SliceCapture::ALL, ..Default::default() });
+        assert_eq!((bits(&plain.re), bits(&plain.im)), (bits(&cap.re), bits(&cap.im)));
+        assert!(plain.kspace.is_none());
+        let k = cap.kspace.expect("k-space requested");
+        assert_eq!(k.slices, vec![1, 0]);
+        let (nx, ny, ncoils, ngrad, nsl) = (k.nx, k.ny, k.n_coils, 2, 2);
+        assert_eq!(k.combined.len(), ngrad * nsl * nx * ny);
+        assert_eq!(k.acquired.as_ref().unwrap().len(), ngrad * nsl * ncoils * nx * ny);
+        assert_eq!(k.sensitivities.len(), ncoils * nx * ny);
+        for g in 0..ngrad {
+            for (si, &zl) in k.slices.iter().enumerate() {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let c = k.combined[((g * nsl + si) * ny + y) * nx + x];
+                        let vox = x + nx * (y + ny * zl);
+                        assert_eq!(c[0], plain.re[vox * ngrad + g]);
+                        assert_eq!(c[1], plain.im[vox * ngrad + g]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// TRXScan main's `captured_reconstructed_kspace_inverts_to_combined`, on the `f32` capture.
+    #[test]
+    fn captured_reconstructed_kspace_inverts_to_combined() {
+        let (images, fmap, acq, sim, acqd) = artifact_fixture();
+        let phase = PhaseModel::hbcd_like();
+        let inp = input(&images, &fmap, &phase, None, sim, acqd);
+        let slices = [2usize];
+        let k = simulate_acquisition_complex(&inp, &acq,
+                                             &AcquisitionOptions { kspace_slices: Some(&slices), capture: SliceCapture::ALL, ..Default::default() })
+            .kspace.unwrap();
+        let (nx, ny, nc) = (k.nx, k.ny, k.n_coils);
+        let (rec, cimg) = (k.reconstructed.as_ref().unwrap(), k.coil_images.as_ref().unwrap());
+        for g in 0..2 {
+            let mut wsum = vec![C::ZERO; nx * ny];
+            let mut ssum = vec![0.0f64; nx * ny];
+            for coil in 0..nc {
+                let base = (g * nc + coil) * nx * ny;
+                let ks: Vec<C> = rec[base..base + nx * ny].iter().map(|v| C { re: v[0] as f64, im: v[1] as f64 }).collect();
+                let img = inverse_2d(&ks, nx, ny, nx / 2, ny / 2);
+                for i in 0..nx * ny {
+                    let ci = cimg[base + i];
+                    assert!((img[i].re - ci[0] as f64).abs() < 1e-4 && (img[i].im - ci[1] as f64).abs() < 1e-4, "coil image mismatch");
+                    let s = k.sensitivities[coil * nx * ny + i] as f64;
+                    wsum[i] = wsum[i].add(img[i].scale(s));
+                    ssum[i] += s * s;
+                }
+            }
+            for i in 0..nx * ny {
+                let c = k.combined[g * nx * ny + i];
+                let (re, im) = (wsum[i].re / ssum[i].max(1e-12), wsum[i].im / ssum[i].max(1e-12));
+                assert!((re - c[0] as f64).abs() < 1e-4 && (im - c[1] as f64).abs() < 1e-4, "combined at g={g} i={i}");
+            }
+        }
+    }
+
+    /// TRXScan main's `acquired_kspace_is_pre_grappa_and_mask_is_the_sampling_mask`.
+    #[test]
+    fn acquired_kspace_is_pre_grappa_and_mask_is_the_sampling_mask() {
+        let (images, fmap, acq, sim, acqd) = artifact_fixture();
+        let phase = PhaseModel::none();
+        let inp = input(&images, &fmap, &phase, None, sim, acqd);
+        let slices = [0usize];
+        let k = simulate_acquisition_complex(&inp, &acq,
+                                             &AcquisitionOptions { kspace_slices: Some(&slices), capture: SliceCapture::ALL, ..Default::default() })
+            .kspace.unwrap();
+        assert_eq!(k.mask, sampling_mask(k.nx, k.ny, &acq));
+        let (a, rec) = (k.acquired.as_ref().unwrap(), k.reconstructed.as_ref().unwrap());
+        let mut filled = 0;
+        for coil in 0..k.n_coils {
+            for (j, &m) in k.mask.iter().enumerate() {
+                let i = coil * k.nx * k.ny + j;
+                if !m {
+                    assert_eq!(a[i], [0.0, 0.0], "un-acquired sample must be zero in `acquired`");
+                    if rec[i] != [0.0, 0.0] {
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        assert!(filled > 0, "GRAPPA must have synthesised un-acquired lines in `reconstructed`");
+    }
+
+    /// The progress callback sees every volume once, with the total.
+    #[test]
+    fn progress_counts_every_volume() {
+        let (images, fmap, acq, sim, acqd) = artifact_fixture();
+        let phase = PhaseModel::none();
+        let inp = input(&images, &fmap, &phase, None, sim, acqd);
+        let seen = std::sync::Mutex::new(Vec::new());
+        let cb = |done: usize, total: usize| seen.lock().unwrap().push((done, total));
+        simulate_acquisition_complex(&inp, &acq, &AcquisitionOptions { progress: Some(&cb), ..Default::default() });
+        let mut v = seen.into_inner().unwrap();
+        v.sort_unstable();
+        assert_eq!(v, vec![(1, 2), (2, 2)]);
     }
 }
