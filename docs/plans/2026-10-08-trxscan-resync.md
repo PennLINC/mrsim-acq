@@ -9,18 +9,20 @@ bit relative to `main` and without moving one aslscan output bit relative to `p7
 **Why.** The P0 extraction (`docs/plans/2026-09-21-p0-mrsim-acq-extraction.md`) moved TRXScan's acquisition
 stage into mrsim-acq from a TRXScan snapshot, `05c76bf` (2026-09-23). Its TRXScan branch,
 `p0-mrsim-acq-extraction` (`12a9d09`), was never merged. Since then, TRXScan `main` changed the moved modules:
-- `ef4abe9` (2026-09-24) squashes the GNL work at an earlier point than the snapshot.
+- `ef4abe9` (2026-09-24) squashes the GNL work but leaves part of it out. The snapshot's last GNL commit,
+  `57858a5`, has eddy replay, the smooth background phase and the legacy path; the squash does not.
 - `02ca507` (2026-09-28) adds the Python bindings.
 
 A trial merge of the old branch into `main` conflicts in 19 files (modify/delete on `kspace.rs`, `motion.rs`
-and `phase.rs`). The old branch also carries snapshot-only GNL work that `main` does not have.
+and `phase.rs`). The old branch would also bring back the work the squash left out.
 
 **Architecture.** Redo the TRXScan side on a fresh branch from `main`. Port `main`'s acquisition changes into
 mrsim-acq as additive, default-off capabilities. Keep TRXScan's public API (CLI, Python bindings) on a thin
 TRXScan-side facade over mrsim-acq. Order of work:
 1. Capture `main`'s own output as the baseline.
-2. Grow mrsim-acq, gated on the aslscan regress run.
+2. Grow mrsim-acq additively, gated on the aslscan regress run and the TRXScan P0 gate.
 3. Re-point TRXScan, gated on the new baseline.
+4. Only then remove the pieces `main` dropped.
 
 No task changes both TRXScan's code location and its behavior.
 
@@ -30,23 +32,49 @@ reference for the mechanical TRXScan-side work.
 
 ## Decisions already made
 
-- **Snapshot-only pieces are removed from mrsim-acq to match `main`** (user, 2026-10-08):
+- **The pieces `main` dropped are removed from mrsim-acq** (user, 2026-10-08):
   - `SliceInput.eddy_lin` with the `eddy_trace` entry argument (eddy replay);
   - `BackgroundPhase.smooth` (the smooth background-phase modes);
   - `simulate_acquisition_legacy` and its test;
   - `Nufft1::n`.
 
-  Neither consumer uses them. They stay in git history and on the old branch. TRXScan-side snapshot-only
-  features are simply not re-extracted: `--eddy-trace`, `--phase-bg-scale`, `--phase-smooth`,
-  `--s0-map`/`--t2-map`, `--csf-scale-map`, and the MESE/MEGRE scripts.
-- **A fresh branch from `main`, not a merge of the old branch.** Merging would resurrect the snapshot-only
-  work and the pre-squash GNL history.
+  Neither consumer uses them. They stay in git history and on the old branch. The TRXScan-side features
+  dropped with them are simply not re-extracted: `--eddy-trace`, `--phase-bg-scale`, `--phase-smooth`,
+  `--s0-map`/`--t2-map`, `--csf-scale-map`, and the MESE/MEGRE scripts. The removal comes last (Task 7);
+  see "Why removals last".
+- **A fresh branch from `main`, not a merge of the old branch.** Merging would bring back the work `main` left
+  out, and the pre-squash GNL history.
 - **mrsim-acq keeps its general API** (the P0 interface changes: `T2Volume`, `eddy_drive`/`prep_drive`,
   `PrepPhase`, `DropoutLaw`, the echo formation). `main`'s diffusion-shaped API becomes a TRXScan facade:
   `SimulationInput` with `bvals`/`bvecs`/`t2`, `simulate_acquisition`, `simulate_acquisition_complex`,
-  `Acquisition::hbcd` and `dropout_events`.
+  `Acquisition::hbcd`, `dropout_events`, and `apply_multiband_motion(_slab)` taking `bvals, b_max`.
 - **mrsim-acq's `Acquisition::default()` keeps `FiberfoxCompatible`.** aslscan, `kspace3d`, the spiral path
-  and mrsim-acq's tests rely on it. TRXScan's facade sets `Scanner` where `main` defaults to it.
+  and mrsim-acq's tests rely on it. It is the only field whose default differs from `main`'s
+  (`main` defaults `pf_mode` to `Scanner`; `echo` is mrsim-acq's own field). `Default` cannot be overridden
+  on a foreign type, so TRXScan gets `acq::default_acquisition()`, and no TRXScan code may call
+  `Acquisition::default()` (Task 6 greps for it).
+- **mrsim-acq as a git dependency.** TRXScan pins sibling crates as git dependencies (`trx-rs` by rev,
+  `odx-rs` by tag), and its CI, wheel and release workflows (`ci.yml`, `python.yml`, `release.yml`;
+  maturin-action builds in Docker) cannot see a `../mrsim-acq` path. mrsim-acq is public.
+  - TRXScan depends on `mrsim-acq = { git = "https://github.com/PennLINC/mrsim-acq", tag = "..." }`.
+  - Local gates use a `[patch."https://github.com/PennLINC/mrsim-acq"]` path override, kept out of the
+    committed tree (in the gate script, or an uncommitted `.cargo/config.toml`).
+  - A tagged mrsim-acq must be pushed before the TRXScan PR (Task 8).
+- **One deliberate behavior difference.** mrsim-acq's entry point refuses (panics) when a readout starts
+  before its excitation (`trf ≤ 0` on an acquired line; P0, `3102f75`). `main` has no such check and
+  simulates those timings. The re-pointed TRXScan inherits the refusal. The Python facade validates first
+  and raises a Python `ValueError`, rather than letting a Rust panic reach the binding. No baseline case
+  may sit in that regime.
+
+## Why removals last
+
+The frozen TRXScan P0 worktree (`../TRXScan-p0`, `12a9d09`) is the only diffusion-shaped check on mrsim-acq
+until TRXScan is re-pointed. It calls `simulate_acquisition_legacy` and passes `eddy_trace`/`eddy_lin`, so it
+stops compiling the moment those are removed.
+- Tasks 2-5 are additive. Nothing the frozen tree uses changes signature, and it matches `PartialFourierMode`
+  only by constructing it. So its 62 checksums keep guarding Tasks 2-5.
+- The removals (Task 7) come after Task 6 re-points TRXScan `main`, whose own baseline then takes over. The
+  P0 gate is retired at Task 7.
 
 ## What main changed (inventory)
 
@@ -55,35 +83,37 @@ existing configuration; D = absent on `main`.
 
 | Change on `main` | Cat | Port to |
 |---|---|---|
-| `PartialFourierMode::Scanner` (late start, skips the first lines), `pf_skipped_lines`, the Scanner branch in `sampling_mask`, and the eddy clock (`tread`) shifted by the skipped lines | B (C only in Scanner mode) | mrsim-acq, default-off. The `tread` shift must go into `LineTiming::for_acquisition`, so `kspace3d`, spiral and GRASE agree |
-| `#[default] Scanner` on `Acquisition` and the CLI (`--pf-mode scanner`) | C | TRXScan facade only |
+| `PartialFourierMode::Scanner` (late start, skips the first lines), `pf_skipped_lines`, the Scanner branch in `sampling_mask`, and the eddy clock (`tread`) shifted by the skipped lines | B (C only in Scanner mode) | mrsim-acq, default-off. The `tread` shift must go into `LineTiming::for_acquisition`, so `kspace3d`, spiral and GRASE agree. mrsim-acq's `sampling_mask` tests only `== Contiguous` and falls through to the Fiberfox rule, so Scanner needs its own branch |
+| `#[default] Scanner` on `Acquisition` and the CLI (`--pf-mode scanner`) | C | TRXScan facade only (`default_acquisition`) |
 | `Acquisition::hbcd(ny)` preset | B | TRXScan facade, as a free function (the type is foreign) |
 | `EpiTiming`, `epi_timing`, `epi_trajectory` | B | mrsim-acq, beside `LineTiming` |
 | `SliceCapture`, `SliceRecon`, `simulate_slice_full` (`simulate_slice` becomes a wrapper) | B | mrsim-acq |
 | `simulate_acquisition_complex`, `AcquisitionOptions` (`slice_z`/`nz_full`, `kspace_slices`, `capture`, `t_echo_per_volume`, `progress`), `KspaceCapture`, `AcquisitionOutput` | B (C only for slabs) | mrsim-acq, over its general entry point |
 | `SimulationInput` and `simulate_acquisition` (replacing the positional entry point) | A | TRXScan facade |
 | Noise-map RNG keyed on the global voxel (identical when not a slab) | A | mrsim-acq, with the options |
-| `motion::apply_multiband_motion_slab`; `apply_multiband_motion` delegates to it | B (C only for slabs) | mrsim-acq, written with `DropoutLaw` |
+| `motion::apply_multiband_motion_slab`; `apply_multiband_motion` delegates to it. Both take `bvals, b_max` on `main` | B (C only for slabs) | mrsim-acq, written with `DropoutLaw`; TRXScan facade wrappers with `main`'s signatures |
 | `motion::dropout_events` and `dropout_seed` (hard-codes `b < 50`) | A (moved from the bin) | TRXScan facade (diffusion-specific) |
-| `eddy_lin`, `BackgroundPhase.smooth`, `simulate_acquisition_legacy`, `Nufft1::n` | D | Removed from mrsim-acq (decision above) |
-| `io::write_gre_fieldmap`; `hires_grid` delegating to a new inherent `Grid::hires` | B / A | TRXScan. `Grid` is foreign there, so use `mrsim_acq::io::hires_grid` (identical arithmetic) or the old branch's `GridRaster` trait |
+| `eddy_lin`, `BackgroundPhase.smooth`, `simulate_acquisition_legacy`, `Nufft1::n` | D | Removed from mrsim-acq, last (Task 7) |
+| `io::write_gre_fieldmap`; `hires_grid` delegating to a new inherent `Grid::hires` (used by Python and `io.rs`) | B / A | TRXScan. `Grid` is foreign there, so use `mrsim_acq::io::hires_grid` (identical arithmetic) or the old branch's `GridRaster` trait. Python builds without `io`, so it needs the trait or a std-only helper |
 
 `readout.rs`, `noise.rs`, `mat.rs`, `orient.rs`, `analytic.rs` and `config.rs` are byte-identical between
-the snapshot and `main`. The three newest `main` commits (`0b917e6`, `be68c24`, `acb7506`) touch no moved
-module.
+the snapshot and `main`. `kspace::Rng`, which `main`'s new `gre.rs` uses, exists in mrsim-acq unchanged. The
+three newest `main` commits (`0b917e6`, `be68c24`, `acb7506`) touch no moved module.
 
 ## Global constraints
 
-- **Two identity gates, every task.**
-  - aslscan: `tools/regress_identity.sh p7-complete p7-complete`, all cases identical (67 at P7).
-  - TRXScan: from Task 7, its outputs byte-identical to the Task 1 baseline of `main`, under both
-    `--features cli` and `--features cli,kspace,par`.
-- **The old P0 checksums no longer describe TRXScan.** `main`'s CLI default moved from `contiguous` to
-  `scanner` partial Fourier, so `main` itself differs from `05c76bf`. The Task 1 baseline replaces them.
-  The TRXScan P0 gate (frozen worktree at `12a9d09`) stays a check on mrsim-acq's history only. Re-run it
-  after Task 2 to confirm the removals.
+- **Identity gates.**
+  - aslscan, every task: `tools/regress_identity.sh p7-complete p7-complete`, all cases identical (67 at P7).
+  - TRXScan P0 (frozen worktree, 62 checksums), every mrsim-acq task through Task 5. Retired at Task 7.
+  - TRXScan `main`, from Task 6: outputs byte-identical to the Task 1 baseline under both `--features cli`
+    and `--features cli,kspace,par`; the Python hashes identical; and `main`'s CI steps passing locally
+    (`cargo test` with default features, `cargo test --features cli --all-targets`, `maturin develop` and
+    `pytest` in `python/`).
+- **The old P0 checksums do not describe `main`.** `main`'s CLI default partial Fourier moved from
+  `contiguous` to `scanner`, so `main` itself differs from `05c76bf`. The Task 1 baseline is the reference
+  for TRXScan. The P0 checksums only guard mrsim-acq's own history (above).
 - Hand-formatted source, about 100 columns. No repo-wide `cargo fmt`. Tests live in module `mod tests`.
-- Clippy: no new warnings in either crate.
+- Clippy: no new warnings in any crate.
 - Git: `-c core.autocrlf=false` for worktree add, commit and merge. Run gates from WSL-made detached
   worktrees.
 - Nothing is pushed, and no PR is opened, without the user's go-ahead. TRXScan `main` is Matt Cieslak's
@@ -91,58 +121,64 @@ module.
 
 ---
 
-## Task 0: Branches and worktrees
+## Task 0: Branches, worktrees and the starting gate
 
 - [ ] TRXScan: create a worktree `../TRXScan-resync` on a new branch `resync-mrsim-acq` from `origin/main`
   (`acb7506`), made from WSL so both gits can read it.
-- [ ] mrsim-acq: work on `main`, as in P1-P7.
-- [ ] Record the heads in this plan's Measurements.
+- [ ] mrsim-acq: work on `main`, as in P1-P7. Tag the starting point `pre-resync` (local), so Task 6 can
+  bisect mrsim-acq if its gate fails.
+- [ ] Run the TRXScan P0 gate once against the current mrsim-acq (expect 62 of 62).
+- [ ] Ask the user which micromamba environment has maturin and the bindings' Python dependencies (`numpy`,
+  `scipy`, `nibabel`, `pooch`, `dipy`, `trx-python`, `pytest`), as `python.yml` installs them.
+- [ ] Record the heads and the environment in this plan's Measurements.
 
 ## Task 1: Baseline of TRXScan main
 
 - [ ] Bring the P0 fixture tooling onto `resync-mrsim-acq`: `tools/gen_p0_fixture.py`,
   `tools/run_p0_baseline.sh` and `tests/fixtures/p0_baseline/` inputs (content from `05c76bf`; no source
-  change).
+  change). Every flag the script uses exists on `main`'s CLI (verified). Rename its `legacy` case
+  (`--oversample 1`): `main` has no legacy path, so it runs the oversampled path at o = 1.
 - [ ] Extend the run matrix so it covers what `main` added or changed. Each case is one CLI invocation, under
   both feature sets:
   - partial Fourier `scanner` (the new default), `contiguous` and `fiberfox`;
+  - the `hbcd` preset;
   - multiband with motion and dropout;
   - a noise map;
   - `--gre-out` (the GRE fieldmap) and GNL ground truth;
   - `--eddy-phase`.
-- [ ] Add a Python-bindings baseline: a script that builds the extension (maturin) and hashes the arrays from
-  `simulate`, `simulate_acquisition_complex` with capture, `epi_timing`/`epi_trajectory` and
-  `apply_multiband_motion_slab`. **Needs a micromamba environment with maturin and the bindings' Python
-  deps: ask the user which one.**
-- [ ] Run against unmodified `main`. Commit `tests/fixtures/resync_baseline/checksums.txt` and the Python
-  hashes on `resync-mrsim-acq`.
+
+  No case may have `trf ≤ 0` (see the behavior difference above).
+- [ ] Python baseline: build with `maturin develop --release` in `python/`, then a script that hashes the
+  arrays from:
+  - `simulate`;
+  - `simulate_acquisition_complex` with capture, and with `slice_z`/`nz_full` and `t_echo_per_volume`;
+  - `epi_timing`/`epi_trajectory`;
+  - `apply_multiband_motion_slab`;
+  - `acquisition_from_dict` with an empty dict (which pins the default), and `Acquisition::hbcd`.
+
+  Also run `pytest` (it must pass on `main` before anything changes).
+- [ ] Run against unmodified `main`. Commit `tests/fixtures/resync_baseline/` (the CLI checksums and the
+  Python hashes) on `resync-mrsim-acq`.
 - [ ] Self-test: perturb one constant in `main`'s `kspace.rs` locally, confirm both baselines detect it, and
   revert.
 
-## Task 2: mrsim-acq — the removals (decision above)
+## Task 2: mrsim-acq — Scanner partial Fourier
 
-- [ ] Remove `SliceInput.eddy_lin`, the `eddy_trace` argument of `simulate_acquisition_oversampled`,
-  `BackgroundPhase.smooth`, `simulate_acquisition_legacy` (and its test) and `Nufft1::n`.
-- [ ] Update aslscan's call sites for the dropped `eddy_trace` argument (about 11, all passing `None`).
-- [ ] Signed zero: `poly + 0.0` becomes `poly`, which differs only when `poly` is `-0.0`. The aslscan regress
-  gate decides whether that reaches any output. If it does, keep the `+ 0.0` and say why in a comment.
-- [ ] Gates: mrsim-acq tests (both feature sets), clippy, aslscan regress, TRXScan P0 (frozen worktree).
-- [ ] Commit in each crate: `refactor: drop the snapshot-only eddy replay, smooth background phase and legacy
-  path`.
-
-## Task 3: mrsim-acq — Scanner partial Fourier
-
-- [ ] Add `PartialFourierMode::Scanner` and `pf_skipped_lines`, and add the Scanner branch to
+- [ ] Add `PartialFourierMode::Scanner` and `pf_skipped_lines`, and give Scanner its own branch in
   `sampling_mask`, ported from `main` as-is. The default stays `FiberfoxCompatible`.
 - [ ] Shift the eddy clock by the skipped lines in `LineTiming::for_acquisition`, so the 2D, GRASE, spiral
   and gradient-echo 3D paths all see it. Fix `validate_acquisition_timing`'s message, which says partial
   Fourier lines are read last; under Scanner they are read first.
-- [ ] Tests: `main`'s Scanner test (the first lines skipped, the centre reached sooner, Contiguous timing
-  unchanged). The mask and timing equal `main`'s on a set of `(ny, pf)`. Each mode is unchanged with
-  `pf = 1`. A GRASE run in Scanner mode reads the shifted clock.
-- [ ] Gates as in Task 2. Commit: `feat: scanner-style partial Fourier (late start)`.
+- [ ] Tests:
+  - `main`'s Scanner test (the first lines skipped, the centre reached sooner, Contiguous timing unchanged);
+  - the mask and timing equal `main`'s on a set of `(ny, pf)`;
+  - the Scanner mask differs from Fiberfox's at `pf < 1` (the fall-through trap);
+  - each mode is unchanged at `pf = 1`;
+  - a GRASE run in Scanner mode reads the shifted clock.
+- [ ] Gates: mrsim-acq tests (both feature sets), clippy, aslscan regress, TRXScan P0. Commit:
+  `feat: scanner-style partial Fourier (late start)`.
 
-## Task 4: mrsim-acq — EPI timing and the slice capture
+## Task 3: mrsim-acq — EPI timing and the slice capture
 
 - [ ] Add `EpiTiming`, `epi_timing` and `epi_trajectory`, consistent with `LineTiming` (the test asserts
   agreement).
@@ -151,14 +187,15 @@ module.
 - [ ] Port `main`'s tests: `capturing_kspace_changes_no_arithmetic`,
   `captured_reconstructed_kspace_inverts_to_combined`,
   `acquired_kspace_is_pre_grappa_and_mask_is_the_sampling_mask`, and the timing-trajectory agreement test.
-- [ ] Gates. Commit: `feat: EPI timing and per-slice k-space capture`.
+- [ ] Gates as in Task 2. Commit: `feat: EPI timing and per-slice k-space capture`.
 
-## Task 5: mrsim-acq — complex output and acquisition options
+## Task 4: mrsim-acq — complex output and acquisition options
 
 - [ ] Add `AcquisitionOptions`, `KspaceCapture`, `AcquisitionOutput` and `simulate_acquisition_complex`
   over mrsim-acq's general input. That input is a struct holding today's positional arguments (`T2Volume`,
-  `t_inhom`, `eddy_drive`, `prep_drive`, `noise_sigma`). `simulate_acquisition_oversampled` stays as a
-  wrapper, so aslscan does not change.
+  `t_inhom`, `eddy_drive`, `prep_drive`, `noise_sigma`, and `eddy_trace` until Task 7).
+  `simulate_acquisition_oversampled` keeps its signature as a wrapper, so aslscan and the frozen P0 tree do
+  not change.
 - [ ] Slab support (`slice_z`/`nz_full`): the global `z` feeds the shot, the phase slice, the slice seed,
   `SliceInput.nz` and the noise-map key. Without a slab it is identical.
 - [ ] `t_echo_per_volume`: clone `acq` per volume and run `validate_acquisition_timing` per volume (on `main`
@@ -170,64 +207,91 @@ module.
 
   Plus one new test: magnitude and phase from the complex output equal `simulate_acquisition_oversampled`'s
   bit for bit.
-- [ ] Gates. Commit: `feat: complex output, k-space capture and slab options on the 2D entry point`.
+- [ ] Gates as in Task 2. Commit: `feat: complex output, k-space capture and slab options on the 2D entry point`.
 
-## Task 6: mrsim-acq — slab multiband motion
+## Task 5: mrsim-acq — slab multiband motion
 
 - [ ] Add `apply_multiband_motion_slab`, written against `DropoutLaw` (the P0 change). `apply_multiband_motion`
-  delegates to it with no slab. Keep `dropout_events`/`dropout_seed` out of mrsim-acq (they hard-code
-  diffusion's `b < 50`).
+  delegates to it with no slab, and keeps its signature. Keep `dropout_events`/`dropout_seed` out of
+  mrsim-acq (they hard-code diffusion's `b < 50`).
 - [ ] Port `multiband_slab_matches_the_full_volume_where_no_jump_crosses_the_edge`.
-- [ ] Gates. Commit: `feat: multiband motion on a slab of slices`.
+- [ ] Gates as in Task 2. Commit: `feat: multiband motion on a slab of slices`.
+- [ ] Push mrsim-acq and tag it (`resync-api`) **with the user's go-ahead**, so TRXScan can pin it. Until
+  then, Task 6 builds against the local path override.
 
-## Task 7: TRXScan — re-point the moved modules (on `resync-mrsim-acq`)
+## Task 6: TRXScan — re-point the moved modules (on `resync-mrsim-acq`)
 
-- [ ] Add mrsim-acq as a path dependency with forwarded features (`kspace`, `io`, `par`), as on the old
-  branch.
-- [ ] Delete the moved modules. Re-export from `lib.rs`. Replace `Grid::hires` with
-  `mrsim_acq::io::hires_grid`, or the old branch's `GridRaster` trait.
+- [ ] Add mrsim-acq as a git dependency at the Task 5 tag, with the local `[patch]` override for the gates.
+  Forward features as `main` needs them:
+  - TRXScan's `kspace` forwards to `mrsim-acq/kspace`, and `par` to `mrsim-acq/par`.
+  - `io` forwards to `mrsim-acq/io` but never pulls it into the Python crate, which builds without `io`.
+- [ ] Delete the moved modules and re-export from `lib.rs`. Replace `Grid::hires` with a std-only path that
+  works without `io`: the old branch's `GridRaster` trait, or a TRXScan helper with `hires_grid`'s arithmetic.
 - [ ] Port the old branch's re-pointing commits (`4aa20fd..12a9d09`) by hand where `main` rewrote the files:
-  `trxscan.rs`, `compartments.rs`, `gnl.rs`, `raster.rs`, `benchmark.rs`, and the new `gre.rs` (it uses
-  `kspace::Rng`). Their content is the guide; do not cherry-pick blindly.
-- [ ] The TRXScan facade (`src/acq.rs`, or kept under the `kspace`/`motion` module names so the Python
-  bindings change least):
+  `trxscan.rs`, `compartments.rs`, `gnl.rs`, `raster.rs`, `benchmark.rs`, and the new `gre.rs`. Their
+  content is the guide; do not cherry-pick blindly.
+- [ ] The TRXScan facade (`src/acq.rs`, re-exported under the `kspace`/`motion` paths the bindings use, so
+  they change least):
+  - `default_acquisition()` (Scanner) and `hbcd_acquisition(ny)`. Replace every `Acquisition::default()` and
+    `Acquisition::hbcd` in TRXScan: the CLI, the Python bindings (`acquisition_from_dict`'s base), the
+    benchmark bins and the tests. A test asserts `default_acquisition()` equals `main`'s default field by
+    field;
   - `SimulationInput` and `simulate_acquisition` / `simulate_acquisition_complex`, translating `bvals`/`bvecs`
     to `eddy_drive`/`prep_drive`, `t2` to `T2Volume::Uniform`, and `DiffusionPhase` to `PrepPhase`;
-  - an `hbcd_acquisition(ny)` free function, plus the `Scanner` default where `main` relies on it;
-  - `dropout_events` and `dropout_seed`;
-  - Python's `acquisition_from_dict` gains `..base`, because mrsim-acq's `Acquisition` has the `echo` field.
-- [ ] Gates: TRXScan output identical to the Task 1 baseline (both feature sets), the Python hashes identical,
-  `cargo test` in TRXScan (both feature sets), clippy, and the aslscan regress run.
+  - `apply_multiband_motion` and `apply_multiband_motion_slab` with `main`'s `bvals, b_max` signatures,
+    building the diffusion `DropoutLaw`; plus `dropout_events` and `dropout_seed`;
+  - a timing pre-check in the Python entry points that raises `ValueError`;
+  - `acquisition_from_dict` keeps `..base` with `base = default_acquisition()`.
+- [ ] Gates: the TRXScan gates (Global constraints), clippy, aslscan regress and TRXScan P0, plus
+  `grep -rn "Acquisition::default()\|Acquisition::hbcd" src python/src` finding nothing.
 - [ ] Commits: one per mechanical step, as P0 did.
+
+## Task 7: mrsim-acq — remove what main dropped
+
+- [ ] Remove `SliceInput.eddy_lin`, the `eddy_trace` argument (from `simulate_acquisition_oversampled` and
+  the Task 4 input struct), `BackgroundPhase.smooth`, `simulate_acquisition_legacy` (and its test) and
+  `Nufft1::n`.
+- [ ] Update the callers: aslscan (its `simulate_acquisition_oversampled` calls pass `eddy_trace: None`) and
+  the TRXScan facade.
+- [ ] Signed zero: `poly + 0.0` becomes `poly`, which differs only when `poly` is `-0.0`. The aslscan and
+  TRXScan gates decide whether that reaches any output; `main` never had the `+ 0.0`, so TRXScan can only
+  get closer to its baseline. If aslscan moves, keep the `+ 0.0` there and say why in a comment.
+- [ ] Retire the TRXScan P0 gate: the frozen tree no longer compiles. Record that in Measurements.
+- [ ] Gates: aslscan regress and the TRXScan gates. Commits in each crate: `refactor: drop eddy replay, the
+  smooth background phase and the legacy path, as TRXScan main did`.
 
 ## Task 8: Reviews, docs and landing
 
 - [ ] READMEs: mrsim-acq gains the new capabilities (Scanner partial Fourier, capture, complex output,
-  slabs). TRXScan's README and CLAUDE.md say where the acquisition stage lives.
-- [ ] Codex adversarial review of the range in both crates, verified and fixed; then an ordinary Codex review.
+  slabs). TRXScan's README and CLAUDE.md say where the acquisition stage lives and how to build against a
+  local mrsim-acq (the `[patch]` override).
+- [ ] Codex adversarial review of the range in both crates (credits permitting; otherwise a Claude one),
+  verified and fixed; then an ordinary review.
 - [ ] Final gates on the final heads.
 - [ ] With the user's go-ahead:
-  - push mrsim-acq;
-  - push `resync-mrsim-acq` and open a PR to TRXScan `main` for Matt's review;
+  - push mrsim-acq, with a tag for the final API, and repin TRXScan to it;
+  - push `resync-mrsim-acq` and open a PR to TRXScan `main` for Matt's review; GitHub CI (`ci.yml`,
+    `python.yml`) must pass on the PR;
   - after it merges, ask whether to delete the old remote branch `p0-mrsim-acq-extraction`.
 
 ## Acceptance criteria
 
 - TRXScan `main` + this branch: every CLI case and every Python hash in the Task 1 baseline identical, under
-  both feature sets.
-- aslscan regress identical against `p7-complete`. mrsim-acq and TRXScan tests pass under both feature sets.
-  No new clippy warnings.
+  both feature sets; `pytest` and `main`'s CI steps pass, locally and on the PR.
+- aslscan regress identical against `p7-complete`. mrsim-acq tests pass under both feature sets. No new
+  clippy warnings.
 - mrsim-acq carries no TRXScan-specific code (no `b < 50`, no `hbcd`), and `main`'s new capabilities are
   available to aslscan.
+- The one deliberate difference (refusing `trf ≤ 0`) is documented in TRXScan's README and the PR.
 
 ## Risks
 
-- **TRXScan `main` keeps moving.** Rebase `resync-mrsim-acq` before Task 7's gate. Re-run Task 1 if a new
+- **TRXScan `main` keeps moving.** Rebase `resync-mrsim-acq` before Task 6's gate. Re-run Task 1 if a new
   commit touches the moved modules (check with `git diff --stat <baseline>..origin/main -- src/kspace.rs
-  src/motion.rs src/phase.rs src/nufft.rs src/io.rs`).
-- **The Python baseline** depends on an environment with maturin; without one, the bindings are checked only
-  by compiling.
-- **Signed zero** (Task 2) and the **Scanner eddy clock in 3D** (Task 3) are the two places a port could move
+  src/motion.rs src/phase.rs src/nufft.rs src/io.rs`) or the Python bindings.
+- **No TRXScan baseline check between Task 1 and Task 6.** The P0 gate covers the snapshot-era paths, and
+  the ported bit-identity tests cover the new ones. A Task 6 failure is bisected with the `pre-resync` tag.
+- **Signed zero** (Task 7) and the **Scanner eddy clock in 3D** (Task 2) are the two places a port could move
   bits quietly. The gates and the named tests cover them.
 - **Whether aslscan should adopt Scanner partial Fourier** is a behavior change for aslscan, out of scope
   here. It would be its own phase.
@@ -235,3 +299,41 @@ module.
 ## Measurements
 
 (filled in during implementation)
+
+## Claude adversarial review of this plan (2026-10-08)
+
+Run while Codex was out of credits. It found 4 majors and 6 minors, each verified against the source, and all
+were applied above.
+
+**Majors:**
+
+- **R1. The removals broke the only diffusion-shaped gate.** The plan removed `eddy_lin`, `smooth` and the
+  legacy path first, then said to re-run the P0 gate. But the frozen P0 tree (`12a9d09`) calls
+  `simulate_acquisition_legacy` and passes `eddy_trace`/`eddy_lin`, so it would not compile, and Tasks 2-5
+  would have run with no TRXScan check at all. Fixed: the additive tasks come first, under the P0 gate; the
+  removals come after the re-point (Task 7), when `main`'s baseline guards TRXScan.
+- **R2. `Acquisition::default()` would have changed TRXScan's defaults silently.** After the re-point,
+  `Acquisition` is mrsim-acq's type, whose default is Fiberfox where `main`'s is Scanner. Python's
+  `acquisition_from_dict` and the CLI start from `Acquisition::default()`, and `Default` cannot be overridden
+  on a foreign type. Fixed: `default_acquisition()` in TRXScan, every call replaced, a grep in the gate, and
+  a field-by-field test.
+- **R3. A path dependency would break TRXScan's CI, wheels and release.** `main` pins `trx-rs`/`odx-rs` as git
+  dependencies. `python.yml`/`release.yml` check out only TRXScan, and maturin-action builds in Docker. Fixed:
+  mrsim-acq (public) as a pinned git dependency, a local `[patch]` for the gates, a tagged push before the PR,
+  and CI passing on the PR.
+- **R4. The facade missed the motion API.** The bindings call `apply_multiband_motion_slab(..., &bvals,
+  b_max, ...)` with `main`'s signature, while mrsim-acq takes a `DropoutLaw`. Fixed: facade wrappers for both
+  motion functions.
+
+**Minors:**
+
+- **r1.** The squash was described as cut "at an earlier point than the snapshot". `57858a5` (the snapshot's
+  last GNL commit) has the features, so the squash left them out. Corrected.
+- **r2.** mrsim-acq's P0 timing check panics where `main` simulates (`trf ≤ 0`). It is now listed as the one
+  deliberate difference, with a Python `ValueError` and no baseline case in that regime.
+- **r3.** `main`'s `pytest` suite (`python/tests/`) and CI steps were not in the gates. Added.
+- **r4.** The P0 script's `legacy` case runs the oversampled path on `main`. Renamed and kept.
+- **r5.** mrsim-acq's `sampling_mask` falls through to the Fiberfox rule for anything not `Contiguous`. A
+  test now asserts that the Scanner mask differs.
+- **r6.** Python builds without `io`, so `mrsim_acq::io::hires_grid` is unavailable there. `Grid::hires`'s
+  replacement must be std-only.
