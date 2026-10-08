@@ -348,7 +348,8 @@ three newest `main` commits (`0b917e6`, `be68c24`, `acb7506`) touch no moved mod
 - `2304c06` (Task 2): 67 of 67.
 - `df447f6` (Tasks 3-5): 67 of 67. The snapshot read mrsim-acq as `+local`, with CRLF-only differences
   from a Windows-git checkout; see Traps.
-- aslscan `8291945` + mrsim-acq `b45a719` (Task 7): see below.
+- aslscan `8291945` + mrsim-acq `b45a719` (Task 7): 67 of 67.
+- Final, aslscan `8291945` + mrsim-acq `68785c4` (after the review's fixes): 67 of 67.
 
 **Task 8: the Claude adversarial review of the implementation (2026-10-08; Codex out of credits).**
 - Eight findings, each verified against the source. Fixed in mrsim-acq `f796d43` and TRXScan `de8cf2c`,
