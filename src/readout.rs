@@ -98,11 +98,70 @@ pub struct EchoTrain {
 /// spacing `t_line_ms`; `reverse_phase` as [`SingleShotEpi`]'s (false: the block starts at its
 /// highest `ky` and descends). Spiral: one spiral-out interleaf of `interleaves` per echo, starting
 /// at the spin echo, `readout_ms` long, sampled every `dwell_ms`, its turns `radial_oversampling`
-/// times denser than the Nyquist spacing ([`spiral_trajectory`]).
+/// times denser than the Nyquist spacing ([`spiral_trajectory`]), the partitions it reads chosen by
+/// `kz` ([`KzSampling`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Readout3d {
     Grase { ky_segments: usize, t_line_ms: f64, reverse_phase: bool },
-    Spiral { interleaves: usize, readout_ms: f64, dwell_ms: f64, radial_oversampling: f64 },
+    Spiral { interleaves: usize, readout_ms: f64, dwell_ms: f64, radial_oversampling: f64, kz: KzSampling },
+}
+
+/// Which kz partitions a stack of spirals reads (P8): partial Fourier along kz, and regular
+/// undersampling by `accel` (Vidorreta et al. 2017: from `kz = 0` outward in steps of `accel`).
+///
+/// With `kz = p - nz/2` the centred index of partition `p`:
+/// - partial Fourier keeps the `round(partial_fourier nz)` highest partitions, a contiguous band
+///   holding the centre and all of the positive side (`kz >= nz/2 - round(partial_fourier nz)`);
+/// - acceleration keeps, of those, the partitions with `kz` a multiple of `accel`.
+///
+/// The partitions partial Fourier leaves out are zero-filled; the ones acceleration leaves out
+/// inside the band are synthesized from a calibration acquisition (`kspace3d::KzAcceleration`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KzSampling {
+    /// In `(0.5, 1]`; 1 is every partition.
+    pub partial_fourier: f64,
+    /// At least 1; 1 is no acceleration.
+    pub accel: usize,
+}
+
+impl KzSampling {
+    /// Every partition.
+    pub const FULL: KzSampling = KzSampling { partial_fourier: 1.0, accel: 1 };
+
+    pub fn is_full(&self) -> bool {
+        self.partial_fourier >= 1.0 && self.accel <= 1
+    }
+
+    /// The first partition of the partial-Fourier band `lo..nz`.
+    pub fn band_start(&self, nz: usize) -> Result<usize, String> {
+        if !(self.partial_fourier.is_finite() && self.partial_fourier > 0.5 && self.partial_fourier <= 1.0) {
+            return Err(format!("partial Fourier along kz must be in (0.5, 1], got {}", self.partial_fourier));
+        }
+        if self.accel == 0 {
+            return Err("the kz acceleration must be at least 1".to_string());
+        }
+        // a fraction above one half always keeps the centre partition nz/2: round(f nz) >= nz - nz/2
+        let kept = ((nz as f64 * self.partial_fourier).round() as usize).min(nz);
+        debug_assert!(nz - kept <= nz / 2, "the band {}..{nz} leaves out the kz centre", nz - kept);
+        Ok(nz - kept)
+    }
+
+    /// Per partition, whether the train reads it.
+    pub fn acquired(&self, nz: usize) -> Result<Vec<bool>, String> {
+        let lo = self.band_start(nz)?;
+        let c = (nz / 2) as i64;
+        Ok((0..nz).map(|p| p >= lo && (p as i64 - c).rem_euclid(self.accel as i64) == 0).collect())
+    }
+
+    /// How many partitions the train reads.
+    pub fn n_acquired(&self, nz: usize) -> Result<usize, String> {
+        Ok(self.acquired(nz)?.iter().filter(|&&a| a).count())
+    }
+
+    /// The same band without the acceleration: what the calibration train reads.
+    pub fn calibration(&self) -> KzSampling {
+        KzSampling { partial_fourier: self.partial_fourier, accel: 1 }
+    }
 }
 
 /// Partitions in the order the train reads them: `kz_order(nz, order)[n]` is the `n`-th read.
@@ -563,7 +622,12 @@ pub fn spiral_trajectory(nx: usize, ny: usize, interleaves: usize, readout_ms: f
 pub struct Spiral3dTable {
     pub nz: usize,
     pub traj: SpiralTrajectory,
-    /// Per partition: the echo (1-based) that reads it and its kz segment.
+    /// Per partition, whether the train reads it ([`KzSampling`]).
+    pub acquired: Vec<bool>,
+    /// The first partition of the partial-Fourier band.
+    pub band_start: usize,
+    /// Per partition: the echo (1-based) that reads it and its kz segment (both 0 where the
+    /// partition is not read).
     pub echo: Vec<usize>,
     pub kz_segment: Vec<usize>,
     pub kz_segments: usize,
@@ -587,25 +651,50 @@ impl Spiral3dTable {
 
 /// The table of a [`Readout3d::Spiral`] train.
 pub fn spiral_lines(train: &EchoTrain, readout: &Readout3d, nx: usize, ny: usize, nz: usize) -> Result<Spiral3dTable, String> {
-    let Readout3d::Spiral { interleaves, readout_ms, dwell_ms, radial_oversampling } = *readout else {
+    let Readout3d::Spiral { interleaves, readout_ms, dwell_ms, radial_oversampling, kz } = *readout else {
         return Err("a GRASE readout has no spiral table (grase_lines)".to_string());
     };
     let traj = spiral_trajectory(nx, ny, interleaves, readout_ms, dwell_ms, radial_oversampling)?;
-    if train.kz_segments == 0 || !nz.is_multiple_of(train.kz_segments) {
-        return Err(format!("{nz} partitions do not divide into {} kz segments", train.kz_segments));
+    let order = spiral_kz_order(train, &kz, nz)?;
+    if train.etl != order.len() / train.kz_segments {
+        return Err(if kz.is_full() {
+            format!("echo train length {} is not {nz} partitions / {} kz segments", train.etl, train.kz_segments)
+        } else {
+            format!("echo train length {} is not the {} partitions read (of {nz}) / {} kz segments", train.etl, order.len(),
+                    train.kz_segments)
+        });
     }
-    if train.etl != nz / train.kz_segments {
-        return Err(format!("echo train length {} is not {nz} partitions / {} kz segments", train.etl, train.kz_segments));
-    }
-    let order = kz_order(nz, train.kz_order);
     let (mut echo, mut kz_segment) = (vec![0; nz], vec![0; nz]);
     for (n, &p) in order.iter().enumerate() {
         echo[p] = n / train.kz_segments + 1;
         kz_segment[p] = n % train.kz_segments;
     }
-    let e_c = centre_echo(train, nz)?;
-    Ok(Spiral3dTable { nz, traj, echo, kz_segment, kz_segments: train.kz_segments, esp_ms: train.esp_ms, e_c,
-                       n_shots: interleaves * train.kz_segments })
+    let e_c = echo[nz / 2];
+    Ok(Spiral3dTable { nz, traj, acquired: kz.acquired(nz)?, band_start: kz.band_start(nz)?, echo, kz_segment,
+                       kz_segments: train.kz_segments, esp_ms: train.esp_ms, e_c, n_shots: interleaves * train.kz_segments })
+}
+
+/// The partitions a spiral train reads, in the order it reads them: [`kz_order`] restricted to the
+/// partitions `kz` acquires, which must divide into the train's kz segments.
+pub fn spiral_kz_order(train: &EchoTrain, kz: &KzSampling, nz: usize) -> Result<Vec<usize>, String> {
+    let acquired = kz.acquired(nz)?;
+    let order: Vec<usize> = kz_order(nz, train.kz_order).into_iter().filter(|&p| acquired[p]).collect();
+    if train.kz_segments == 0 || !order.len().is_multiple_of(train.kz_segments) {
+        return Err(if kz.is_full() {
+            format!("{nz} partitions do not divide into {} kz segments", train.kz_segments)
+        } else {
+            format!("the {} partitions read (of {nz}: partial Fourier {} and acceleration {} along kz) do not divide into \
+                     {} kz segments", order.len(), kz.partial_fourier, kz.accel, train.kz_segments)
+        });
+    }
+    Ok(order)
+}
+
+/// The echo (1-based) of a spiral train that reads the kz centre.
+pub fn spiral_centre_echo(train: &EchoTrain, kz: &KzSampling, nz: usize) -> Result<usize, String> {
+    let order = spiral_kz_order(train, kz, nz)?;
+    let n = order.iter().position(|&p| p == nz / 2).expect("the kz centre is always read");
+    Ok(n / train.kz_segments + 1)
 }
 
 /// `ESP` from BIDS's `EchoTime` for a spiral: the kz-centre echo's spiral starts at its echo, so
@@ -841,7 +930,7 @@ mod tests {
     fn spiral_asl001_numbers() {
         // asl001 with the committed overlay: 64 x 64 x 20, 8 interleaves, T = 4 ms, dwell 4 us,
         // TE 10.528 ms, excitation at LD + PLD = 3.475 s, TR 4.886 s, refocusing time 2 ms
-        let ro = Readout3d::Spiral { interleaves: 8, readout_ms: 4.0, dwell_ms: 0.004, radial_oversampling: 1.2 };
+        let ro = Readout3d::Spiral { interleaves: 8, readout_ms: 4.0, dwell_ms: 0.004, radial_oversampling: 1.2, kz: KzSampling::FULL };
         let train = EchoTrain { etl: 20, esp_ms: 0.0, refocusing_deg: 111.0, kz_order: KzOrder::Centric, kz_segments: 1,
                                 refocusing_time_ms: 2.0 };
         let tab = spiral_lines(&train, &ro, 64, 64, 20).unwrap();
@@ -866,7 +955,7 @@ mod tests {
         assert_eq!(tab.shot(3, 5), 5);
         assert!((tab.trf_ms(10, 0) - (10.528 + 0.002)).abs() < 1e-12);
         // Codex's example: an 8 ms spiral at this ESP would run through the next pulse
-        let ro8 = Readout3d::Spiral { interleaves: 4, readout_ms: 8.0, dwell_ms: 0.004, radial_oversampling: 1.2 };
+        let ro8 = Readout3d::Spiral { interleaves: 4, readout_ms: 8.0, dwell_ms: 0.004, radial_oversampling: 1.2, kz: KzSampling::FULL };
         let tab8 = spiral_lines(&train, &ro8, 64, 64, 20).unwrap();
         assert!(check_spiral_timing(&train, &tab8, 3475.0, 4886.0).unwrap_err().contains("next refocusing pulse"));
         // two kz segments: shots interleave x segment; past the repetition is refused
@@ -881,6 +970,45 @@ mod tests {
     }
 
     // ---- P7 part C: the 3D gradient-echo train
+
+    #[test]
+    fn kz_sampling_patterns() {
+        // the protocol of Vidorreta et al. (2017), two-shot: 36 partitions, 6/8, R = 2
+        let kz = KzSampling { partial_fourier: 0.75, accel: 2 };
+        assert_eq!(kz.band_start(36).unwrap(), 9);
+        let acq = kz.acquired(36).unwrap();
+        let read: Vec<i64> = (0..36).filter(|&p| acq[p]).map(|p| p as i64 - 18).collect();
+        assert_eq!(read, (-4..=8).map(|m| 2 * m).collect::<Vec<i64>>());
+        assert_eq!(kz.n_acquired(36).unwrap(), 13);
+        assert_eq!(kz.calibration().n_acquired(36).unwrap(), 27);
+        // centric: the centre, then outward in steps of two until the low side runs out
+        let tr = EchoTrain { etl: 13, ..train(36, 1, KzOrder::Centric, 10.0) };
+        let order: Vec<i64> = spiral_kz_order(&tr, &kz, 36).unwrap().into_iter().map(|p| p as i64 - 18).collect();
+        assert_eq!(order, [0, 2, -2, 4, -4, 6, -6, 8, -8, 10, 12, 14, 16]);
+        assert_eq!(spiral_centre_echo(&tr, &kz, 36).unwrap(), 1);
+        let ro = Readout3d::Spiral { interleaves: 2, readout_ms: 4.0, dwell_ms: 0.001, radial_oversampling: 1.2, kz };
+        let t = spiral_lines(&tr, &ro, 64, 64, 36).unwrap();
+        assert_eq!((t.e_c, t.n_shots, t.band_start), (1, 2, 9));
+        assert_eq!((t.echo[18], t.echo[20], t.echo[16], t.echo[34], t.echo[19], t.echo[0]), (1, 2, 3, 13, 0, 0));
+        // linear: the centre is read after the band's low side only
+        let lin = EchoTrain { etl: 13, ..train(36, 1, KzOrder::Linear, 10.0) };
+        assert_eq!(spiral_centre_echo(&lin, &kz, 36).unwrap(), 5);
+        // the full pattern is the old table
+        assert!(KzSampling::FULL.acquired(7).unwrap().iter().all(|&a| a));
+        assert_eq!(spiral_centre_echo(&train(36, 2, KzOrder::Centric, 10.0), &KzSampling::FULL, 36).unwrap(),
+                   centre_echo(&train(36, 2, KzOrder::Centric, 10.0), 36).unwrap());
+        // 5/8 of 36 rounds to 23
+        assert_eq!(KzSampling { partial_fourier: 0.625, accel: 1 }.n_acquired(36).unwrap(), 23);
+        // refusals
+        assert!(KzSampling { partial_fourier: 0.5, accel: 1 }.band_start(36).unwrap_err().contains("(0.5, 1]"));
+        assert!(KzSampling { partial_fourier: 1.0, accel: 0 }.band_start(36).unwrap_err().contains("at least 1"));
+        // the smallest band still holds the centre: 0.51 of 4 keeps kz = 0, 1
+        assert_eq!(KzSampling { partial_fourier: 0.51, accel: 1 }.band_start(4).unwrap(), 2);
+        assert_eq!(KzSampling { partial_fourier: 0.51, accel: 1 }.band_start(5).unwrap(), 2);
+        let two = EchoTrain { etl: 6, ..train(36, 2, KzOrder::Centric, 10.0) };
+        assert!(spiral_kz_order(&two, &kz, 36).unwrap_err().contains("13 partitions read"));
+        assert!(spiral_lines(&EchoTrain { etl: 36, ..tr.clone() }, &ro, 64, 64, 36).unwrap_err().contains("13 partitions read"));
+    }
 
     fn ge_train(kz_segments: usize, order: KzOrder, tes: Vec<f64>) -> ExcitationTrain {
         ExcitationTrain { kz_segments, kz_order: order, exc_spacing_ms: 40.0, echo_times_ms: tes, excitation_time_ms: 2.0 }

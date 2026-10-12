@@ -43,7 +43,9 @@ reconstructing an image from it. The following effects are included:
 - **3D readouts:** segmented **GRASE** echo trains, with echo amplitudes from an extended-phase-
   graph model of the refocusing pulses, and **stack-of-spirals**. The spirals are reconstructed by
   gridding and iterative least squares, with a certified error bound on the off-resonance time
-  segmentation; spirals need the `kspace` feature.
+  segmentation; spirals need the `kspace` feature. A stack of spirals can be undersampled along kz:
+  partial Fourier (zero-filled) and regular acceleration, resolved by coils arranged in rings along z
+  and a GRAPPA-like kernel fitted to a calibration acquisition.
   A segmented acquisition can give each shot its own weight and pose.
 - **3D gradient-echo EPI** (a stack of EPI): a train of excitations, each followed by an EPI readout
   of one partition's k-space plane (or one segment of it). The caller supplies a weight for every
@@ -95,6 +97,7 @@ There are five entry points, each simulating a whole series of volumes in one ca
 | `kspace::simulate_acquisition_complex` | 2D EPI, one echo, complex output, with options (below) |
 | `kspace::simulate_acquisition_echoes` | 2D EPI, several echo times per excitation |
 | `kspace3d::simulate_acquisition_3d` | 3D GRASE or stack-of-spirals, optionally segmented into shots |
+| `kspace3d::simulate_acquisition_3d_kz` | The same, with the coil rings and calibration a stack of spirals undersampled along kz needs |
 | `kspace3d::simulate_acquisition_3d_ge` | 3D gradient-echo EPI train, one or more echo times per excitation |
 
 The 2D entry point's inputs are:
