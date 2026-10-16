@@ -191,7 +191,7 @@ pub struct Acquisition {
     pub window: KspaceWindow, // reconstruction apodization; None = unapodized rectangular
     pub n_coils: usize,       // receiver coils (1 = uniform single coil); ring-arranged sensitivities
     pub accel: usize,         // GRAPPA acceleration R (1 = fully sampled); undersamples PE lines
-    pub acs_lines: usize,     // GRAPPA autocalibration lines (fully-sampled central PE band)
+    pub acs_lines: usize,     // GRAPPA reference lines: the central PE band of the reference scan the kernel is fitted to
     pub seed: u64,            // mixed into every derived per-slice seed; 0 reproduces legacy output
     pub echo: EchoFormation,  // how the echo forms: spin echo (default) or gradient echo
 }
@@ -546,7 +546,6 @@ pub fn step_hires(snx: usize, sny: usize, edge: f64) -> Vec<f32> {
 pub fn sampling_mask(nx: usize, ny: usize, acq: &Acquisition) -> Vec<bool> {
     let ys = ny / 2;
     let accel = acq.accel.max(1);
-    let acs_half = (acq.acs_lines / 2) as i64;
     let mut m = vec![false; nx * ny];
     // Scanner mode: exactly round(ny*pf) consecutive lines; the FIRST lines of the train are
     // skipped. The forward train starts at high ky, so the skipped block is the high-ky end;
@@ -575,9 +574,9 @@ pub fn sampling_mask(nx: usize, ny: usize, acq: &Acquisition) -> Vec<bool> {
                 continue;
             }
         }
-        let acquired = accel <= 1
-            || (kyi as i64 - ys as i64).abs() <= acs_half
-            || kyi % accel == ys % accel;
+        // GRAPPA: every R-th line, aligned on the centre; the reference lines the kernel is fitted
+        // to are a separate scan's (`GrappaCalibration`), not part of the volume
+        let acquired = accel <= 1 || kyi % accel == ys % accel;
         if !acquired {
             continue;
         }
@@ -1237,22 +1236,55 @@ pub fn simulate_slice(inp: &SliceInput, acq: &Acquisition) -> Vec<(f32, f32)> {
 
 /// [`simulate_slice`] with the intermediates selected by `cap` retained. The combined image is
 /// identical to `simulate_slice`'s before its `f32` cast; capturing changes no arithmetic.
+///
+/// Under GRAPPA a lone slice is its own series: its kernel is fitted on a reference scan of the
+/// same object ([`grappa_reference_kernel`], on the slice seed's calibration stream); the series
+/// entries fit one per slice on the series' reference scan ([`GrappaCalibration`]).
 pub fn simulate_slice_full(inp: &SliceInput, acq: &Acquisition, cap: SliceCapture) -> SliceRecon {
-    // Build each coil's k-space (undersampled for GRAPPA when accel>1), reconstruct, then combine.
+    simulate_slice_with(inp, acq, cap, None)
+}
+
+/// One slice's coil k-spaces as acquired (spikes and noise included, before GRAPPA).
+fn build_coil_kspaces(inp: &SliceInput, acq: &Acquisition) -> Vec<Vec<C>> {
     let ncoils = acq.n_coils.max(1);
-    let mut coil_kspace: Vec<Vec<C>> = Vec::with_capacity(ncoils);
-    for coil in 0..ncoils {
-        coil_kspace.push(build_coil_kspace(inp, acq, coil, ncoils));
-    }
-    reconstruct_coils_full(coil_kspace, acq, inp.acq_matrix, cap)
+    (0..ncoils).map(|coil| build_coil_kspace(inp, acq, coil, ncoils)).collect()
+}
+
+/// The GRAPPA kernel of one slice, fitted on its reference scan: `inp`'s object read by `acq`'s
+/// readout without the acceleration, without spikes and without `inp`'s eddy and preparation
+/// drives, its noise on the stream `inp.slice_seed` names (the caller salts it).
+pub(crate) fn grappa_reference_kernel(inp: &SliceInput, acq: &Acquisition) -> GrappaKernel {
+    let reference = SliceInput { eddy_drive: None, prep_drive: None, ..*inp };
+    let coils = build_coil_kspaces(&reference, &Acquisition { accel: 1, n_spikes: 0, ..acq.clone() });
+    let [nx, ny] = inp.acq_matrix;
+    GrappaKernel::fit(&coils, nx, ny, acq.accel, acq.acs_lines)
+}
+
+/// [`simulate_slice_full`] with the GRAPPA kernel given (`None`: fitted on a reference scan of
+/// the slice itself, its noise on the slice seed salted by [`SEED_SALT_GRAPPA_CAL`]).
+fn simulate_slice_with(inp: &SliceInput, acq: &Acquisition, cap: SliceCapture, kernel: Option<&GrappaKernel>)
+    -> SliceRecon
+{
+    let own;
+    let kernel = match kernel {
+        None if acq.accel > 1 => {
+            own = grappa_reference_kernel(&SliceInput { slice_seed: inp.slice_seed ^ SEED_SALT_GRAPPA_CAL, ..*inp }, acq);
+            Some(&own)
+        }
+        k => k,
+    };
+    // Build each coil's k-space (undersampled for GRAPPA when accel>1), reconstruct, then combine.
+    reconstruct_coils_full(build_coil_kspaces(inp, acq), acq, inp.acq_matrix, cap, kernel)
 }
 
 /// One slice's (or partition's) reconstruction from its coils' acquired k-spaces: GRAPPA, the
 /// window, the inverse transform and the Roemer combine, returning the combined complex image
 /// on the acquired matrix in `f64`. [`simulate_slice`]'s reconstruction, moved here unchanged so
-/// the 3D path (`kspace3d`) reconstructs each partition by the same code.
-pub(crate) fn reconstruct_coils(coil_kspace: Vec<Vec<C>>, acq: &Acquisition, acq_matrix: [usize; 2]) -> Vec<C> {
-    reconstruct_coils_full(coil_kspace, acq, acq_matrix, SliceCapture::default())
+/// the 3D path (`kspace3d`) reconstructs each partition by the same code. `kernel` is the slice's
+/// GRAPPA kernel, required under acceleration and not read otherwise.
+pub(crate) fn reconstruct_coils(coil_kspace: Vec<Vec<C>>, acq: &Acquisition, acq_matrix: [usize; 2],
+                                kernel: Option<&GrappaKernel>) -> Vec<C> {
+    reconstruct_coils_full(coil_kspace, acq, acq_matrix, SliceCapture::default(), kernel)
         .combined
         .into_iter()
         .map(|c| C { re: c[0], im: c[1] })
@@ -1260,8 +1292,8 @@ pub(crate) fn reconstruct_coils(coil_kspace: Vec<Vec<C>>, acq: &Acquisition, acq
 }
 
 /// [`reconstruct_coils`] with the intermediates selected by `cap` retained.
-fn reconstruct_coils_full(mut coil_kspace: Vec<Vec<C>>, acq: &Acquisition, acq_matrix: [usize; 2], cap: SliceCapture)
-    -> SliceRecon
+fn reconstruct_coils_full(mut coil_kspace: Vec<Vec<C>>, acq: &Acquisition, acq_matrix: [usize; 2], cap: SliceCapture,
+                          kernel: Option<&GrappaKernel>) -> SliceRecon
 {
     let [nx, ny] = acq_matrix;
     let (xs, ys) = (nx / 2, ny / 2);
@@ -1272,9 +1304,11 @@ fn reconstruct_coils_full(mut coil_kspace: Vec<Vec<C>>, acq: &Acquisition, acq_m
     assert_eq!(coil_kspace.len(), ncoils, "one k-space per coil");
     let acquired = cap.acquired.then(|| coil_kspace.iter().map(|k| pairs(k)).collect());
 
-    // GRAPPA: fill the un-acquired PE lines with a kernel calibrated on the ACS band across coils.
+    // GRAPPA: fill the un-acquired PE lines with the kernel fitted on the reference scan
     if accel > 1 {
-        grappa_reconstruct(&mut coil_kspace, nx, ny, ys, accel, acq.acs_lines);
+        let k = kernel.expect("an accelerated slice needs its GRAPPA kernel (fitted on a reference scan)");
+        assert_eq!(k.accel, accel, "the GRAPPA kernel was fitted for another acceleration");
+        k.apply(&mut coil_kspace, nx, ny);
     }
 
     // Reconstruction window: after GRAPPA, before the inverse transform, so it acts on
@@ -1450,83 +1484,153 @@ pub(crate) fn solve_hermitian(mut h: Vec<Vec<C>>, mut b: Vec<C>) -> Vec<C> {
     x
 }
 
-/// GRAPPA: fill un-acquired PE lines in-place. Calibrates a kernel (2 PE source lines spaced `R`,
-/// × 3 readout points, × all coils) on the fully-sampled central ACS band, then applies it to
-/// synthesize each missing line per coil. The g-factor noise amplification emerges automatically
-/// from reconstructing undersampled noisy multi-coil data.
-fn grappa_reconstruct(coil: &mut [Vec<C>], nx: usize, ny: usize, ys: usize, accel: usize, acs_lines: usize) {
+/// An in-plane GRAPPA kernel: per offset `d` in `1..R`, the weights that synthesize a missing PE
+/// line `d` above an acquired one from 2 PE source lines spaced `R` × 3 readout points × all coils,
+/// one weight set per output coil. Fitted on the central `acs_lines` of a fully-sampled reference
+/// scan of one slice ([`GrappaKernel::fit`]) and applied to the undersampled k-spaces of that
+/// slice ([`GrappaKernel::apply`]). The g-factor noise amplification emerges automatically from
+/// reconstructing undersampled noisy multi-coil data.
+///
+/// As on a scanner's EPI, the reference lines are not part of the imaging volumes: a volume reads
+/// every `R`-th line, and every other line is synthesized, the centre of k-space included. (With
+/// the reference band kept in every volume, its lines carry the unamplified noise and the
+/// synthesized ones the amplified noise, which makes the noise high-pass along phase encode: a
+/// lag-1 correlation of about -0.4 on the aslprep-zoo protocols.) A series fits each slice's kernel
+/// once ([`GrappaCalibration`]) and applies it to every volume, so the reconstruction is one linear
+/// map for the whole series.
+#[derive(Clone)]
+pub(crate) struct GrappaKernel {
+    accel: usize,
+    /// `weights[d - 1][output coil][feature]`.
+    weights: Vec<Vec<Vec<C>>>,
+}
+
+/// The readout offsets of a GRAPPA source point.
+const GRAPPA_DKX: [i64; 3] = [-1, 0, 1];
+
+/// The Tikhonov regularization of the GRAPPA fit, relative to the mean diagonal of `AᴴA`. Relative
+/// so the kernel does not depend on the signal scale; large enough that the reference scan's noise
+/// does not regularize the fit instead. (An absolute `1e-4`, as before, is nothing against `AᴴA`
+/// at a realistic signal scale: the fit was then regularized by the noise alone, the g-factor fell
+/// as the noise rose, and the temporal SD grew like `V^0.3` rather than `V^0.5`.)
+pub const GRAPPA_LAMBDA: f64 = 1e-3;
+
+/// The kernel's source features at readout index `kx`: the PE lines `s0` and `s1`, the readout
+/// points `kx + GRAPPA_DKX` (wrapped), every coil; layout `(line * 3 + point) * nc + coil`.
+fn grappa_feature(coil: &[Vec<C>], nx: usize, s0: usize, s1: usize, kx: usize) -> Vec<C> {
     let nc = coil.len();
-    if nc == 0 || accel <= 1 {
-        return;
+    let mut f = vec![C::ZERO; 2 * GRAPPA_DKX.len() * nc];
+    for (li, &sl) in [s0, s1].iter().enumerate() {
+        for (ki, &dk) in GRAPPA_DKX.iter().enumerate() {
+            let kxs = (kx as i64 + dk).rem_euclid(nx as i64) as usize;
+            for (ci, c) in coil.iter().enumerate() {
+                f[(li * GRAPPA_DKX.len() + ki) * nc + ci] = c[kxs + nx * sl];
+            }
+        }
     }
-    let at = |x: usize, y: usize| x + nx * y;
-    let dkx: [i64; 3] = [-1, 0, 1];
-    let nfeat = 2 * dkx.len() * nc;
-    let sidx = |line: usize, ki: usize, ci: usize| (line * dkx.len() + ki) * nc + ci;
-    let acs_half = (acs_lines / 2) as i64;
-    let (acs_lo, acs_hi) = ((ys as i64 - acs_half).max(0) as usize, ((ys as i64 + acs_half) as usize).min(ny - 1));
+    f
+}
 
-    let feature = |coil: &[Vec<C>], s0: usize, s1: usize, kx: usize| -> Vec<C> {
-        let mut f = vec![C::ZERO; nfeat];
-        for (li, &sl) in [s0, s1].iter().enumerate() {
-            for (ki, &dk) in dkx.iter().enumerate() {
-                let kxs = (kx as i64 + dk).rem_euclid(nx as i64) as usize;
-                for ci in 0..nc {
-                    f[sidx(li, ki, ci)] = coil[ci][at(kxs, sl)];
+impl GrappaKernel {
+    /// Fit the kernel of acceleration `accel` on the reference band (`acs_lines` about `ny/2`) of
+    /// one slice's fully-sampled coil k-spaces (`kx + nx*ky`), by least squares regularized by
+    /// [`GRAPPA_LAMBDA`].
+    pub(crate) fn fit(coil: &[Vec<C>], nx: usize, ny: usize, accel: usize, acs_lines: usize) -> GrappaKernel {
+        let nc = coil.len();
+        let ys = ny / 2;
+        let nfeat = 2 * GRAPPA_DKX.len() * nc;
+        let acs_half = (acs_lines / 2) as i64;
+        let (acs_lo, acs_hi) = ((ys as i64 - acs_half).max(0) as usize, ((ys as i64 + acs_half) as usize).min(ny - 1));
+        let mut weights = Vec::with_capacity(accel.saturating_sub(1));
+        for d in 1..accel {
+            // calibrate: accumulate AᴴA (shared) and Aᴴb (per output coil) over the reference band
+            let mut aha = vec![vec![C::ZERO; nfeat]; nfeat];
+            let mut ahb = vec![vec![C::ZERO; nfeat]; nc];
+            for b in acs_lo..acs_hi {
+                let (s0, s1, tgt_ky) = (b, b + accel, b + d);
+                if s1 > acs_hi || tgt_ky > acs_hi {
+                    continue;
                 }
-            }
-        }
-        f
-    };
-
-    for d in 1..accel {
-        // calibrate: accumulate AᴴA (shared) and Aᴴb (per output coil) over ACS positions
-        let mut aha = vec![vec![C::ZERO; nfeat]; nfeat];
-        let mut ahb = vec![vec![C::ZERO; nfeat]; nc];
-        for b in acs_lo..acs_hi {
-            let (s0, s1, tgt_ky) = (b, b + accel, b + d);
-            if s1 > acs_hi || tgt_ky > acs_hi {
-                continue;
-            }
-            for kx in 0..nx {
-                let f = feature(coil, s0, s1, kx);
-                for i in 0..nfeat {
-                    let fic = C { re: f[i].re, im: -f[i].im }; // conj
-                    for j in 0..nfeat {
-                        aha[i][j] = aha[i][j].add(fic.mul(f[j]));
-                    }
-                    for co in 0..nc {
-                        ahb[co][i] = ahb[co][i].add(fic.mul(coil[co][at(kx, tgt_ky)]));
-                    }
-                }
-            }
-        }
-        for (i, row) in aha.iter_mut().enumerate() {
-            row[i] = row[i].add(C { re: 1e-4, im: 0.0 }); // Tikhonov
-        }
-        let weights: Vec<Vec<C>> = (0..nc).map(|co| solve_hermitian(aha.clone(), ahb[co].clone())).collect();
-
-        // synthesize every missing line at this offset (outside the ACS)
-        for ky in 0..ny {
-            if (ky as i64 - ys as i64).rem_euclid(accel as i64) != d as i64 {
-                continue;
-            }
-            if (ky as i64 - ys as i64).abs() <= acs_half || ky < d || ky + accel - d >= ny {
-                continue;
-            }
-            let (s0, s1) = (ky - d, ky - d + accel);
-            for kx in 0..nx {
-                let f = feature(coil, s0, s1, kx);
-                for co in 0..nc {
-                    let mut v = C::ZERO;
+                for kx in 0..nx {
+                    let f = grappa_feature(coil, nx, s0, s1, kx);
                     for i in 0..nfeat {
-                        v = v.add(weights[co][i].mul(f[i]));
+                        let fic = C { re: f[i].re, im: -f[i].im }; // conj
+                        for j in 0..nfeat {
+                            aha[i][j] = aha[i][j].add(fic.mul(f[j]));
+                        }
+                        for co in 0..nc {
+                            ahb[co][i] = ahb[co][i].add(fic.mul(coil[co][kx + nx * tgt_ky]));
+                        }
                     }
-                    coil[co][at(kx, ky)] = v;
+                }
+            }
+            let mean_diag = (0..nfeat).map(|i| aha[i][i].re).sum::<f64>() / nfeat as f64;
+            assert!(mean_diag > 0.0, "the GRAPPA reference scan holds no signal: the kernel cannot be fitted");
+            for (i, row) in aha.iter_mut().enumerate() {
+                row[i].re += GRAPPA_LAMBDA * mean_diag; // Tikhonov
+            }
+            weights.push((0..nc).map(|co| solve_hermitian(aha.clone(), ahb[co].clone())).collect());
+        }
+        GrappaKernel { accel, weights }
+    }
+
+    /// Synthesize every missing PE line of one slice's undersampled coil k-spaces in place (the
+    /// lines within `d` of the first or `R - d` of the last, whose sources fall off the matrix,
+    /// stay zero). The sources are acquired lines only, so the offsets can be filled in any order.
+    pub(crate) fn apply(&self, coil: &mut [Vec<C>], nx: usize, ny: usize) {
+        let ys = ny / 2;
+        let (accel, nc) = (self.accel, coil.len());
+        for (di, weights) in self.weights.iter().enumerate() {
+            let d = di + 1;
+            assert_eq!(weights.len(), nc, "the GRAPPA kernel was fitted for {} coils, not {nc}", weights.len());
+            for ky in 0..ny {
+                if (ky as i64 - ys as i64).rem_euclid(accel as i64) != d as i64 || ky < d || ky + accel - d >= ny {
+                    continue;
+                }
+                let (s0, s1) = (ky - d, ky - d + accel);
+                for kx in 0..nx {
+                    let f = grappa_feature(coil, nx, s0, s1, kx);
+                    for co in 0..nc {
+                        let mut v = C::ZERO;
+                        for (w, fi) in weights[co].iter().zip(&f) {
+                            v = v.add(w.mul(*fi));
+                        }
+                        coil[co][kx + nx * ky] = v;
+                    }
                 }
             }
         }
     }
+}
+
+/// The reference scan an accelerated series' in-plane GRAPPA kernels are fitted to, once per
+/// series (one kernel per slice, applied to every volume). `images` is the object it sees: per
+/// compartment ONE volume in the layout of the series' images at one volume (simulation grid,
+/// `x + snx*(y + sny*z)`, the call's local slices). It is read by the series' own readout without
+/// the acceleration (every PE line; partial Fourier as the series has it), without the per-volume
+/// drives (no eddy, no preparation phase, no physiology or shot weights), without spikes, and
+/// with thermal noise on its own streams: those of `seed` salted by [`SEED_SALT_GRAPPA_CAL`]. The
+/// kernel is fitted on its central `acs_lines`.
+///
+/// `None` in the options means the series' first volume's images and the series' seed.
+#[derive(Debug, Clone, Copy)]
+pub struct GrappaCalibration<'a> {
+    pub images: &'a [Vec<f32>],
+    pub seed: u64,
+}
+
+/// The salt of a GRAPPA reference scan's noise streams ("GRPCAL").
+pub const SEED_SALT_GRAPPA_CAL: u64 = 0x4752_5043_414C;
+
+/// The seed of slice `z`'s reference-scan noise ([`GrappaCalibration`]).
+pub(crate) fn grappa_cal_slice_seed(z: usize, seed: u64) -> u64 {
+    (z as u64).wrapping_mul(0x9E37) ^ seed ^ SEED_SALT_GRAPPA_CAL
+}
+
+/// One volume of `images` (per compartment, layout `vox * n_volumes + g`) as per-compartment
+/// single volumes: what a default [`GrappaCalibration`] reads.
+pub(crate) fn volume_images(images: &[Vec<f32>], n_volumes: usize, g: usize) -> Vec<Vec<f32>> {
+    images.iter().map(|im| im.iter().skip(g).step_by(n_volumes).copied().collect()).collect()
 }
 
 /// Run the k-space acquisition over a whole 4D clean-signal volume: every (volume, slice) through
@@ -1625,6 +1729,10 @@ pub struct AcquisitionOptions<'a> {
     /// Called after each volume completes with `(done, total)`. Volumes run in parallel under
     /// `par`, so it must be `Sync`; completion order is not volume order.
     pub progress: Option<&'a (dyn Fn(usize, usize) + Sync)>,
+    /// The reference scan the in-plane GRAPPA kernels are fitted to, once per series (read only
+    /// when `accel > 1`; with `t_echo_per_volume`, once per distinct echo time, read at it).
+    /// `None` = the first volume's images and the call's seed.
+    pub grappa_calibration: Option<GrappaCalibration<'a>>,
 }
 
 /// K-space and per-coil intermediates for the captured slices. Complex arrays are `[re, im]`
@@ -1763,6 +1871,70 @@ fn acquire_volumes_complex(
     for &zl in &captured {
         assert!(zl < nz, "kspace_slices index {zl} out of range for {nz} slices");
     }
+
+    // GRAPPA: one kernel per slice for the whole series, fitted on the reference scan
+    // (`GrappaCalibration`), so the reconstruction is the same linear map in every volume. Under
+    // per-volume echo times, one reference scan per distinct echo time, read at it: what separate
+    // runs at each echo time would fit.
+    let mut tes: Vec<f64> = opts.t_echo_per_volume.map_or_else(|| vec![acq.t_echo], |t| t.to_vec());
+    tes.sort_by(f64::total_cmp);
+    tes.dedup_by(|a, b| a.to_bits() == b.to_bits());
+    let kernels: Vec<(u64, Vec<GrappaKernel>)> = if acq.accel.max(1) > 1 {
+        let owned;
+        let (cal_images, cal_seed): (&[Vec<f32>], u64) = match opts.grappa_calibration {
+            Some(c) => (c.images, c.seed),
+            None => {
+                owned = volume_images(images, n_volumes, 0);
+                (&owned, receiver_seed)
+            }
+        };
+        assert!(cal_images.len() == ncomp && cal_images.iter().all(|i| i.len() == nvox_sim),
+                "the GRAPPA calibration images are not one simulation-grid volume per compartment");
+        let no_shot = ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] };
+        let fit_slice = |acq_cal: &Acquisition, zl: usize| -> GrappaKernel {
+            let z = global_z(zl);
+            let plane = snx * sny * zl..snx * sny * (zl + 1);
+            let refs: Vec<&[f32]> = cal_images.iter().map(|im| &im[plane.clone()]).collect();
+            let t2_slice = t2_slices(t2, zl, snx * sny);
+            let ti_slice = t_inhom.map(|ti| t2_slices(ti, zl, snx * sny));
+            let phi = phase_slice(phase, &no_shot, snx, sny, o, z, nz_full);
+            grappa_reference_kernel(
+                &SliceInput {
+                    compartments: &refs,
+                    t2: &t2_slice,
+                    t_inhom: ti_slice.as_deref(),
+                    fmap: &fmap[plane.clone()],
+                    phase0: Some(&phi),
+                    sim: [snx, sny],
+                    acq_matrix: [nx, ny],
+                    z,
+                    nz: nz_full,
+                    eddy_drive: None,
+                    prep_drive: None,
+                    slice_seed: grappa_cal_slice_seed(z, cal_seed),
+                },
+                acq_cal,
+            )
+        };
+        tes.iter()
+            .map(|&te| {
+                let acq_cal = Acquisition { t_echo: te, ..acq.clone() };
+                #[cfg(feature = "par")]
+                let k = {
+                    use rayon::prelude::*;
+                    (0..nz).into_par_iter().map(|zl| fit_slice(&acq_cal, zl)).collect()
+                };
+                #[cfg(not(feature = "par"))]
+                let k = (0..nz).map(|zl| fit_slice(&acq_cal, zl)).collect();
+                (te.to_bits(), k)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let kernels_at = |te: f64| -> &[GrappaKernel] {
+        kernels.iter().find(|(b, _)| *b == te.to_bits()).map_or(&[][..], |(_, k)| &k[..])
+    };
     let done = std::sync::atomic::AtomicUsize::new(0);
 
     let per_vol = |g: usize| -> (Vec<f32>, Vec<f32>, Vec<SliceRecon>) {
@@ -1806,7 +1978,7 @@ fn acquire_volumes_complex(
                 ^ receiver_seed;
             let want = captured.contains(&zl);
             let cap = if want { opts.capture } else { SliceCapture::default() };
-            let out = simulate_slice_full(
+            let out = simulate_slice_with(
                 &SliceInput {
                     compartments: &refs,
                     t2: &t2_slice,
@@ -1823,6 +1995,7 @@ fn acquire_volumes_complex(
                 },
                 acq_g,
                 cap,
+                kernels_at(acq_g.t_echo).get(zl),
             );
             for y in 0..ny {
                 for x in 0..nx {
@@ -4052,7 +4225,8 @@ mod complex_tests {
     /// TRXScan main's `simulate_acquisition_is_bit_identical_to_the_per_slice_loop`: the literal
     /// loop the acquisition used to be (`simulate_slice` per (g, z), the image-space noise keyed
     /// on the voxel, then `f32` magnitude and phase) against the complex entry point, sample for
-    /// sample. (That `simulate_acquisition_oversampled` is the complex output's magnitude and phase
+    /// sample; under GRAPPA each slice's kernel now comes from the series' reference scan, fitted
+    /// here literally too, where `simulate_slice` fitted it per volume. (That `simulate_acquisition_oversampled` is the complex output's magnitude and phase
     /// is only a wiring check: both run `acquire_volumes_complex`. The literal loop and the golden
     /// record are what pin the bits.)
     #[test]
@@ -4088,13 +4262,29 @@ mod complex_tests {
                 let phi = phase_slice(&phase, &shot, snx, sny, o, z, nz);
                 let slice_seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37) ^ 5;
                 let t2s = [T2Slice::Uniform(80.0), T2Slice::Uniform(60.0)];
-                let out = simulate_slice(
+                // GRAPPA: the slice's kernel is fitted once, on the reference scan: volume 0's
+                // images read unaccelerated, no drives, no spikes, the calibration noise stream
+                let cal: Vec<Vec<f32>> = images.iter()
+                    .map(|img| (0..snx * sny).map(|i| img[(i + snx * sny * z) * ngrad]).collect()).collect();
+                let cal_refs: Vec<&[f32]> = cal.iter().map(|v| v.as_slice()).collect();
+                let phi0 = phase_slice(&phase, &ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] }, snx, sny, o, z, nz);
+                let cal_seed = (z as u64).wrapping_mul(0x9E37) ^ 5 ^ SEED_SALT_GRAPPA_CAL;
+                let cal_k: Vec<Vec<C>> = (0..acq.n_coils).map(|c| build_coil_kspace(
+                    &SliceInput {
+                        compartments: &cal_refs, t2: &t2s, t_inhom: None, fmap: &fs, phase0: Some(&phi0), sim: [snx, sny],
+                        acq_matrix: [nx, ny], z, nz, eddy_drive: None, prep_drive: None, slice_seed: cal_seed,
+                    },
+                    &Acquisition { accel: 1, n_spikes: 0, ..acq.clone() }, c, acq.n_coils)).collect();
+                let kernel = GrappaKernel::fit(&cal_k, nx, ny, acq.accel, acq.acs_lines);
+                let out: Vec<(f32, f32)> = simulate_slice_with(
                     &SliceInput {
                         compartments: &refs, t2: &t2s, t_inhom: None, fmap: &fs, phase0: Some(&phi), sim: [snx, sny],
                         acq_matrix: [nx, ny], z, nz, eddy_drive: EDDY[g], prep_drive: PREP[g], slice_seed,
                     },
                     &acq,
-                );
+                    SliceCapture::default(),
+                    Some(&kernel),
+                ).combined.iter().map(|c| (c[0] as f32, c[1] as f32)).collect();
                 for y in 0..ny {
                     for x in 0..nx {
                         let (mut re, mut im) = out[x + nx * y];
@@ -4284,5 +4474,181 @@ mod complex_tests {
         let mut v = seen.into_inner().unwrap();
         v.sort_unstable();
         assert_eq!(v, vec![(1, 2), (2, 2)]);
+    }
+}
+
+/// The in-plane GRAPPA kernel of a series is fitted once, on a reference scan, and applied to
+/// every volume: the series' reconstruction is one linear map, and its temporal noise is thermal.
+#[cfg(test)]
+mod grappa_series_tests {
+    use super::*;
+
+    const N: usize = 32;
+    const O: usize = 2;
+    const NZ: usize = 2;
+    const SCALE: f64 = 1e4;
+    const T2U: [T2Volume<'static>; 1] = [T2Volume::Uniform(80.0)];
+
+    /// A two-level object per slice on the simulation grid, distinct per slice.
+    fn object(scale: f32) -> Vec<f32> {
+        let s = N * O;
+        let mut v = vec![0.0f32; s * s * NZ];
+        for z in 0..NZ {
+            let a = box_hires(s, s, 10.0 + 2.0 * z as f64, 54.0, 8.0, 56.0 - 3.0 * z as f64);
+            let b = box_hires(s, s, 20.0, 40.0 + z as f64, 18.0, 34.0);
+            for i in 0..s * s {
+                v[i + s * s * z] = scale * (a[i] + 0.8 * b[i]);
+            }
+        }
+        v
+    }
+
+    /// The series' images (one compartment): volume `g` is `vols[g]`.
+    fn series_images(vols: &[&[f32]]) -> Vec<Vec<f32>> {
+        let n = vols.len();
+        let mut im = vec![0.0f32; vols[0].len() * n];
+        for (g, v) in vols.iter().enumerate() {
+            for (vox, x) in v.iter().enumerate() {
+                im[vox * n + g] = *x;
+            }
+        }
+        vec![im]
+    }
+
+    fn acq(noise_variance: f64) -> Acquisition {
+        Acquisition {
+            signal_scale: SCALE, do_distortions: false, noise_variance, n_coils: 4, accel: 2, acs_lines: 8, seed: 3,
+            ..Acquisition::default()
+        }
+    }
+
+    /// The complex series, `[g][vox]`, through the production entry point.
+    fn run(images: &[Vec<f32>], n: usize, acq: &Acquisition, cal: Option<GrappaCalibration>) -> Vec<Vec<C>> {
+        let s = N * O;
+        let fmap = vec![0.0f32; s * s * NZ];
+        let phase = PhaseModel::none();
+        let (eddy, prep) = (vec![None; n], vec![None; n]);
+        let inp = AcquisitionInput {
+            sim_dims: [s, s, NZ], acq_dims: [N, N, NZ], n_volumes: n, images, t2: &T2U, fmap: &fmap, t_inhom: None,
+            eddy_drive: &eddy, prep_drive: &prep, phase: &phase, seed: 7, noise_sigma: None,
+        };
+        let out = simulate_acquisition_complex(&inp, acq, &AcquisitionOptions { grappa_calibration: cal, ..Default::default() });
+        (0..n).map(|g| (0..N * N * NZ).map(|v| C { re: out.re[v * n + g] as f64, im: out.im[v * n + g] as f64 }).collect())
+            .collect()
+    }
+
+    /// The same series with each (volume, slice) reconstructed as a lone slice, `simulate_slice`'s
+    /// way: its own kernel, fitted on a reference scan of its own object.
+    fn run_refit(images: &[Vec<f32>], n: usize, acq: &Acquisition) -> Vec<Vec<C>> {
+        let s = N * O;
+        let fmap = vec![0.0f32; s * s];
+        let phi = vec![0.0f64; s * s];
+        let t2s = [T2Slice::Uniform(80.0)];
+        (0..n).map(|g| {
+            let mut vol = vec![C::ZERO; N * N * NZ];
+            for z in 0..NZ {
+                let sl: Vec<f32> = (0..s * s).map(|i| images[0][(i + s * s * z) * n + g]).collect();
+                let refs = [sl.as_slice()];
+                let slice_seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37) ^ 7;
+                let out = simulate_slice_full(
+                    &SliceInput {
+                        compartments: &refs, t2: &t2s, t_inhom: None, fmap: &fmap, phase0: Some(&phi), sim: [s, s],
+                        acq_matrix: [N, N], z, nz: NZ, eddy_drive: None, prep_drive: None, slice_seed,
+                    },
+                    acq, SliceCapture::default());
+                for (i, c) in out.combined.iter().enumerate() {
+                    vol[i + N * N * z] = C { re: c[0], im: c[1] };
+                }
+            }
+            vol
+        }).collect()
+    }
+
+    /// Mean temporal variance over `mask` and the lag-1 correlation of the temporal residual
+    /// along the phase-encode axis (y), pooled over the mask's vertical neighbour pairs.
+    fn temporal_stats(vols: &[Vec<C>], mask: &[bool]) -> (f64, f64) {
+        let n = vols.len() as f64;
+        let nv = vols[0].len();
+        let mean: Vec<C> = (0..nv).map(|v| {
+            let s = vols.iter().fold(C::ZERO, |a, vol| a.add(vol[v]));
+            s.scale(1.0 / n)
+        }).collect();
+        let res = |g: usize, v: usize| vols[g][v].add(mean[v].scale(-1.0));
+        let (mut var, mut cnt) = (0.0, 0usize);
+        let (mut sxy, mut sxx, mut syy) = (0.0, 0.0, 0.0);
+        for v in 0..nv {
+            if !mask[v] {
+                continue;
+            }
+            cnt += 1;
+            let (x, y, z) = (v % N, (v / N) % N, v / (N * N));
+            let up = (y + 1 < N).then(|| x + N * (y + 1 + N * z)).filter(|&u| mask[u]);
+            for g in 0..vols.len() {
+                let a = res(g, v);
+                var += a.re * a.re + a.im * a.im;
+                if let Some(u) = up {
+                    let b = res(g, u);
+                    sxy += a.re * b.re + a.im * b.im;
+                    sxx += a.re * a.re + a.im * a.im;
+                    syy += b.re * b.re + b.im * b.im;
+                }
+            }
+        }
+        (var / (cnt as f64 * (n - 1.0)), sxy / (sxx * syy).sqrt())
+    }
+
+    fn object_mask() -> Vec<bool> {
+        let clean = run(&series_images(&[&object(1.0)]), 1, &acq(0.0), None);
+        let peak = clean[0].iter().map(|c| c.abs()).fold(0.0, f64::max);
+        clean[0].iter().map(|c| c.abs() > 0.5 * peak).collect()
+    }
+
+    /// Noise-free, the series' reconstruction is one linear map: the volume `a + b` is the sum of
+    /// the volumes `a` and `b`, and `2a` is twice `a`. Fitting each volume's own kernel breaks it.
+    #[test]
+    fn the_series_reconstruction_is_linear() {
+        let (a, b) = (object(1.0), object(0.4).iter().rev().copied().collect::<Vec<f32>>());
+        let ab: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+        let a2: Vec<f32> = a.iter().map(|x| 2.0 * x).collect();
+        let images = series_images(&[&a, &b, &ab, &a2]);
+        let cal_img = [object(0.7)];
+        let cal = GrappaCalibration { images: &cal_img, seed: 9 };
+        let peak = |v: &[C]| v.iter().map(|c| c.abs()).fold(0.0, f64::max);
+        let err = |vols: &[Vec<C>]| {
+            let sum = vols[0].iter().zip(&vols[1]).zip(&vols[2]).map(|((x, y), s)| s.add(x.add(*y).scale(-1.0)).abs())
+                .fold(0.0, f64::max);
+            let dbl = vols[0].iter().zip(&vols[3]).map(|(x, d)| d.add(x.scale(-2.0)).abs()).fold(0.0, f64::max);
+            (sum / peak(&vols[2]), dbl / peak(&vols[3]))
+        };
+        for cal in [Some(cal), None] {
+            let (sum, dbl) = err(&run(&images, 4, &acq(0.0), cal));
+            assert!(sum < 1e-5 && dbl < 1e-5, "series GRAPPA ({}) is not linear: {sum:.2e}, {dbl:.2e}",
+                    if cal.is_some() { "explicit reference" } else { "default reference" });
+        }
+        let (sum, _) = err(&run_refit(&images, 4, &acq(0.0)));
+        assert!(sum > 1e-3, "per-volume kernels should break additivity, error {sum:.2e}");
+    }
+
+    /// The temporal noise of an accelerated series is thermal: the noise through one linear map.
+    /// Its variance is proportional to the noise variance over three decades (tSD to its square
+    /// root), so the reference scan's noise does not regularize the kernel (`GRAPPA_LAMBDA` does),
+    /// and the in-object residual has no alternating-line anticorrelation along phase encode, since
+    /// no line of a volume carries unamplified reference-band noise. (With the old absolute
+    /// regularization and the reference band kept in every volume, `var/V` fell from 283 to 34
+    /// over this range and the lag-1 correlation was -0.23.)
+    #[test]
+    fn the_temporal_noise_is_thermal() {
+        let nvol = 40;
+        let mask = object_mask();
+        let vols = vec![object(1.0); nvol];
+        let refs: Vec<&[f32]> = vols.iter().map(|v| v.as_slice()).collect();
+        let images = series_images(&refs);
+        let stats: Vec<(f64, f64, f64)> = [1.0, 10.0, 100.0, 1000.0].iter().map(|&v| {
+            let (var, r) = temporal_stats(&run(&images, nvol, &acq(v), None), &mask);
+            (v, var / v, r)
+        }).collect();
+        let (lo, hi) = stats.iter().fold((f64::MAX, 0.0f64), |(a, b), s| (a.min(s.1), b.max(s.1)));
+        assert!(hi / lo < 1.05, "temporal variance over noise variance should be constant: {stats:?}");
+        assert!(stats.iter().all(|s| s.2.abs() < 0.1), "lag-1 PE correlation of the residual: {stats:?}");
     }
 }

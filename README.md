@@ -35,7 +35,9 @@ reconstructing an image from it. The following effects are included:
   Fourier can follow Fiberfox's rule (the default), drop the end of the EPI train (`Contiguous`), or
   start the train late as a scanner does (`Scanner`), which reaches the k-space centre sooner and
   restarts the eddy-current clock at the first acquired line.
-- **Multiple receive coils**, combined into one image, and **GRAPPA** parallel imaging.
+- **Multiple receive coils**, combined into one image, and **GRAPPA** parallel imaging. As on a
+  scanner's EPI, each volume reads every R-th phase-encode line and the kernel is fitted once per
+  series (per slice) on a separate, fully sampled reference scan, then applied to every volume.
 - **Artifacts:** Nyquist ghosting, eddy currents, and k-space spikes.
 - **Noise**, added in k-space or, optionally, in image space with a spatially varying level.
 - **Head motion** (rigid, per volume) and **multiband** slice timing, including motion-related
