@@ -66,6 +66,55 @@ impl Pose {
             [0.0, 0.0, 0.0, 1.0],
         ]
     }
+
+    /// The inverse of [`Pose::to_matrix`]: the pose whose matrix about `center` is `m`, for a rigid
+    /// `m` with `R = Rz·Ry·Rx` and `|ry| < 90°` (the branch `to_matrix` produces for such angles).
+    pub fn from_matrix(m: [[f64; 4]; 4], center: Vec3) -> Pose {
+        let r = [[m[0][0], m[0][1], m[0][2]], [m[1][0], m[1][1], m[1][2]], [m[2][0], m[2][1], m[2][2]]];
+        let ry = (-r[2][0]).clamp(-1.0, 1.0).asin();
+        let rx = r[2][1].atan2(r[2][2]);
+        let rz = r[1][0].atan2(r[0][0]);
+        // translation part = c − R·c + t, so t = m[:,3] − c + R·c
+        let rc = crate::mat::matvec(&r, center);
+        Pose {
+            rot_deg: [rx.to_degrees(), ry.to_degrees(), rz.to_degrees()],
+            trans_mm: [m[0][3] - center[0] + rc[0], m[1][3] - center[1] + rc[1], m[2][3] - center[2] + rc[2]],
+        }
+    }
+}
+
+/// The 4×4 identity: a shot transform that moves nothing.
+pub const IDENTITY_MATRIX: [[f64; 4]; 4] =
+    [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+
+/// The pose of a trajectory at time `t`: linear in each of the six parameters between the nodes
+/// `(node_times[i], poses[i])` (times non-decreasing), held at the first node before it and at the
+/// last after it. Where two nodes share a time, the later one holds from that time on.
+pub fn sample_trajectory(node_times: &[f64], poses: &[Pose], t: f64) -> Pose {
+    assert_eq!(node_times.len(), poses.len(), "one time per pose");
+    let n = poses.len();
+    if n == 0 {
+        return Pose::IDENTITY;
+    }
+    if t <= node_times[0] {
+        return poses[0];
+    }
+    if t >= node_times[n - 1] {
+        return poses[n - 1];
+    }
+    // the last node at or before t; t < the last time, so i + 1 exists
+    let i = node_times.iter().rposition(|&x| x <= t).expect("t is past the first node");
+    let (t0, t1) = (node_times[i], node_times[i + 1]);
+    if t1 <= t0 {
+        return poses[i + 1];
+    }
+    let f = (t - t0) / (t1 - t0);
+    let (a, b) = (poses[i], poses[i + 1]);
+    let lerp = |x: f64, y: f64| x + (y - x) * f;
+    Pose {
+        rot_deg: [lerp(a.rot_deg[0], b.rot_deg[0]), lerp(a.rot_deg[1], b.rot_deg[1]), lerp(a.rot_deg[2], b.rot_deg[2])],
+        trans_mm: [lerp(a.trans_mm[0], b.trans_mm[0]), lerp(a.trans_mm[1], b.trans_mm[1]), lerp(a.trans_mm[2], b.trans_mm[2])],
+    }
 }
 
 /// Deterministic, seedable PRNG (SplitMix64) so motion is reproducible without pulling `rand` into
@@ -284,6 +333,110 @@ pub fn slice_schedule(nz: usize, mb: usize, interleaved: bool) -> Vec<Vec<usize>
         (0..n_groups).collect()
     };
     order.into_iter().map(group_slices).collect()
+}
+
+/// The shot schedule a set of per-slice excitation offsets describes (P9): slices whose offsets are
+/// bit-identical form one shot, the shots in increasing offset, the slices of a shot ascending.
+/// Any slice order and any grouping; for the schedules [`slice_schedule`] represents, the same
+/// shots in the same order.
+pub fn slice_schedule_from_times(offsets: &[f64]) -> Vec<Vec<usize>> {
+    let mut times: Vec<f64> = offsets.to_vec();
+    times.sort_by(f64::total_cmp);
+    times.dedup_by(|a, b| a.to_bits() == b.to_bits());
+    times.iter().map(|t| (0..offsets.len()).filter(|&z| offsets[z].to_bits() == t.to_bits()).collect()).collect()
+}
+
+/// The given slices of `src` resampled by the world-space rigid transform `m` (the head moves by
+/// `p' = m·p`): each output voxel is backward-mapped through `m⁻¹` and trilinearly sampled, zero
+/// outside the grid. The result holds the slices in the order given, each `x + nx*y`. The identity
+/// copies them exactly. `m` folds the rotation centre into its translation, so for the same pose this
+/// agrees with [`resample_by_pose`] to rounding, not bit for bit.
+pub fn resample_slices_by_matrix(src: &[f32], dims: [usize; 3], v2w: [[f64; 4]; 4], m: [[f64; 4]; 4],
+                                 slices: &[usize]) -> Vec<f32> {
+    use crate::mat;
+    let [nx, ny, _] = dims;
+    let slab = nx * ny;
+    let mut out = vec![0.0f32; slab * slices.len()];
+    if m == IDENTITY_MATRIX {
+        for (k, &z) in slices.iter().enumerate() {
+            out[k * slab..(k + 1) * slab].copy_from_slice(&src[z * slab..(z + 1) * slab]);
+        }
+        return out;
+    }
+    let lin = linear3(v2w);
+    let origin = [v2w[0][3], v2w[1][3], v2w[2][3]];
+    let Some(linv) = mat::inverse3(&lin) else {
+        for (k, &z) in slices.iter().enumerate() {
+            out[k * slab..(k + 1) * slab].copy_from_slice(&src[z * slab..(z + 1) * slab]);
+        }
+        return out;
+    };
+    // rigid inverse: m⁻¹·w = Rᵀ(w − t)
+    let rt = mat::transpose(&[[m[0][0], m[0][1], m[0][2]], [m[1][0], m[1][1], m[1][2]], [m[2][0], m[2][1], m[2][2]]]);
+    let t = [m[0][3], m[1][3], m[2][3]];
+    for (k, &z) in slices.iter().enumerate() {
+        for y in 0..ny {
+            for x in 0..nx {
+                let w = mat::matvec(&lin, [x as f64, y as f64, z as f64]);
+                let d = [w[0] + origin[0] - t[0], w[1] + origin[1] - t[1], w[2] + origin[2] - t[2]];
+                let pr = mat::matvec(&rt, d);
+                let hv = mat::matvec(&linv, [pr[0] - origin[0], pr[1] - origin[1], pr[2] - origin[2]]);
+                out[k * slab + x + nx * y] = trilinear(src, dims, hv);
+            }
+        }
+    }
+    out
+}
+
+/// Per-shot rigid motion and dropout on the per-compartment signal, in place (P9). For each volume
+/// `g` and shot `k`, the slices `schedule[k]` (local indices) are resampled from the volume's
+/// pre-motion signal by the world-space transform `transforms[g][k]`, then multiplied by each factor
+/// of `attenuation[g][k]` in order (one per event, as [`apply_multiband_motion_slab`] applies them).
+/// A shot with the identity transform and no factor is left untouched. Build the transforms about
+/// the whole slice stack's field-of-view centre, so a slab and the full volume move alike.
+pub fn apply_shot_transforms(
+    images: &mut [Vec<f32>],
+    dims: [usize; 3],
+    ngrad: usize,
+    v2w: [[f64; 4]; 4],
+    schedule: &[Vec<usize>],
+    transforms: &[Vec<[[f64; 4]; 4]>],
+    attenuation: &[Vec<Vec<f32>>],
+) {
+    let [nx, ny, nz] = dims;
+    let (slab, nvox) = (nx * ny, nx * ny * nz);
+    assert_eq!(transforms.len(), ngrad, "one transform list per volume");
+    assert_eq!(attenuation.len(), ngrad, "one attenuation list per volume");
+    for g in 0..ngrad {
+        assert_eq!(transforms[g].len(), schedule.len(), "one transform per shot");
+        assert_eq!(attenuation[g].len(), schedule.len(), "one factor list per shot");
+        let moved = transforms[g].iter().any(|m| *m != IDENTITY_MATRIX);
+        for img in images.iter_mut() {
+            if moved {
+                let orig: Vec<f32> = (0..nvox).map(|v| img[v * ngrad + g]).collect();
+                for (k, m) in transforms[g].iter().enumerate() {
+                    if *m == IDENTITY_MATRIX || schedule[k].is_empty() {
+                        continue;
+                    }
+                    let rs = resample_slices_by_matrix(&orig, dims, v2w, *m, &schedule[k]);
+                    for (j, &z) in schedule[k].iter().enumerate() {
+                        for xy in 0..slab {
+                            img[(z * slab + xy) * ngrad + g] = rs[j * slab + xy];
+                        }
+                    }
+                }
+            }
+            for (k, factors) in attenuation[g].iter().enumerate() {
+                for &a in factors {
+                    for &z in &schedule[k] {
+                        for xy in 0..slab {
+                            img[(z * slab + xy) * ngrad + g] *= a;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A synthetic within-volume bulk-motion event: at `shot` of `volume` the head jumps (geometric)
@@ -642,5 +795,245 @@ mod tests {
         assert_eq!((law.attenuation(0, 0.5), law.attenuation(2, 0.5), law.attenuation(7, 0.5)), (1.0, 1.0, 1.0));
         let off = DropoutLaw::ScaledTo { drive: vec![1000.0], max: 0.0, floor: 50.0 };
         assert_eq!(off.attenuation(0, 0.9), 1.0);
+    }
+
+    // ---- P9: shot schedules from slice times, per-shot transforms ----
+
+    /// An oblique, anisotropic grid, so the matrix path is exercised away from the identity.
+    fn oblique_v2w() -> [[f64; 4]; 4] {
+        let r = crate::mat::rotation_zyx_deg(4.0, -3.0, 7.0);
+        let s = [1.5, 1.75, 3.0];
+        [
+            [r[0][0] * s[0], r[0][1] * s[1], r[0][2] * s[2], -12.0],
+            [r[1][0] * s[0], r[1][1] * s[1], r[1][2] * s[2], 8.5],
+            [r[2][0] * s[0], r[2][1] * s[1], r[2][2] * s[2], -20.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    }
+
+    /// A smooth field (so trilinear rounding is the only difference between two equal transforms).
+    fn smooth(dims: [usize; 3], phase: f64) -> Vec<f32> {
+        let [nx, ny, nz] = dims;
+        let mut v = vec![0.0f32; nx * ny * nz];
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let (a, b, c) = (x as f64 / nx as f64, y as f64 / ny as f64, z as f64 / nz as f64);
+                    v[x + nx * (y + ny * z)] =
+                        (1.0 + (3.0 * a + phase).sin() * (2.0 * b).cos() + 0.5 * (4.0 * c).sin()) as f32;
+                }
+            }
+        }
+        v
+    }
+
+    fn peak(v: &[f32]) -> f32 {
+        v.iter().fold(0.0f32, |m, x| m.max(x.abs()))
+    }
+
+    #[test]
+    fn schedule_from_times_reproduces_slice_schedule() {
+        for nz in [4usize, 6, 8, 9, 12, 20] {
+            for mb in [1usize, 2, 3, 4] {
+                if nz % mb != 0 {
+                    continue;
+                }
+                for interleaved in [false, true] {
+                    let want = slice_schedule(nz, mb, interleaved);
+                    // the offsets a scanner would record for that schedule: shot k at 0.04 k
+                    let mut offsets = vec![0.0f64; nz];
+                    for (k, shot) in want.iter().enumerate() {
+                        for &z in shot {
+                            offsets[z] = 0.04 * k as f64;
+                        }
+                    }
+                    assert_eq!(slice_schedule_from_times(&offsets), want, "nz {nz} mb {mb} interleaved {interleaved}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn schedule_from_times_takes_any_order() {
+        // descending single band
+        assert_eq!(slice_schedule_from_times(&[0.3, 0.2, 0.1, 0.0]), vec![vec![3], vec![2], vec![1], vec![0]]);
+        // odd-first interleaved (slices 1, 3, 5, then 0, 2, 4)
+        let odd_first = [0.3, 0.0, 0.4, 0.1, 0.5, 0.2];
+        assert_eq!(slice_schedule_from_times(&odd_first), vec![vec![1], vec![3], vec![5], vec![0], vec![2], vec![4]]);
+        // a grouping slice_schedule cannot represent: {0, 1} together
+        assert_eq!(slice_schedule_from_times(&[0.0, 0.0, 0.1, 0.1]), vec![vec![0, 1], vec![2, 3]]);
+    }
+
+    #[test]
+    fn from_matrix_inverts_to_matrix() {
+        let c = [3.0, -7.5, 12.0];
+        for p in [
+            Pose { rot_deg: [2.0, -3.5, 5.0], trans_mm: [0.4, -1.2, 2.5] },
+            Pose { rot_deg: [-12.0, 20.0, -30.0], trans_mm: [-5.0, 0.0, 1.0] },
+            Pose::IDENTITY,
+        ] {
+            let q = Pose::from_matrix(p.to_matrix(c), c);
+            for i in 0..3 {
+                assert!((q.rot_deg[i] - p.rot_deg[i]).abs() < 1e-12, "{p:?} -> {q:?}");
+                assert!((q.trans_mm[i] - p.trans_mm[i]).abs() < 1e-12, "{p:?} -> {q:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn trajectory_interpolates_and_clamps() {
+        let a = Pose { rot_deg: [0.0, 0.0, 2.0], trans_mm: [0.0, 1.0, 0.0] };
+        let b = Pose { rot_deg: [0.0, 0.0, 4.0], trans_mm: [1.0, 1.0, -2.0] };
+        let times = [1.0, 3.0];
+        assert_eq!(sample_trajectory(&times, &[a, b], 0.0), a);
+        assert_eq!(sample_trajectory(&times, &[a, b], 1.0), a);
+        assert_eq!(sample_trajectory(&times, &[a, b], 9.0), b);
+        let m = sample_trajectory(&times, &[a, b], 2.5);
+        assert!((m.rot_deg[2] - 3.5).abs() < 1e-12 && (m.trans_mm[0] - 0.75).abs() < 1e-12 && (m.trans_mm[2] + 1.5).abs() < 1e-12);
+        // coincident nodes: the later holds from that time
+        let c = Pose { trans_mm: [9.0, 0.0, 0.0], ..Pose::IDENTITY };
+        assert_eq!(sample_trajectory(&[0.0, 1.0, 1.0, 2.0], &[a, b, c, c], 1.0), c);
+        assert_eq!(sample_trajectory(&[], &[], 1.0), Pose::IDENTITY);
+    }
+
+    #[test]
+    fn slice_resample_by_matrix_matches_resample_by_pose() {
+        let dims = [11usize, 9, 7];
+        let v2w = oblique_v2w();
+        let src = smooth(dims, 0.3);
+        let c = fov_center(dims, v2w);
+        let pose = Pose { rot_deg: [1.5, -2.0, 3.0], trans_mm: [0.8, -0.6, 1.1] };
+        let full = resample_by_pose(&src, dims, v2w, pose);
+        let slices = [5usize, 0, 3];
+        let got = resample_slices_by_matrix(&src, dims, v2w, pose.to_matrix(c), &slices);
+        let slab = dims[0] * dims[1];
+        let tol = 1e-6 * peak(&src);
+        let mut moved = false;
+        for (k, &z) in slices.iter().enumerate() {
+            for xy in 0..slab {
+                let (a, b) = (got[k * slab + xy], full[z * slab + xy]);
+                assert!((a - b).abs() <= tol, "slice {z} voxel {xy}: {a} vs {b}");
+                moved |= (b - src[z * slab + xy]).abs() > 1e-3;
+            }
+        }
+        assert!(moved, "the pose must move something, or the check is vacuous");
+        // the identity copies exactly
+        let same = resample_slices_by_matrix(&src, dims, v2w, IDENTITY_MATRIX, &slices);
+        for (k, &z) in slices.iter().enumerate() {
+            assert_eq!(&same[k * slab..(k + 1) * slab], &src[z * slab..(z + 1) * slab]);
+        }
+    }
+
+    /// Cumulative jump matrices per shot, as a caller with identity volume poses builds them.
+    fn jump_matrices(events: &[MotionEvent], ngrad: usize, n_shots: usize, c: Vec3) -> Vec<Vec<[[f64; 4]; 4]>> {
+        (0..ngrad).map(|g| {
+            let mut cum = Pose::IDENTITY;
+            (0..n_shots).map(|k| {
+                for e in events.iter().filter(|e| e.volume == g && e.shot == k) {
+                    for i in 0..3 {
+                        cum.trans_mm[i] += e.jump_mm[i];
+                        cum.rot_deg[i] += e.jump_deg[i];
+                    }
+                }
+                if cum == Pose::IDENTITY { IDENTITY_MATRIX } else { cum.to_matrix(c) }
+            }).collect()
+        }).collect()
+    }
+
+    #[test]
+    fn shot_transforms_match_multiband_motion() {
+        let dims = [10usize, 8, 6];
+        let (ngrad, nvox) = (3usize, 10 * 8 * 6);
+        let v2w = oblique_v2w();
+        let c = fov_center(dims, v2w);
+        let mk = || -> Vec<Vec<f32>> {
+            (0..2).map(|comp| {
+                let f = smooth(dims, comp as f64);
+                (0..nvox * ngrad).map(|i| f[i / ngrad] * (1.0 + 0.1 * (i % ngrad) as f32)).collect()
+            }).collect()
+        };
+        let law = DropoutLaw::Uniform;
+        let events = [
+            MotionEvent { volume: 0, shot: 1, severity: 0.3, jump_mm: [0.5, -0.2, 0.7], jump_deg: [0.0, 1.0, -2.0] },
+            MotionEvent { volume: 2, shot: 0, severity: 0.0, jump_mm: [0.0, 0.0, 1.2], jump_deg: [1.5, 0.0, 0.0] },
+            MotionEvent { volume: 2, shot: 2, severity: 0.6, jump_mm: [-0.4, 0.0, 0.0], jump_deg: [0.0, 0.0, 3.0] },
+        ];
+        let schedule = slice_schedule(dims[2], 2, true);
+        let mut old = mk();
+        apply_multiband_motion(&mut old, dims, ngrad, v2w, 2, true, &law, &events);
+        let transforms = jump_matrices(&events, ngrad, schedule.len(), c);
+        let attenuation: Vec<Vec<Vec<f32>>> = (0..ngrad).map(|g| {
+            (0..schedule.len()).map(|k| {
+                events.iter().filter(|e| e.volume == g && e.shot == k).map(|e| law.attenuation(g, e.severity)).collect()
+            }).collect()
+        }).collect();
+        let mut new = mk();
+        apply_shot_transforms(&mut new, dims, ngrad, v2w, &schedule, &transforms, &attenuation);
+        let orig = mk();
+        for comp in 0..2 {
+            let tol = 1e-6 * peak(&orig[comp]);
+            for i in 0..nvox * ngrad {
+                assert!((old[comp][i] - new[comp][i]).abs() <= tol, "comp {comp} index {i}: {} vs {}", old[comp][i], new[comp][i]);
+            }
+            // volume 1 has no event: untouched, bit for bit
+            for v in 0..nvox {
+                assert_eq!(new[comp][v * ngrad + 1].to_bits(), orig[comp][v * ngrad + 1].to_bits());
+            }
+        }
+        // and something did move
+        assert!((0..nvox).any(|v| (new[0][v * ngrad + 2] - orig[0][v * ngrad + 2]).abs() > 1e-3));
+    }
+
+    /// A rotating jump on a slab, with the full stack's matrix, reproduces the full volume's slices
+    /// away from the slab's edges (the slab's own centre would rotate about a different point).
+    #[test]
+    fn shot_transforms_on_a_slab_use_the_full_stack_matrix() {
+        let (nx, ny, nz, ngrad) = (12usize, 10usize, 12usize, 1usize);
+        let v2w = oblique_v2w();
+        let full_dims = [nx, ny, nz];
+        let c = fov_center(full_dims, v2w);
+        let img = smooth(full_dims, 0.7);
+        let jump = Pose { rot_deg: [0.0, 0.0, 4.0], trans_mm: [0.6, 0.0, 0.0] }.to_matrix(c);
+        // two shots: slices 0..6 unmoved, 6..12 jumped
+        let schedule: Vec<Vec<usize>> = vec![(0..6).collect(), (6..12).collect()];
+        let mut full = vec![img.clone()];
+        apply_shot_transforms(&mut full, full_dims, ngrad, v2w, &schedule, &[vec![IDENTITY_MATRIX, jump]], &[vec![vec![], vec![]]]);
+        // the slab z = 4..12 (8 slices), its own v2w shifted by 4 slices, the schedule mapped to local indices
+        let (z0, nzs) = (4usize, 8usize);
+        let mut sv2w = v2w;
+        for r in 0..3 {
+            sv2w[r][3] += v2w[r][2] * z0 as f64;
+        }
+        let slab_dims = [nx, ny, nzs];
+        let local: Vec<Vec<usize>> = schedule.iter().map(|s| s.iter().filter(|&&z| z >= z0).map(|&z| z - z0).collect()).collect();
+        let mut slab = vec![img[nx * ny * z0..].to_vec()];
+        apply_shot_transforms(&mut slab, slab_dims, ngrad, sv2w, &local, &[vec![IDENTITY_MATRIX, jump]], &[vec![vec![], vec![]]]);
+        let tol = 1e-6 * peak(&img);
+        let mut compared = 0;
+        // jumped slices two or more slices inside the slab (the backward map reads neighbouring slices
+        // on this oblique grid, and the slab holds the same data there)
+        for z in 8..10 {
+            for xy in 0..nx * ny {
+                let (a, b) = (slab[0][(z - z0) * nx * ny + xy], full[0][z * nx * ny + xy]);
+                assert!((a - b).abs() <= tol, "slice {z} voxel {xy}: slab {a} vs full {b}");
+                compared += 1;
+            }
+        }
+        assert!(compared > 0);
+        assert!((0..nx * ny).any(|xy| (full[0][8 * nx * ny + xy] - img[8 * nx * ny + xy]).abs() > 1e-3), "the jump moves slice 8");
+    }
+
+    #[test]
+    fn shot_factors_apply_in_order_and_identity_shots_stay() {
+        let dims = [3usize, 2, 2];
+        let mut images = vec![vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]];
+        let orig = images.clone();
+        let schedule = vec![vec![0], vec![1]];
+        let (a, b) = (0.7f32, 0.3f32);
+        apply_shot_transforms(&mut images, dims, 1, IDENTITY_MATRIX, &schedule, &[vec![IDENTITY_MATRIX; 2]], &[vec![vec![], vec![a, b]]]);
+        assert_eq!(&images[0][..6], &orig[0][..6]);
+        for i in 6..12 {
+            assert_eq!(images[0][i].to_bits(), (orig[0][i] * a * b).to_bits());
+        }
     }
 }
