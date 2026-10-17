@@ -117,6 +117,10 @@ impl Pieces {
         self.n += 1;
         true
     }
+    /// Whether `u` is already an edge (a piece's start), so splitting there needs no room.
+    fn has_edge(&self, u: f32) -> bool {
+        (0..self.n as usize).any(|i| self.start[i] == u)
+    }
     fn remove(&mut self, i: usize) {
         let n = self.n as usize;
         for j in i..n - 1 {
@@ -349,11 +353,17 @@ impl SpinHistory {
                         let u0 = snap((k - 0.5 - a) / len);
                         let u1 = snap((k + 0.5 - a) / len);
                         if u1 > u0 {
+                            // make room for both new edges before splitting, so a merge can never
+                            // remove an edge this excitation has just made
+                            let needed = [u0, u1].iter().filter(|&&u| u > 0.0 && u < 1.0 && !pc.has_edge(u)).count();
+                            while pc.n as usize + needed > MAX_PIECES {
+                                merges += 1;
+                                merge_closest(pc, t1, pulses);
+                            }
                             for u in [u0, u1] {
-                                if u > 0.0 && u < 1.0 && !pc.split(u) {
-                                    merges += 1;
-                                    merge_closest(pc);
-                                    pc.split(u);
+                                if u > 0.0 && u < 1.0 {
+                                    let ok = pc.split(u);
+                                    debug_assert!(ok, "room was made for the split");
                                 }
                             }
                             let mut cache: Option<(f32, f64, f64)> = None;
@@ -412,7 +422,7 @@ impl SpinHistory {
 /// weighted by the pair's reduced length `la lb / (la + lb)`, into their length-weighted mean. It
 /// picks thin slivers first: under a drift, the voxels at the ends of the slice stack collect one
 /// sliver per volume, carried out of the stack and never excited again.
-fn merge_closest(pc: &mut Pieces) {
+fn merge_closest(pc: &mut Pieces, t1: f64, pulses: &[Pulse]) {
     let n = pc.n as usize;
     let len = |i: usize| (pc.end(i) - pc.start[i]) as f64;
     let cost = |i: usize| {
@@ -421,8 +431,13 @@ fn merge_closest(pc: &mut Pieces) {
     };
     let best = (1..n).min_by(|&a, &b| cost(a).total_cmp(&cost(b))).expect("a full voxel has pieces to merge");
     let (la, lb) = (pc.end(best - 1) - pc.start[best - 1], pc.end(best) - pc.start[best]);
-    pc.mz[best - 1] = (pc.mz[best - 1] * la + pc.mz[best] * lb) / (la + lb);
-    pc.t[best - 1] = pc.t[best - 1].max(pc.t[best]);
+    let (ta, tb) = (pc.t[best - 1], pc.t[best]);
+    // both pieces brought to the later time (recovery and the pulses between) before averaging
+    let t = ta.max(tb);
+    let at = |mz: f32, from: f64| if from == t { mz as f64 } else { replay(mz as f64, from, t, t1, pulses) };
+    let (ma, mb) = (at(pc.mz[best - 1], ta), at(pc.mz[best], tb));
+    pc.mz[best - 1] = ((ma * la as f64 + mb * lb as f64) / (la + lb) as f64) as f32;
+    pc.t[best - 1] = t;
     pc.remove(best);
 }
 
@@ -603,8 +618,60 @@ mod tests {
             p.mz[i] = i as f32;
         }
         assert!(!p.split(0.99), "full");
-        merge_closest(&mut p);
+        merge_closest(&mut p, 1.0, &[]);
         assert_eq!(p.n as usize, MAX_PIECES - 1);
+    }
+
+    /// Review fix: a merge brings both pieces to the later time first (recovery, pulses), then
+    /// averages: equal halves last saturated at 0 and 4.6 s, T1 1.33 s, hold 0.484264 at 4.6 s.
+    #[test]
+    fn merging_propagates_both_pieces_to_the_later_time() {
+        let mut p = Pieces::relaxed();
+        assert!(p.split(0.5));
+        p.mz = [0.0; MAX_PIECES];
+        p.t[0] = 0.0;
+        p.t[1] = 4.6;
+        merge_closest(&mut p, 1.33, &[]);
+        assert_eq!(p.n, 1);
+        assert_eq!(p.t[0], 4.6);
+        let want = 0.5 * (1.0 - (-4.6f64 / 1.33).exp());
+        assert!((p.mz[0] as f64 - want).abs() < 1e-6, "{} vs {want}", p.mz[0]);
+        assert!((want - 0.484264).abs() < 1e-6);
+        // with a saturation between, the earlier piece starts again from zero at the pulse
+        let mut q = Pieces::relaxed();
+        assert!(q.split(0.5));
+        q.mz = [0.0; MAX_PIECES];
+        q.t[0] = 0.0;
+        q.t[1] = 4.6;
+        merge_closest(&mut q, 1.33, &[Pulse::Saturation { t: 4.0 }]);
+        let want = 0.5 * (1.0 - (-0.6f64 / 1.33).exp());
+        assert!((q.mz[0] as f64 - want).abs() < 1e-6, "{} vs {want}", q.mz[0]);
+    }
+
+    /// Review fix: a full voxel makes room before splitting, so the edges an excitation needs are
+    /// never merged away. One 2 mm voxel (z -1..1) and three 1 mm slabs (z -1.5..1.5): eight
+    /// excitations of every slab while the voxel sinks out of the stack 0.02 mm a time leave one
+    /// sliver per step below the stack, each last excited at its own time, filling the voxel; then
+    /// slab 1 alone at the identity needs two new edges (u = 0.25 and 0.75) and must still excite
+    /// exactly the middle half of the voxel.
+    #[test]
+    fn a_full_voxel_keeps_the_edges_its_excitation_needs() {
+        let (t1, w, c) = (vec![1.0f32], vec![1.0f32], vec![0u8]);
+        let mut src = IDENTITY_MATRIX;
+        src[2][2] = 2.0;
+        let mut s = IDENTITY_MATRIX;
+        s[2][3] = -1.0;
+        let mut h = SpinHistory::new(Source { dims: [1, 1, 1], v2w: src, t1: &t1, weight: &w, class: &c, n_classes: 1 },
+                                     Slabs { dims: [1, 1, 3], v2w: s }, Vec::new());
+        let one = |_t1: f64| 1.0;
+        for i in 0..8 {
+            let p = Pose { trans_mm: [0.0, 0.0, -0.5 - 0.02 * i as f64], ..Pose::IDENTITY };
+            let _ = h.excite(i as f64, p.to_matrix([0.0, 0.0, 0.0]), &[0, 1, 2], &one, None);
+        }
+        let terms = h.excite(8.0, IDENTITY_MATRIX, &[1], &one, None);
+        // half the voxel (volume 2 slab cells) at reference 1: den = 0.5 * 2
+        assert!((terms[0].den[0][0] - 1.0).abs() < 1e-6, "excited fraction: den {}", terms[0].den[0][0]);
+        assert!(h.merges() > 0, "the voxel must have been full, or the check is vacuous");
     }
 
     /// The cost on the motivating size (P9 plan, Task 6): `--release --features par -- --ignored --nocapture`.

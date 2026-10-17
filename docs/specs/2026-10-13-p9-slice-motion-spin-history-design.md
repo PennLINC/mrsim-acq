@@ -444,8 +444,10 @@ interleaved|sequential|descending|odd-first` (default `interleaved`, today's val
 `--motion-events TSV`. The event file is part A's format, with one rule both simulators share:
 its `attenuation` column is `1 - severity`, the input of the dropout law, so a law that scales
 with the b-value applies after reading. A new truth file, `<out>_desc-motionEvents.tsv`, written
-whenever events run, is that format and replays the run. The dropped-slice file keeps its file
-name and columns.
+whenever the per-shot path runs, is that format and replays the run. The legacy multiband call
+(`--mb > 1 --dropout-rate`, interleaved, no new flag; Python's `Artifacts.dropout`) writes only the
+dropped-slice file, as before, so its outputs stay byte-identical. The dropped-slice file keeps
+its file name and columns.
 
 Bindings: `slice_schedule_from_times`, `load_motion_events`, and
 `Compartments.apply_shot_transforms` (slab-local schedule, global shot indices).
