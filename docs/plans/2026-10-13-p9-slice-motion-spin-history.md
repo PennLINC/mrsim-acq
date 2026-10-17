@@ -514,6 +514,76 @@ not the mean of the two; each refusal names what is missing.
   give b=0 volumes no jump and no spin history. An events file can target them.
 - **Cost.** Settled by Task 6: 2.8 s on the motivating size.
 
+## Implementation record (2026-10-17)
+
+Commits (all unpushed): mrsim-acq `102764e` (docs), `eb7b0ea` (Task 1), `99ad5d5` + `3465ef8`
+(Task 6); aslscan `48187b3` (Task 0), `2acd4ea` (2), `d3c05bd` (3), `af219e9` (4), `e188546` (5),
+`59489f4` (7), `a359bad` (8), `a99e721` (9), `a66402f` (10); TRXScan `c8594c8` (12), `2844c3f`
+(13), `dbca4a3` (14), `4cc5423` (a `--t1` parsing fix the smoke test found).
+
+- **Task 0.** Regress on the base (`5dfab06` / `5b4dd60`, with the new P8 case): 35 executed under
+  `cli,kspace,par` and 33 under `cli` (`asl001_p5`, `p8_spiral_kz` need `kspace`), all identical.
+  TRXScan baselines on the untouched branch: 594 CLI and 177 Python hashes, identical.
+- **Task 2.** As the spec's table says, a multiband schedule the P3 path cannot represent takes the
+  shot path whatever the motion request (volume motion alone included).
+- **Task 3.** The regress gate after Task 3 was folded into Task 10's run.
+- **Task 5.** Criterion 1 passes (61 events, one slice each), every run validates.
+- **Task 6.** The pieces design change and the measurement are recorded under Task 6.
+- **Task 10.** Criteria 2-4 pass: the slow drift's largest correction is 1.3e-4 of the tissue
+  (138 930 merges, all at the stack's ends); one 0.5 mm jump gives slice 10's grey matter 0.9050 of
+  the static against the closed form 0.9031 (723 voxels); with presaturation 0.9051 against its
+  own closed form, and the next volume's correction is 4e-16. Regress at `a66402f` / `3465ef8`:
+  35 + 33 identical; the self-test detected the perturbation (its first attempt, at Task 0, had
+  snapshotted a half-edited tree and failed to build).
+- **Task 11-13.** TRXScan baselines identical after each, every cargo feature set and pytest
+  green. The Python `Artifacts.dropout` keeps its behaviour (multiband only); single-band dropout
+  is `ShotEvents(rate=...)` there, and `--dropout-rate` at `--mb 1` on the command line.
+
+## Codex adversarial review of the implementation (2026-10-17)
+
+7 findings (`p9-wt/codex-impl-adversarial.md`), each checked against the source; 6 valid and
+fixed with tests, 1 resolved by correcting the spec.
+
+1. TRXScan read the spin-history weights from re-simulated (scanner-frame) images as if they were
+   head-frame, and tracked voxels by the scanner-frame signal: the weights are now the images moved
+   back by each volume's inverse pose, and the tracked set comes from them
+   (`spin_history_weights_undo_the_volume_pose`).
+2. A full voxel could merge away an edge it had just made while splitting the second: room for both
+   edges is now made before either split (`a_full_voxel_keeps_the_edges_its_excitation_needs`, which
+   fills the voxel with distinct slivers).
+3. Merging averaged states from different times: both pieces are now replayed to the later time,
+   pulses included, before averaging (`merging_propagates_both_pieces_to_the_later_time`).
+4. Python accepted duplicate or out-of-range explicit events that its own events file could not
+   replay: the bindings now check them as the file reader does.
+5. The Python sidecar's `SliceTiming` could contradict the shot order `ShotEvents` used: it now
+   states the shots' timing when `ShotEvents` sets the order and `Protocol.tr_s` is known.
+6. A stack whose slice count is not a multiple of the multiband factor got a three-slice shot:
+   `shot_offsets` now refuses it.
+7. The legacy multiband path writes no events file: kept, because writing one would change the
+   baseline's outputs; the spec now says the file comes with the per-shot path only.
+
+## Final Codex code review (2026-10-17)
+
+3 findings (`p9-wt/codex-impl-final.md`), all valid, all fixed with tests.
+
+1. The room-making loop counted the edges it needed once, before merging, and a merge could remove
+   one of them: a full voxel's `cut` now protects the edges it needs from the merges and recounts
+   after each (`a_cut_keeps_its_existing_edges`).
+2. TRXScan built shots from unchecked timing (`--tr 0` put every slice in one shot; explicit slice
+   times could repeat at single band or exceed the repetition): `check_shot_timing` refuses a
+   non-positive TR, offsets outside `[0, TR)` and shots that are not `mb` slices, in the CLI and
+   both bindings (which take `mb`); `slice_order="protocol"` needs `Protocol.tr_s`.
+3. Both events readers accepted a file without its `slices` column: it is now required (its value
+   is still ignored).
+
+**Final gates (2026-10-17), on mrsim-acq `3ad025c`, aslscan `c06b65d`, TRXScan `368173a`:**
+mrsim-acq 138 / 165 / 165 tests (default, `kspace`, `kspace,par`) and the golden record; aslscan
+93 + 225 unit and 59 integration tests, acceptance criteria 1-4 passing; regress 35 + 33 cases
+identical (the self-test on `a66402f` detected the perturbation in every case); TRXScan 75 / 80 /
+80 / 75 tests (default, `cli`, `cli,par`, `kspace`), 65 pytest, re-sync baselines identical (594
+CLI and 177 Python hashes). Nothing is tagged or pushed: that, and the TRXScan pull request, wait
+for the user.
+
 ## Codex adversarial review of Part C and this plan (2026-10-14)
 
 16 findings (`aslscan/work/p9-codex-plan.md`), each checked against the source (TRXScan at
