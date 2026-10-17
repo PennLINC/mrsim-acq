@@ -248,7 +248,9 @@ New overlay keys under `[motion]`:
 | Key | Meaning |
 |---|---|
 | `spin_history` | `false` (default) or `true` |
-| `spin_history_z_subcells` | sub-cells per phantom voxel along z; default 8 |
+
+(The first draft had a second key, `spin_history_z_subcells`. The engine no longer subdivides
+voxels; see "The model" and the plan's implementation record.)
 
 `spin_history = true` needs a series the closed form describes exactly when nothing moves:
 
@@ -272,11 +274,18 @@ correction relative to it would then be non-zero for a static head.
 
 ## The model
 
-**State.** Every phantom voxel with tissue (`dseg > 0`) is split along z into `q` equal
-sub-cells, fixed in the head. Each holds `mz`, its longitudinal magnetization just after its last
-excitation, and `t`, the time of that excitation.
+**State.** Every phantom voxel with tissue (`dseg > 0`) carries its z extent, fixed in the head,
+as contiguous pieces. Each piece holds `mz`, its longitudinal magnetization just after its last
+excitation, and `t`, the time of that excitation. An excitation that covers part of a voxel
+splits a piece at the slab's edge; adjacent pieces in the same state merge. The history is
+therefore exact along z: a static head on slabs that cut the voxels keeps two pieces in each cut
+voxel, each excited by its own slab. A voxel holds at most eight pieces. Beyond that, the
+neighbouring pair whose merging averages least (state difference weighted by the pair's reduced
+length) merges into its length-weighted mean. In practice that happens to the voxels at the ends
+of the slice stack under a drift, which collect one thin sliver per volume carried out of the
+stack.
 
-**Between excitations.** `Mz(T)` for a sub-cell is found by replaying the series from `(mz, t)` to
+**Between excitations.** `Mz(T)` for a piece is found by replaying the series from `(mz, t)` to
 `T`: recovery toward `M0` with the voxel's `T1`, every suppression pulse at `row_start[v] + p_k`
 in `(t, T]` multiplying by `1 - 2 epsilon`, every presaturation at `row_start[v]` in `(t, T]`
 setting it to zero. This is `longitudinal::timeline` on the series clock. The stored state is
@@ -285,27 +294,27 @@ never modified by a pulse, only by an excitation. A voxel with `T1 = 0` gives ze
 
 **The slab.** A box: slice `z` excites everything whose scanner-frame slice coordinate falls in
 `[z - 1/2, z + 1/2)` voxels, over the whole plane and not only the field of view. Slabs are
-contiguous and as thick as the slice spacing. A sub-cell's overlap `w` with a slab under a
-transform is the overlap of the interval of its own z length about its moved centre. Its tilt is
-ignored.
+contiguous and as thick as the slice spacing. A voxel's z extent under a transform is the interval
+of its own z length about its moved centre. Its tilt is ignored.
 
 **An excitation.** For shot `s` of volume `v`, at time `T = T(v, s)` and transform `Q(v, s)`, and
-for each of the shot's slices `z` and each sub-cell with overlap `w > 0`:
+for each of the shot's slices `z` and each piece inside slice `z`'s slab (after splitting at the
+slab's edges):
 
-1. *Correct.* The sub-cell adds `w V (Mz(T) - Mz_ref)` to the correction image of its tissue
-   class, at the simulation-grid cell of slice `z` its moved centre falls in. `V` is the
-   sub-cell's volume over the simulation cell's, and `Mz_ref` is
-   `tissue_mz(M0, T1, tr, t_v + offset(s), suppression)`, the value the closed form gives that
+1. *Correct.* The piece adds `l V (Mz(T) - Mz_ref)` to the correction image of its voxel's tissue
+   class, at the simulation-grid cell of slice `z` nearest the voxel's moved centre. `l` is the
+   piece's fraction of the voxel, `V` the voxel's volume over the simulation cell's, and `Mz_ref`
+   is `tissue_mz(M0, T1, tr, t_v + offset(s), suppression)`, the value the closed form gives that
    voxel at this shot's time.
-2. *Excite.* The sub-cell's state becomes `mz = (1 - w) Mz(T)`, `t = T`.
+2. *Excite.* The piece's state becomes `mz = 0`, `t = T`.
 
 The correction images are multiplied by whatever per-voxel and per-shot factors the tissue images
 carry (the echo-time factor, the physiological tissue factor, the shot's dropout attenuation) and
 added to the moved tissue images of that shot's slices.
 
 **Start.** Before the first volume the engine runs one fictitious volume: the first row's shots,
-one repetition early, all at the pose of the first volume's first shot, exciting only. Sub-cells
-it does not reach start fully relaxed. A head that never moves then meets every later excitation
+one repetition early, all at the pose of the first volume's first shot, exciting only. Pieces it
+does not reach start fully relaxed. A head that never moves then meets every later excitation
 exactly as the closed form assumes.
 
 **What is not touched.** The blood, arterial and extravascular-label compartments are computed as
@@ -316,13 +325,13 @@ before: labeled blood arrives after the previous excitation and is treated as fr
 
 The engine is a new pure-std module in `mrsim-acq`, `spin_history`, so that TRXScan can use it
 (part C). It knows nothing of ASL. Its inputs are a source grid in the head frame with a `T1`, a
-weight and a class per voxel, the sub-cell count, the slab geometry, the pulses on the series
-clock, and a reference `Mz` per voxel and shot. With `M0 = 1` inside and the caller's weight
-outside, each excitation returns two images per class and shot slice:
+weight and a class per voxel, the slab geometry, the pulses on the series clock, and a reference
+`Mz` per voxel and shot. With `M0 = 1` inside and the caller's weight outside, each excitation
+returns two images per class and shot slice:
 
 ```
-num = sum of  w V weight (Mz(T) - Mz_ref)
-den = sum of  w V weight Mz_ref
+num = sum over excited pieces of  l V weight (Mz(T) - Mz_ref)
+den = sum over excited pieces of  l V weight Mz_ref
 ```
 
 The weight is fixed at construction and may be replaced for one excitation, because a diffusion
@@ -332,22 +341,19 @@ signal changes from volume to volume. Both consumers add `num`: `aslscan` with `
 
 ## What this gets right, and what it approximates
 
-- **A static head is exact.** Every sub-cell wholly inside a slab has `Mz(T) = Mz_ref`, so the
-  correction is zero. Sub-cells cut by a slab boundary carry the mixing error below, which for a
-  static head is a fraction `exp(-TR/T1)` of one sub-cell layer.
+- **A static head is exact**, on aligned slabs and on slabs that cut the voxels: every excited
+  piece has `Mz(T) = Mz_ref`, so the correction is zero.
 - **Double excitation and skipping under through-plane translation** are exact for a box profile,
-  up to that mixing.
-- **Sub-cell mixing.** A sub-cell that a slab covers in part holds one `Mz`, the mean of its
-  excited and unexcited parts. That mean is right after one partial excitation; a second one
-  cannot know which part the first took. The error lives in the sub-cells that straddle a slab
-  boundary, one layer of `phantom dz / q` per boundary (0.125 mm on a 1 mm phantom at the
-  default, a fortieth of a 5 mm slab). Deciding membership by the sub-cell's centre instead was
-  rejected: it turns a slow drift into rare whole-layer jumps, each a spurious dip of a few
-  percent.
-- **Rotation.** Ignoring a sub-cell's tilt misplaces the slab boundary inside the voxels it
-  crosses by up to `(phantom in-plane voxel size) x sin(angle) / 2`, about 0.01 mm per degree on
-  a 1 mm phantom. Subdividing z does not reduce this. Where a rotation tilts a slab across many
-  voxels the slab's shape is followed voxel by voxel; only each voxel's own edge is approximate.
+  as long as no voxel exceeds its eight pieces.
+- **Merging when full.** The averaging falls on the thin slivers the stack's end voxels collect
+  under a drift, which are outside the stack and are excited again only if the motion returns.
+  The first draft's equal sub-cells, averaged when partly excited, biased a static head by about
+  0.6% of a slice's signal wherever slabs cut voxels (the implementation's first test showed it);
+  the pieces replaced them.
+- **Rotation.** Ignoring a voxel's tilt misplaces the slab boundary inside the voxels it crosses
+  by up to `(phantom in-plane voxel size) x sin(angle) / 2`, about 0.01 mm per degree on a 1 mm
+  phantom. Where a rotation tilts a slab across many voxels the slab's shape is followed voxel by
+  voxel; only each voxel's own edge is approximate.
 - **Two kernels.** The tissue is moved by trilinear interpolation of 5 mm simulation slices and
   corrected with a box overlap binned to the nearest in-plane cell. A through-plane shift of a
   tenth of a slab reaches the image as a 10% blend of the neighbouring slice plus a correction
@@ -363,21 +369,16 @@ signal changes from volume to volume. Both consumers add `num`: `aslscan` with `
   box-averaged to the acquisition grid, in the units of the tissue signal before the echo-time,
   physiological and dropout factors. Zero means no effect. It is a difference and not a ratio,
   so it is defined where suppression nulls the tissue.
-- `AslscanSimulation.Motion` gains, besides part A's keys, `SpinHistory`: `{ "Model": "box-slab-subcell-correction", "SliceProfile": "box",
-  "SlabThickness": <mm>, "ZSubcells": q, "Compartments": "tissue", "Reference":
-  "longitudinal::tissue_mz" }`.
+- `AslscanSimulation.Motion` gains, besides part A's keys, `SpinHistory`: `{ "Model":
+  "box-slab-piecewise-correction", "SliceProfile": "box", "SlabThickness": <mm>, "MaxPieces": 8,
+  "Merges": <count>, "Compartments": "tissue", "Reference": "longitudinal::tissue_mz" }`.
 
 ## Cost
 
-For the motivating run (40 volumes, 20 slices, a 197 x 233 x 100 phantom at 1 mm): 800
-excitations, each touching one slab of about 230 000 voxels at 8 sub-cells, so some 1.5 x 10^9
-recoveries, and a state of 12 bytes per sub-cell over the tissue voxels (a few hundred megabytes
-at most). Neither figure has been measured. Sub-cells of a voxel almost always share `t`, so the
-recovery can be evaluated once per distinct value. The plan measures the cost on this run before
-anything else is built on it, and the budget is that it stays under a minute. If it does not,
-the levers are fewer sub-cells and tracking only the tissue that ever enters the stack. Falling
-back to the closed form for "unchanged" volumes is not one: a volume after a disturbance still
-carries it.
+Measured on 2026-10-17 (plan, Task 6) on the motivating size: a 197 x 233 x 100 source with a
+third of the voxels tracked, slabs 128 x 136 x 20 of 5 mm, 800 excitations of a slow drift with a
+small rotation. The engine took 2.8 s under `par` (28 threads) and the whole test process peaked at
+545 MB. The budget was one minute.
 
 ---
 
@@ -463,7 +464,7 @@ takes a weight per call (see "Where it lives"): for compartment `c` in volume `v
 source cell is that compartment's signal there divided by its reference magnetization
 `1 - exp(-TR/T1_c)`. `num` is then the signal correction itself, and it is added to the
 compartment's image at the shot's slices after the geometry. The engine runs once per
-compartment, every signal-grid cell tracked with `q` sub-cells along z (default 8).
+compartment, every signal-grid cell tracked.
 
 **Refusals.** Spin history is refused without `T1`s or a repetition time; without events that
 jump or a motion trace; with `Protocol.head` (five compartments, three `T1`s); and with any run
@@ -475,9 +476,9 @@ block-averaged from the signal grid to the acquired grid, in signal units; zero 
 `Simulation.spin_history` holds it in Python, and `Dataset` writes it under
 `derivatives/trxscan`. The command line writes `<out>_desc-spinHistory.nii.gz`.
 
-With a source voxel as thick as a slice, the box overlap is resolved to an eighth of a slice:
-coarser than `aslscan`'s 1 mm phantom, and sufficient for jumps of a millimetre or more on 1.7 to
-2 mm diffusion slices.
+A source voxel there is as thick as a slice. The pieces keep the box overlap exact along z
+regardless, but each piece has one in-plane position (its voxel's), so the correction's in-plane
+detail is the signal grid's.
 
 ## Landing
 
@@ -507,16 +508,16 @@ profiles, cross-talk without motion, the blood).
   the multi-echo and the Hadamard series; `"slice"` with `random`, a Look-Locker series on the new
   path, the new keys with a 3D readout, and duplicate events in a file are refused; the sidecar
   of a P3-path run is byte-identical.
-- **Part B, engine** — a static head gives a correction below `1e-6` of the tissue signal on an
-  aligned grid, with and without suppression pulses and presaturation, and below `1e-3` on a grid
-  whose slabs cut phantom voxels. In-plane motion of any size gives the same. In uniform tissue,
-  a through-plane jump of a whole number of sub-cells, a fraction `f` of the slab, toward the
-  slab excited next scales that slab's tissue (reference plus correction, summed over the slab)
-  by `1 - f (1 - (1 - exp(-dt/T1)) / (1 - exp(-TR/T1)))`: 0.9031 for `f = 0.1`, `dt = 40 ms`,
-  and 0.9268 for `dt = 0.4 s`. The opposite jump leaves the skipped tenth at `0.9990 M0` in the
-  next volume, and at the static value when that volume is presaturated. The jump's dip is the
-  same with and without presaturation. A slow through-plane drift gives a correction that varies
-  smoothly, with no steps at sub-cell crossings. Each refusal names its condition.
+- **Part B, engine** — a static head gives a correction below `1e-6` of the tissue signal, on
+  aligned slabs and on slabs that cut the voxels, with and without presaturation. In-plane motion
+  of any size gives the same. In uniform tissue, a through-plane jump of a fraction `f` of the
+  slab toward the slab excited next scales that slab's tissue (reference plus correction, summed
+  over the slab) by `1 - f (1 - (1 - exp(-dt/T1)) / R)`, `R` the reference: 0.9031 for `f = 0.1`,
+  `dt = 40 ms` and `R = 1 - exp(-TR/T1)`, and the same form against the presaturated reference.
+  The slab after it, at the same pose, holds a tenth last excited a repetition plus `dt` ago. The
+  opposite jump leaves the skipped tenth at `0.9990 M0` in the next volume, and at the static value
+  when that volume is presaturated. A slow through-plane drift gives a correction that varies
+  smoothly, with no merges. Each refusal names its condition.
 - **Part C** — after the pin moves and before any TRXScan source changes, the re-sync baselines
   are identical. With `--mb > 1`, `--slice-order interleaved` and no new flag, outputs are
   identical to the pinned release, in the CLI and in Python. `--mb 1 --dropout-rate` drops single

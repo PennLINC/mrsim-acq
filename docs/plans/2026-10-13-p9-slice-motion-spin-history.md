@@ -73,7 +73,7 @@ the user's uncommitted spiral edits and are not touched.
 | mrsim-acq | `src/motion.rs` | `slice_schedule_from_times`, `resample_slices_by_matrix`, `apply_shot_transforms`, `sample_trajectory`, `Pose::from_matrix` |
 | mrsim-acq | `src/spin_history.rs` | New, pure std: the engine |
 | mrsim-acq | `src/lib.rs` | `pub mod spin_history;` |
-| aslscan | `src/protocol.rs` | `within_volume_sampling`, `events`, `spin_history`, `spin_history_z_subcells`; the path decision; the lifted and added refusals |
+| aslscan | `src/protocol.rs` | `within_volume_sampling`, `events`, `spin_history`; the path decision; the lifted and added refusals |
 | aslscan | `src/series/shots.rs` | New: schedule, shot times, shot transforms and attenuations, shared by `series.rs` and `series/p6.rs` |
 | aslscan | `src/series.rs`, `src/series/p6.rs` | Dispatch to the new path; spin-history correction (`series.rs` only) |
 | aslscan | `src/bids.rs`, `src/bin/aslscan.rs` | `desc-motionShots_gt.tsv`, `desc-spinHistory_gt.nii.gz`, sidecar keys, run summary |
@@ -281,15 +281,30 @@ voxels of different `T1` and weight binned to one cell give the weight-sum of th
 with a third of the voxels in a class, 8 sub-cells, slabs 128 x 136 x 20, 800 excitations) and
 times it under `par`.
 
-- [ ] Write the module and the tests.
-- [ ] Run the measurement. Record time and peak memory here. **If it is over 60 s or over 2 GiB,
+- [x] Write the module and the tests.
+- [x] Run the measurement. Record time and peak memory here. **If it is over 60 s or over 2 GiB,
       stop and report before Task 7**, with the two levers the spec names measured (fewer
       sub-cells; tracking only tissue that enters the stack).
-- [ ] The golden record passes unchanged. Commit: `feat: spin_history — box-slab sub-cell engine`.
+- [x] The golden record passes unchanged. Commit: `feat: spin_history — box-slab piecewise engine`.
+
+**Done 2026-10-17, with one design change.** The first test run showed the equal sub-cells with
+mean-field mixing bias a static head by 0.57% of a slice's signal where slabs cut the voxels (the
+spec had estimated about 0.1%): a sub-cell excited in part by one slab and in part by the next
+mixes the two states at the second read. The engine now keeps each voxel's z extent as exact
+pieces (split at slab edges, merged when equal; at most `MAX_PIECES = 8`, the closest thin pair
+merged beyond), so there is no sub-cell count: `SpinHistory::new(source, slabs, pulses)`, and
+`spin_history_z_subcells` (Task 7) is dropped. The spec was updated to match. Every engine test
+passes, the static ones to `1e-6` on aligned and cut grids, and the closed forms (0.9031, the
+presaturated dip, the slab after the jump, the skipped tenth at `0.9990`) to `1e-5`.
+
+Measurement (`measure_the_motivating_series`, release, `par`, 28 threads): 2.8 s for the 800
+excitations (a slow drift with a 0.5 and 0.3 degree rotation), 80 ms to build, peak RSS 545 MB
+for the whole test process. Merges occur only at the ends of the slice stack under the drift (one
+sliver per volume carried out of the stack); the merge picks those slivers.
 
 ### Task 7: `aslscan` protocol
 
-`[motion] spin_history` and `spin_history_z_subcells` (default 8, at least 1). The refusals of
+`[motion] spin_history`. The refusals of
 the spec's "What it accepts", each naming its condition: a 3D readout; a contrast other than
 spin echo; any row that is not `control` or `label`; rows whose preparation differs (reuse the
 `prep_key` comparison of `series.rs:841`, moved into `protocol`); more than one echo;
@@ -420,7 +435,7 @@ unchunked one two slices or more from every slab edge.
 
 ### Task 13: spin history
 
-Library: `spin_history_correction(comp, sig_grid, t1_s: [f64; 3], tr_s, plan, subcells) ->
+Library: `spin_history_correction(comp, sig_grid, t1_s: [f64; 3], tr_s, plan) ->
 Vec<f32>`. The source voxels are the signal-grid cells, every one tracked. The engine holds one
 class per voxel and the three compartments overlap in every cell, so it runs once per
 compartment with that compartment's `T1` everywhere. Per volume, each `excite` replaces the
@@ -497,7 +512,7 @@ not the mean of the two; each refusal names what is missing.
   single-band run that passed the flag was silently unaffected and will now drop slices.
 - **TRXScan's drawn events never touch b=0 volumes** (`dropout_events` skips `b < 50`), so they
   give b=0 volumes no jump and no spin history. An events file can target them.
-- **Cost.** Task 6 decides whether the default sub-cell count stands.
+- **Cost.** Settled by Task 6: 2.8 s on the motivating size.
 
 ## Codex adversarial review of Part C and this plan (2026-10-14)
 
