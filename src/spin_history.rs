@@ -117,6 +117,24 @@ impl Pieces {
         self.n += 1;
         true
     }
+    /// Make `u0` and `u1` edges (each inside `(0, 1)` or ignored), merging pieces first when the
+    /// voxel lacks room: the edges this cut needs are protected from those merges and the room
+    /// still needed is recounted after each one. Returns the number of merges.
+    fn cut(&mut self, u0: f32, u1: f32, t1: f64, pulses: &[Pulse]) -> u64 {
+        let needs = |pc: &Pieces| [u0, u1].iter().filter(|&&u| u > 0.0 && u < 1.0 && !pc.has_edge(u)).count();
+        let mut merges = 0;
+        while self.n as usize + needs(self) > MAX_PIECES {
+            merges += 1;
+            merge_closest(self, t1, pulses, &[u0, u1]);
+        }
+        for u in [u0, u1] {
+            if u > 0.0 && u < 1.0 {
+                let ok = self.split(u);
+                debug_assert!(ok, "room was made for the split");
+            }
+        }
+        merges
+    }
     /// Whether `u` is already an edge (a piece's start), so splitting there needs no room.
     fn has_edge(&self, u: f32) -> bool {
         (0..self.n as usize).any(|i| self.start[i] == u)
@@ -355,17 +373,7 @@ impl SpinHistory {
                         if u1 > u0 {
                             // make room for both new edges before splitting, so a merge can never
                             // remove an edge this excitation has just made
-                            let needed = [u0, u1].iter().filter(|&&u| u > 0.0 && u < 1.0 && !pc.has_edge(u)).count();
-                            while pc.n as usize + needed > MAX_PIECES {
-                                merges += 1;
-                                merge_closest(pc, t1, pulses);
-                            }
-                            for u in [u0, u1] {
-                                if u > 0.0 && u < 1.0 {
-                                    let ok = pc.split(u);
-                                    debug_assert!(ok, "room was made for the split");
-                                }
-                            }
+                            merges += pc.cut(u0, u1, t1, pulses);
                             let mut cache: Option<(f32, f64, f64)> = None;
                             for i in 0..pc.n as usize {
                                 let (s, e) = (pc.start[i], pc.end(i));
@@ -422,14 +430,17 @@ impl SpinHistory {
 /// weighted by the pair's reduced length `la lb / (la + lb)`, into their length-weighted mean. It
 /// picks thin slivers first: under a drift, the voxels at the ends of the slice stack collect one
 /// sliver per volume, carried out of the stack and never excited again.
-fn merge_closest(pc: &mut Pieces, t1: f64, pulses: &[Pulse]) {
+fn merge_closest(pc: &mut Pieces, t1: f64, pulses: &[Pulse], protect: &[f32]) {
     let n = pc.n as usize;
     let len = |i: usize| (pc.end(i) - pc.start[i]) as f64;
     let cost = |i: usize| {
         let d = (pc.mz[i] - pc.mz[i - 1]).abs() as f64 + (pc.t[i] - pc.t[i - 1]).abs().min(1e6);
         d * len(i) * len(i - 1) / (len(i) + len(i - 1))
     };
-    let best = (1..n).min_by(|&a, &b| cost(a).total_cmp(&cost(b))).expect("a full voxel has pieces to merge");
+    // merging pieces i-1 and i removes the edge at start[i]: never a protected one (a full voxel
+    // has seven edges and at most two are protected, so a candidate remains)
+    let best = (1..n).filter(|&i| !protect.contains(&pc.start[i]))
+        .min_by(|&a, &b| cost(a).total_cmp(&cost(b))).expect("a full voxel has an unprotected edge to merge");
     let (la, lb) = (pc.end(best - 1) - pc.start[best - 1], pc.end(best) - pc.start[best]);
     let (ta, tb) = (pc.t[best - 1], pc.t[best]);
     // both pieces brought to the later time (recovery and the pulses between) before averaging
@@ -618,8 +629,27 @@ mod tests {
             p.mz[i] = i as f32;
         }
         assert!(!p.split(0.99), "full");
-        merge_closest(&mut p, 1.0, &[]);
+        merge_closest(&mut p, 1.0, &[], &[]);
         assert_eq!(p.n as usize, MAX_PIECES - 1);
+    }
+
+    /// Final-review fix: a merge made to find room never removes an edge the cut needs. Eight
+    /// pieces at multiples of 0.125 (pieces 0 and 1 the same state, so the cheapest merge would
+    /// remove the edge at 0.125); a cut over [0.125, 0.6875) needs one new edge but must keep 0.125.
+    #[test]
+    fn a_cut_keeps_its_existing_edges() {
+        let mut p = Pieces::relaxed();
+        for i in 1..MAX_PIECES {
+            assert!(p.split(i as f32 / 8.0));
+        }
+        for i in 0..MAX_PIECES {
+            p.mz[i] = if i < 2 { 0.0 } else { 0.1 * i as f32 };
+            p.t[i] = if i < 2 { 1.0 } else { i as f64 };
+        }
+        let merges = p.cut(0.125, 0.6875, 1.0, &[]);
+        assert_eq!(merges, 1);
+        assert!(p.has_edge(0.125) && p.has_edge(0.6875), "{:?}", &p.start[..p.n as usize]);
+        assert_eq!(p.n as usize, MAX_PIECES);
     }
 
     /// Review fix: a merge brings both pieces to the later time first (recovery, pulses), then
@@ -631,7 +661,7 @@ mod tests {
         p.mz = [0.0; MAX_PIECES];
         p.t[0] = 0.0;
         p.t[1] = 4.6;
-        merge_closest(&mut p, 1.33, &[]);
+        merge_closest(&mut p, 1.33, &[], &[]);
         assert_eq!(p.n, 1);
         assert_eq!(p.t[0], 4.6);
         let want = 0.5 * (1.0 - (-4.6f64 / 1.33).exp());
@@ -643,7 +673,7 @@ mod tests {
         q.mz = [0.0; MAX_PIECES];
         q.t[0] = 0.0;
         q.t[1] = 4.6;
-        merge_closest(&mut q, 1.33, &[Pulse::Saturation { t: 4.0 }]);
+        merge_closest(&mut q, 1.33, &[Pulse::Saturation { t: 4.0 }], &[]);
         let want = 0.5 * (1.0 - (-0.6f64 / 1.33).exp());
         assert!((q.mz[0] as f64 - want).abs() < 1e-6, "{} vs {want}", q.mz[0]);
     }
