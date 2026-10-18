@@ -689,3 +689,10 @@ Read-only `codex exec` over the three diffs, 9 findings. Each was checked agains
 The review confirmed the transform order, the `P(t) == P_v -> J` shortcut, the clocks on every path, and that every timed sampling path goes through `Trace::pose_at`.
 
 **A process slip, recorded so it is not repeated.** A scratch-to-worktree push overwrote the committed spec and plan with the scratch copy's older versions. They were restored from `03fe1cf`, and the scratch copy now carries them.
+
+### Ordinary Codex review (final pass), 2026-10-18
+
+Three findings, all valid, all fixed:
+- **Coverage compared times exactly.** Four volumes at TR 1.1 s put the last reference at 3.3000000000000003 s against a trace ending at 3.3 s, and the run was refused. `Trace::check_covers` now allows `1e-9 x max(1, |t|)` s at each end; the sampler holds the endpoint there.
+- **TRXScan's shots table at 90 degrees of pitch.** `write_motion_shots` could write angles that did not reproduce the pose (a trajectory at (20, 45, 0) degrees with a (0, 45, 0) jump). It now checks the reconstruction (1e-9) and refuses. The aslscan 2D table (P9's writer) has the same latent edge and is left as it was.
+- **The first-shot-offset test could not fail.** It now records the poses `_core.signal_moving` receives and checks them against `3 v + 0.2` s.
