@@ -224,6 +224,136 @@ pub fn load_motion_tsv(path: &std::path::Path) -> Result<Vec<Pose>, String> {
     Ok(poses)
 }
 
+/// A timed motion trace (P10): rigid poses at sample times, seconds on the caller's acquisition
+/// clock. Read with [`load_motion_trace`]; the pose at any time is [`sample_trajectory`] over the
+/// samples ([`Trace::pose_at`]). Whether the trace covers the times a run samples depends on the
+/// run, so [`Trace::check_covers`] is the caller's to call with them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trace {
+    /// Sample times (s), strictly increasing.
+    pub times: Vec<f64>,
+    pub poses: Vec<Pose>,
+}
+
+/// The clock of a trace file without a `time` column (a BIDS-physio-style sidecar's
+/// `SamplingFrequency` and `StartTime`): sample `i` at `start_s + i / frequency_hz`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sampling {
+    pub frequency_hz: f64,
+    pub start_s: f64,
+}
+
+impl Trace {
+    /// The trace's pose at `t`.
+    pub fn pose_at(&self, t: f64) -> Pose {
+        sample_trajectory(&self.times, &self.poses, t)
+    }
+
+    /// The longest interval between two samples (s).
+    pub fn max_interval(&self) -> f64 {
+        self.times.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max)
+    }
+
+    /// Every one of `times` inside the trace's span, or an error naming the span `what` needs and the
+    /// trace's. Never extrapolate: holding the last pose past the trace would invent stillness.
+    pub fn check_covers(&self, times: &[f64], what: &str) -> Result<(), String> {
+        if times.is_empty() {
+            return Ok(());
+        }
+        let (lo, hi) = times.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &t| (a.min(t), b.max(t)));
+        let (first, last) = (self.times[0], self.times[self.times.len() - 1]);
+        if lo < first || hi > last {
+            return Err(format!(
+                "{what}: the run samples the trace from {lo} s to {hi} s, but it spans {first} s to {last} s; a timed \
+                 trace must cover every time it is sampled at (it is never extrapolated)"));
+        }
+        Ok(())
+    }
+}
+
+/// Whether a motion TSV's header has a `time` column (P10): with the caller's sidecar read, how a
+/// timed trace is told from an untimed one before either loader runs.
+pub fn has_time_column(path: &std::path::Path) -> Result<bool, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let header = text.lines().map(|l| l.trim_end_matches('\r')).find(|l| !l.trim().is_empty()).unwrap_or("");
+    Ok(header.split('\t').any(|c| c.trim() == "time"))
+}
+
+/// Read a timed motion trace (P10): the columns `trans_x/y/z` (mm) and `rot_x/y/z` (radians, held
+/// in degrees) of [`load_motion_tsv`], with times from a `time` column (s) or from `sampling`, never
+/// both and never neither. Strict, unlike [`load_motion_tsv`], which stays the reader of untimed
+/// traces: every cell present and finite (`n/a` is 0 in the six pose columns), times strictly
+/// increasing, at least two samples. The rotations are converted with [`load_motion_tsv`]'s
+/// arithmetic, so the same cells give the same poses bit for bit.
+pub fn load_motion_trace(path: &std::path::Path, sampling: Option<Sampling>) -> Result<Trace, String> {
+    let what = path.display().to_string();
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {what}: {e}"))?;
+    let mut lines = text.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.trim().is_empty());
+    let header: Vec<&str> = lines.next().ok_or_else(|| format!("{what}: empty TSV"))?.split('\t').map(str::trim).collect();
+    let find = |name: &str| header.iter().position(|&c| c == name);
+    let mut idx = [0usize; 6];
+    for (k, name) in ["trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z"].iter().enumerate() {
+        idx[k] = find(name).ok_or_else(|| format!("{what}: column '{name}' missing"))?;
+    }
+    let time_col = find("time");
+    match (time_col, sampling) {
+        (Some(_), Some(_)) => {
+            return Err(format!("{what}: a time column and a sampling rate (a sidecar SamplingFrequency): two clocks for one trace"))
+        }
+        (None, None) => return Err(format!("{what}: no time column and no sampling rate; not a timed trace")),
+        (None, Some(s)) => {
+            if !(s.frequency_hz.is_finite() && s.frequency_hz > 0.0) {
+                return Err(format!("{what}: SamplingFrequency {} is not a positive number", s.frequency_hz));
+            }
+            if !s.start_s.is_finite() {
+                return Err(format!("{what}: StartTime {} is not finite", s.start_s));
+            }
+        }
+        (Some(_), None) => {}
+    }
+    let names = ["trans_x", "trans_y", "trans_z", "rot_x", "rot_y", "rot_z"];
+    let deg = 180.0 / std::f64::consts::PI;
+    let (mut times, mut poses) = (Vec::new(), Vec::new());
+    for (i, line) in lines.enumerate() {
+        let cells: Vec<&str> = line.split('\t').map(str::trim).collect();
+        let cell = |c: usize, name: &str| cells.get(c).copied().ok_or_else(|| format!("{what} row {i}: column {name} is missing"));
+        let mut v = [0.0f64; 6];
+        for k in 0..6 {
+            let s = cell(idx[k], names[k])?;
+            v[k] = if s == "n/a" {
+                0.0
+            } else {
+                match s.parse::<f64>() {
+                    Ok(x) if x.is_finite() => x,
+                    _ => return Err(format!("{what} row {i}: {} = {s:?} is not a finite number or n/a", names[k])),
+                }
+            };
+        }
+        let t = match (time_col, sampling) {
+            (Some(c), _) => {
+                let s = cell(c, "time")?;
+                match s.parse::<f64>() {
+                    Ok(x) if x.is_finite() => x,
+                    _ => return Err(format!("{what} row {i}: time = {s:?} is not a finite number")),
+                }
+            }
+            (None, Some(sm)) => sm.start_s + i as f64 / sm.frequency_hz,
+            (None, None) => unreachable!("refused above"),
+        };
+        if let Some(&prev) = times.last() {
+            if t <= prev {
+                return Err(format!("{what} row {i}: time {t} s does not increase (the row before is at {prev} s)"));
+            }
+        }
+        times.push(t);
+        poses.push(Pose { trans_mm: [v[0], v[1], v[2]], rot_deg: [v[3] * deg, v[4] * deg, v[5] * deg] });
+    }
+    if times.len() < 2 {
+        return Err(format!("{what}: a timed trace needs at least two samples, it has {}", times.len()));
+    }
+    Ok(Trace { times, poses })
+}
+
 /// Trilinear sample of `vol` (layout `x + nx*(y + ny*z)`) at continuous voxel coordinate `p`;
 /// zero outside the grid. Public because consumers' own warps (TRXScan's `gnl`) use it.
 #[inline]
@@ -894,6 +1024,89 @@ mod tests {
         let c = Pose { trans_mm: [9.0, 0.0, 0.0], ..Pose::IDENTITY };
         assert_eq!(sample_trajectory(&[0.0, 1.0, 1.0, 2.0], &[a, b, c, c], 1.0), c);
         assert_eq!(sample_trajectory(&[], &[], 1.0), Pose::IDENTITY);
+    }
+
+    fn trace_file(name: &str, text: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("mrsim_acq_trace_{name}_{}.tsv", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn timed_trace_reads_a_time_column_with_load_motion_tsvs_poses() {
+        let path = trace_file("col",
+            "time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n\
+             -0.5\t0\t0\t0\t0\t0\t0\n\
+             0.25\t-0.5\t0.25\tn/a\t0.0174533\t0\t0.06\n\
+             1\t1\t2\t3\t0.1\t-0.2\t0.3\n");
+        assert!(has_time_column(&path).unwrap());
+        let tr = load_motion_trace(&path, None).unwrap();
+        assert_eq!(tr.times, vec![-0.5, 0.25, 1.0]);
+        // the same cells through the untimed reader: the same poses, bit for bit
+        assert_eq!(tr.poses, load_motion_tsv(&path).unwrap());
+        assert_eq!(tr.poses[1].trans_mm, [-0.5, 0.25, 0.0]);
+        assert_eq!(tr.max_interval(), 0.75);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn timed_trace_takes_a_sampling_rate_and_start() {
+        let path = trace_file("rate", "trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n0\t0\t0\t0\t0\t0\n1\t0\t0\t0\t0\t0\n2\t0\t0\t0\t0\t0\n");
+        assert!(!has_time_column(&path).unwrap());
+        let tr = load_motion_trace(&path, Some(Sampling { frequency_hz: 4.0, start_s: 0.0 })).unwrap();
+        assert_eq!(tr.times, vec![0.0, 0.25, 0.5]);
+        let tr = load_motion_trace(&path, Some(Sampling { frequency_hz: 4.0, start_s: -1.0 })).unwrap();
+        assert_eq!(tr.times, vec![-1.0, -0.75, -0.5]);
+        assert_eq!(tr.poses[2].trans_mm, [2.0, 0.0, 0.0]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn timed_trace_refusals_name_their_condition() {
+        let h = "time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n";
+        let rate = Some(Sampling { frequency_hz: 10.0, start_s: 0.0 });
+        let cases: [(&str, String, Option<Sampling>, &str); 9] = [
+            ("both", format!("{h}0\t0\t0\t0\t0\t0\t0\n1\t0\t0\t0\t0\t0\t0\n"), rate, "two clocks"),
+            ("neither", "trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n0\t0\t0\t0\t0\t0\n0\t0\t0\t0\t0\t0\n".into(), None, "not a timed trace"),
+            ("flat", format!("{h}0\t0\t0\t0\t0\t0\t0\n0\t0\t0\t0\t0\t0\t0\n"), None, "does not increase"),
+            ("back", format!("{h}1\t0\t0\t0\t0\t0\t0\n0.5\t0\t0\t0\t0\t0\t0\n"), None, "does not increase"),
+            ("nan_t", format!("{h}0\t0\t0\t0\t0\t0\t0\nNaN\t0\t0\t0\t0\t0\t0\n"), None, "time = \"NaN\""),
+            ("inf", format!("{h}0\t0\t0\t0\t0\t0\t0\n1\tinf\t0\t0\t0\t0\t0\n"), None, "trans_x = \"inf\""),
+            ("short", format!("{h}0\t0\t0\t0\t0\t0\t0\n1\t0\t0\n"), None, "column trans_z is missing"),
+            ("one", format!("{h}0\t0\t0\t0\t0\t0\t0\n"), None, "at least two samples"),
+            ("nocol", "time\ttrans_x\n0\t0\n1\t0\n".into(), None, "column 'trans_y' missing"),
+        ];
+        for (name, text, s, want) in cases {
+            let path = trace_file(name, &text);
+            let e = load_motion_trace(&path, s).unwrap_err();
+            assert!(e.contains(want), "{name}: {e}");
+            let _ = std::fs::remove_file(&path);
+        }
+        let path = trace_file("hz", "trans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n0\t0\t0\t0\t0\t0\n0\t0\t0\t0\t0\t0\n");
+        for hz in [0.0, -1.0, f64::NAN] {
+            let e = load_motion_trace(&path, Some(Sampling { frequency_hz: hz, start_s: 0.0 })).unwrap_err();
+            assert!(e.contains("SamplingFrequency"), "{e}");
+        }
+        let e = load_motion_trace(&path, Some(Sampling { frequency_hz: 1.0, start_s: f64::INFINITY })).unwrap_err();
+        assert!(e.contains("StartTime"), "{e}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_trace_is_its_samples_at_their_times_and_refuses_what_it_does_not_cover() {
+        let path = trace_file("cover",
+            "time\ttrans_x\ttrans_y\ttrans_z\trot_x\trot_y\trot_z\n0\t0\t0\t0\t0\t0\t0\n0.04\t0.3\t0\t0\t0\t0\t0.01\n0.08\t0.5\t0\t0\t0\t0\t0\n");
+        let tr = load_motion_trace(&path, None).unwrap();
+        for (t, p) in tr.times.iter().zip(&tr.poses) {
+            assert_eq!(tr.pose_at(*t), *p);
+        }
+        assert!(tr.check_covers(&[0.0, 0.02, 0.08], "run").is_ok());
+        assert!(tr.check_covers(&[], "run").is_ok());
+        for bad in [[-0.01, 0.05], [0.0, 0.09]] {
+            let e = tr.check_covers(&bad, "overlay motion.trajectory x.tsv").unwrap_err();
+            assert!(e.contains("overlay motion.trajectory x.tsv") && e.contains("spans 0 s to 0.08 s") && e.contains("never extrapolated"), "{e}");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
