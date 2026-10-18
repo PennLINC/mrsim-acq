@@ -552,6 +552,47 @@ failed: slice 0 of volume 12 sat at 0.16-0.24 in every timed run.
   1e-9 mm and 1e-9 degrees. The spec's part A and "Decisions deferred" record it.
 - **Not changed:** the kernel's edge itself, because changing it would change P3/P9 outputs.
 
+**Task 0 regress.** `regress_identity.sh f3c0593 ad1f081` exits 0: 37 cases executed under
+`cli,kspace,par` and 35 under `cli`, 2 skipped (they need `kspace`), all identical. The self-test
+started on the committed tree (aslscan `a3c1890`, mrsim-acq `a984b88`).
+
+**Task 6.**
+- **Segment times**, confirmed from the source:
+  - spin echo (`series.rs`): `row_start[v] + s x TR + t` (the protocol clock steps `NumberShots`
+    repetitions per row);
+  - P6: `sched.preps_of(v)[s].start_s + t`;
+  - the gradient-echo train (`ge3d.rs`): the same, since the train starts at the row's signal time
+    after each preparation.
+- **One helper for all three builders:** `shots::segment_poses` returns each segment's pose relative
+  to the volume's (`J . P(t) . P_v^-1`) and its absolute pose (`J . P(t)`). Where `P(t)` is `P_v`
+  exactly, the relative pose is `J`, with no matrix arithmetic. So a trace held still within a
+  volume is the volume-sampled run bit for bit, which all three tests check with a non-identity
+  rotation.
+- **Deviation from the plan:** the relative pose is decomposed with `Pose::from_matrix` and resampled
+  by the builders' existing `resample_by_pose`, not by `resample_slices_by_matrix`. That keeps one
+  set-building code path, at rounding-level cost. The legacy path still never enters the new branch.
+- `distinct_moved` and `check_segment_memory` (all volumes' sets, P6's tissue-only twins counted).
+- `Protocol.segment_images_gib` (`[images] max_memory_gib`, accepted on the 3D `"shot"` path,
+  default 4).
+- `SeriesOutput.segment_shots` (and `Ge3dBuild.segment_shots`); the writer emits the table with
+  `slices` `n/a`.
+- Sidecar keys `SegmentTransform`, two `Approximations` and a `GroundTruth` entry.
+- Coverage queries every segment.
+- Tests: three new (`series.rs` GRASE, P6 Hadamard GRASE with leakage twins, `ge3d` train).
+  Library 234, end to end 60/63.
+
+**Task 7.** Criterion 4 runs on `asl005` with its P5 overlay (four segments, 30 partitions,
+`phantom-3t-z120`), not on `p5_grase`. On the crop phantom `p5_grase` has 2 partitions, so the
+spread test was impossible: the larger one always holds at least half the energy (it measured
+0.52). With a 2 mm step at segment 2 of volume 1:
+- only volume 1 changes (0.271 of the peak);
+- the largest partition holds 0.22 of the difference energy;
+- the sidecar names the approximation;
+- every run validates.
+
+The end partition's share is the resampler's edge again (spec, "Decisions deferred"). Acceptance
+criteria 2-4 all pass (`work/acc-t7b`).
+
 ### Codex review of the spec and plan, 2026-10-17
 
 Read-only `codex exec`, 11 findings. Each was checked against the source; all held, and all were
