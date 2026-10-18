@@ -669,3 +669,23 @@ applied:
 | 9 | medium | Python's `poses` argument conflated volume and shot poses; the utilities break on timed traces | `lib.rs:654`, `motion.rs:134-139`, `motion.py:209-233` | `volume_poses` kept, `shot_poses` added with shapes; utilities take `tr_s` |
 | 10 | medium | `MotionMode` is `mrsim-acq`'s and built by TRXScan's binding; changing it breaks Task 1's additive contract | `protocol.rs:18`, `motion.rs:38`, `lib.rs:1033` | Trace kept in `MotionSpec`; readers routed through `volume_poses` |
 | 11 | low | The substring check can miss an escaped `SamplingFrequency` key | `trxscan.rs:543` | `serde_json` under TRXScan's `cli`; real parsing |
+
+### Codex review of the implementation, 2026-10-18
+
+Read-only `codex exec` over the three diffs, 9 findings. Each was checked against the source; all held, and all were fixed:
+
+| # | Severity | Finding | Fix |
+|---|---|---|---|
+| 1 | medium | Python slab/chunk runs: the re-simulation rotates about the slab's centre (`compartments.rs:879`), the per-shot remainder about the full stack's | `Motion(sampling="shot")` refused on anything but the whole stack; the underlying chunked-motion centre bug predates P10 and is filed as its own task |
+| 2 | medium | Shot sampling without `ShotEvents` silently dropped `Artifacts.dropout` | Refused, naming `ShotEvents(rate=...)` |
+| 3 | medium | Python reference poses ignored a nonzero first-shot offset (`slice_order="protocol"`) | The shot schedule is resolved before the re-simulation; its earliest offset places the reference poses and the untimed nodes |
+| 4 | medium | CLI untimed shot sampling interpolated over the raw rows while the re-simulation pads with the identity | `MotionInput.per_volume`, exactly one pose per volume, for the sampling |
+| 5 | medium | 3D relative pose decomposition (`Pose::from_matrix`) is wrong at 90 degrees of pitch | `segment_poses` checks that the decomposition reproduces the matrix (1e-9) and refuses otherwise |
+| 6 | medium | The shot-motion bindings indexed `volume_poses` unchecked (panic on a wrong shape) | `poses_from_rows` in both; tests call the bindings themselves |
+| 7 | medium | Empty traces, NaN queries and `tr <= 0` reached a panic or a degenerate answer | `Trace::check_covers` refuses short traces and non-finite queries; `sample_poses` refuses non-finite queries; positive `--tr` and `tr_s` |
+| 8 | low | The loader did not check finiteness after generating times or converting rotations | Both checked |
+| 9 | low | The generator could write a one-sample or non-finite trace | `start`, sample count and times checked; a sidecar's `StartTime` too |
+
+The review confirmed the transform order, the `P(t) == P_v -> J` shortcut, the clocks on every path, and that every timed sampling path goes through `Trace::pose_at`.
+
+**A process slip, recorded so it is not repeated.** A scratch-to-worktree push overwrote the committed spec and plan with the scratch copy's older versions. They were restored from `03fe1cf`, and the scratch copy now carries them.
