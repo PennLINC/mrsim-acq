@@ -280,7 +280,10 @@ impl Trace {
         }
         let (lo, hi) = times.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &t| (a.min(t), b.max(t)));
         let (first, last) = (self.times[0], self.times[self.times.len() - 1]);
-        if lo < first || hi > last {
+        // the run's clock adds repetitions in floating point (4 x 1.1 s is 3.3000000000000003): a
+        // query that far past an end is that end ([`sample_trajectory`] holds it), not extrapolation
+        let slack = |x: f64| 1e-9 * x.abs().max(1.0);
+        if lo < first - slack(first) || hi > last + slack(last) {
             return Err(format!(
                 "{what}: the run samples the trace from {lo} s to {hi} s, but it spans {first} s to {last} s; a timed \
                  trace must cover every time it is sampled at (it is never extrapolated)"));
@@ -1140,6 +1143,9 @@ mod tests {
         assert!(tr.check_covers(&[], "run").is_ok());
         // implementation review: a query that is not a time, and a trace too short to cover anything
         assert!(tr.check_covers(&[0.01, f64::NAN], "run").unwrap_err().contains("not a time"));
+        // final review: the run's clock rounding at an end is the end, not extrapolation
+        assert!(tr.check_covers(&[0.0, 0.08 + 1e-15], "run").is_ok());
+        assert!(tr.check_covers(&[0.0, 0.08 + 1e-6], "run").is_err());
         let empty = Trace { times: Vec::new(), poses: Vec::new() };
         assert!(empty.check_covers(&[0.0], "run").unwrap_err().contains("at least two samples"));
         for bad in [[-0.01, 0.05], [0.0, 0.09]] {
