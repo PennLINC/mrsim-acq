@@ -577,9 +577,19 @@ Python, `Motion.timed` with numpy arrays does the same job.
      - every other volume matches the still run to `1e-4` of the peak.
 
      All reference poses are the identity, so the re-simulation is the still run's.
-   - **With spin history**, the nod volume's odd slices sit below their even neighbours by at
-     least 0.05. The next volume's odd/even difference is at most a quarter of the nod volume's,
-     the recovery a long TR allows, and it is reported rather than required to vanish.
+   - **With spin history**, compared against the same motion without it, so the geometry is
+     taken out:
+     - the nod volume's odd slices sit below their even neighbours by at least 0.05;
+     - the next volume echoes the comb with the opposite sign. Its even pass starts about 2.4 s
+       after the nod volume's displaced odd pass, so the tissue now in its even slices has had
+       half a repetition to recover. The tissue in its odd slices was skipped and has had one and
+       a half;
+     - the volumes after that are unchanged, because a whole volume of 90-degree excitations at
+       rest erases the history.
+
+     (Revised in Task 10. The draft compared against the still run, which mixes the geometry
+     in, and expected the next volume mostly recovered. Both were wrong. The reference run in
+     the context shows the same persistence into its volume 38.)
 
 ---
 

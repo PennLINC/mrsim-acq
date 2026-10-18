@@ -593,6 +593,64 @@ spread test was impossible: the larger one always holds at least half the energy
 The end partition's share is the resampler's edge again (spec, "Decisions deferred"). Acceptance
 criteria 2-4 all pass (`work/acc-t7b`).
 
+**Task 8** (TRXScan `eb6cfe6`).
+- `ShotPlan::with_shot_poses` (`new` calls it with `None`, so the seven existing call sites are
+  unchanged): `history = J . P(t)`, `geometry = J . P(t) . P_v^-1`, or exactly `J` where `P(t)`
+  is `P_v`.
+- `ShotPlan::shot_times`, `ShotPlan::pose` and a `center` field; `write_motion_shots`.
+- CLI:
+  - `--motion-sampling volume|shot` (requires `--motion`);
+  - `read_motion` detects timing first: `has_time_column`, and the sidecar parsed with
+    `serde_json`, now under the `cli` feature;
+  - an untimed trace keeps `load_motion_tsv`;
+  - a timed trace or shot sampling needs `--tr`;
+  - coverage is checked before the signal stage;
+  - `<out>_desc-motionShots.tsv` on every per-shot run.
+- Tests: one library test (geometry · P_v = history to 1e-12; held poses give `new` bit for bit;
+  the table round-trips) and one binary test (untimed lenient cells and row count, both timed
+  forms, an escaped key, `--tr`, coverage, two clocks, broken JSON, `requires`).
+- Gates: the re-sync baselines are identical (594, 177). The P9 set is identical on its 45 files,
+  with three files added (`*_desc-motionShots.tsv`).
+
+**Task 9** (TRXScan `dd8e6f8`).
+- `Motion.times`, `Motion.sampling`, `Motion.is_timed`, `Motion.timed(...)`.
+  - **Deviation from the spec:** the spec named the constructor `Motion.timed`. To keep that name,
+    the property became `is_timed`.
+- `from_confounds`: timed through `_core.load_motion_trace`, untimed as before.
+- `poses_for(..., tr_s=, offsets=)`, `shot_poses_for`, `resample` refusing a timed trace, and
+  `matrices`, `framewise_displacement` and `plot` taking `tr_s`.
+- `simulate`: the per-shot path runs for `sampling="shot"` without `ShotEvents` (in their default
+  order) and fills `Simulation.motion_shots`. The CLI-style and `Dataset` writers write it.
+- Bindings: `load_motion_trace`, `sample_poses`, `motion_shots_tsv`, and a `shot_poses` keyword on
+  both shot-motion bindings (flat `(n * n_shots, 6)`; refused without `volume_poses` or in the
+  wrong shape).
+- Tests: three new; pytest 68 passed.
+
+**Task 10.**
+- `docs/FEATURES.md`, `README.md` and `CLAUDE.md` describe timed traces and `--motion-sampling`,
+  and say plainly that the per-shot remainder is resampled, not re-simulated.
+- **Criterion 5**, scratchpad `c5_runs.sh` and `c5_check.py`, on the `trx-fig` multiband-4 grid.
+  A 100 Hz nod rises between volume 2's even and odd passes, holds through the odd pass, and is
+  back by 14.37 s.
+  - Shot times are exact.
+  - Without spin history, every volume but 2 equals the still run exactly. So do volume 2's
+    slices acquired before the nod, and its slices acquired off baseline differ (0.112 of the
+    peak).
+  - **Spin history, isolated** (with it against without):
+    - volume 2's odd slices sit 0.118 below the even ones;
+    - volume 3 echoes the comb with the opposite sign (even minus odd = -0.222): its even pass,
+      2.4 s after volume 2's displaced odd pass, finds that tissue under-recovered;
+    - volumes 0-1 and 4-5 are unchanged exactly. A volume of 90-degree excitations at rest erases
+      the history.
+- **The criterion as drafted failed and was wrong.**
+  - It compared against the still run, which mixes the geometry in.
+  - It expected the next volume mostly recovered, which the physics does not give. The reference
+    run persists the same way into its volume 38.
+  - The spec's criterion 5 is revised accordingly.
+- **Checked on the way:** the image change matches the written correction map. The map is in the
+  signal units before the acquisition (no scale, no T2 decay), so the ratio of image change to map
+  is 31-36, slice after slice.
+
 ### Codex review of the spec and plan, 2026-10-17
 
 Read-only `codex exec`, 11 findings. Each was checked against the source; all held, and all were
