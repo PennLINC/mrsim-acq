@@ -150,6 +150,15 @@ For a timed trace, every query time is inside the trace (refused otherwise), so 
 ends of `sample_trajectory` is never reached. For an untimed trace under P9's `"slice"` sampling
 the clamp is reached and stays: the last volume's later shots hold its pose, as in P9.
 
+**Poses at the identity stay the identity** (found in Task 5). The series clock adds repetitions
+in floating point, so a shot lands at, say, 58.80000000000001 s just past a still sample at 58.8 s.
+Interpolated there, the pose is about 1e-13 mm instead of zero. That matters because the resampler
+gives zero to any voxel whose sample point lies outside the grid (`mrsim_acq::motion::trilinear`).
+A 1e-13 mm shift therefore blanked the bottom slice of that volume. A timed
+trace's pose within `TRACE_POSE_EPSILON` (1e-9 mm and 1e-9 degrees in every parameter) of the
+identity is the identity (`Trace::pose_at`). The edge behaviour itself is P3's and P9's, and
+changing it would change their outputs. It is noted under "Decisions deferred".
+
 Linear interpolation of Euler angles is not the geodesic between two rotations. Between two
 samples of a trace that is sampled faster than the shots, the difference is second order in a
 rotation that is already small, so it is ignored here as it was in P9.
@@ -624,6 +633,12 @@ already at `P_v`, and that P9's priming is unaffected (stated in part A).
 - **Geodesic interpolation.** It is second order for a trace sampled faster than the shots.
 - **TRXScan per-shot re-simulation**, for the fibre-gradient angle at each shot's pose.
 - **Poses that move the per-voxel maps and the fieldmap**, as in P3 and P9.
+- **The resampler's edge.** `trilinear` returns zero for a sample point outside `[0, n - 1]`, so a
+  head moved through the slice direction by any amount blanks the end slice it leaves. The tissue
+  beyond the stack is not in the phantom, so zero is defensible for a real shift. But the value
+  jumps from the slice's own to zero between 0 and 1e-13 mm, which is not. Zero-padding the
+  missing corners would be continuous. It would also change every existing motion output at the
+  stack ends, so it needs its own gate run and the user's decision.
 
 # Risks
 

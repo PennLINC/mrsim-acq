@@ -495,6 +495,63 @@ checksum set.
 
 *(Task outcomes and case counts go here as the work proceeds.)*
 
+### Implementation, 2026-10-18
+
+**Base.** The user chose "start on the plan in a new worktree" without changing the proposed base.
+Worktrees are `p10-wt/{mrsim-acq,aslscan,TRXScan}` on `p10-timed-motion`, from `ad1f081`,
+`7ded4f2` and `724c87c`. The spec and plan moved there from `p9-wt` (`67a4a8c`). Edits are made in
+`p10-scratch/` copies and tested there, then copied into the worktrees. The regress snapshots the
+live trees when it starts, so the worktrees must never hold half-edited code.
+
+**Task 0.**
+- `regress_identity.sh` gains `p9_shot_spin` (the single-band events file with spin history) and
+  `p9_slice_drift` (the slice-sampled drift with spin history): 37 + 35 cases.
+- The TRXScan re-sync baselines on the untouched branch are identical (594 CLI, 177 Python).
+- The P9 checksum set has 45 files from six runs (`still`, `after`, `sb_still`, `sb_after`,
+  `nod_still`, `nod_after`), in `p10-wt/trx-p9-t0a`. It reproduces itself (`t0b`) and matches the
+  P9 figure runs.
+
+**Task 1** (`a8e0369`):
+- `Trace` (times required, not optional: the loader is for timed traces only), `Sampling`,
+  `has_time_column`, `load_motion_trace`;
+- `Trace::pose_at`, `Trace::max_interval`, `Trace::check_covers` (the shared coverage message);
+- tests: 4 new, 22 in `motion::`; all four mrsim-acq feature sets and the golden record pass.
+
+**Task 2** (`e4fc580`): the generator and 8 stdlib tests.
+
+**Tasks 3-4, one commit.** Task 3 alone would parse a timed trace that the series then ignored.
+- `WithinVolumeSampling::Shot`, with `per_shot()` and `as_str()`.
+- `MotionSpec.timed` (a `TimedTrajectory`), `MotionSpec::volume_poses` and
+  `check_timed_coverage`.
+- **The readers of `mode`:** `resolve_poses` in `series.rs`, `p6.rs` and `ge3d.rs` (now
+  `volume_poses`), plus the "Off without events is no motion" check in `overlay_motion`, which
+  would have dropped a timed trace held as `Off`. That one now checks `timed` too. There are no
+  other readers.
+- `shots::query_times`, `reference_times`, `min_shot_spacing`.
+- **Coverage** is checked at the start of `simulate_legacy` (rows' clock), `p6::build` (raw
+  volumes) and `ge3d` (raw volumes, first segment).
+- **Sidecar:** the `Trajectory` block, plus `VolumePose` on P3's path. The shots table writer is
+  unchanged for 2D; the readout-independent list comes with Task 6.
+- Tests: protocol, shots, series (bit-for-bit equivalence under "volume", "slice"/"shot" and spin
+  history; coverage over the query set, refused in under 0.5 s), Hadamard with two cycles and an
+  m0scan, and an end-to-end sidecar test. Library 231, end to end 60 (`cli`) and 63
+  (`cli,kspace,par`).
+
+**Task 5.** Acceptance criteria 2 and 3 pass, and every run validates:
+- criterion 2: the timed linear nod equals P9's events run **bit for bit** (difference 0); volume
+  12's odd slices are at 0.69-0.82 and its even slices at 0.99-1.02;
+- criterion 3: under "volume", volume 12 equals the still run (difference 0) and volume 13 is
+  moved (0.968 of the peak); under "shot", the even slices sit 0.343 above the odd ones.
+
+**Finding (Task 5): clock rounding against the resampler's edge.** The first acceptance run
+failed: slice 0 of volume 12 sat at 0.16-0.24 in every timed run.
+- **Cause:** the series clock puts that shot at 58.80000000000001 s, so the interpolated pose was
+  about 1e-13 mm, not zero. `trilinear` zeroes any sample outside the grid, so the bottom slice was
+  blanked.
+- **Fix** (in `mrsim-acq`): `Trace::pose_at` returns the identity within `TRACE_POSE_EPSILON` =
+  1e-9 mm and 1e-9 degrees. The spec's part A and "Decisions deferred" record it.
+- **Not changed:** the kernel's edge itself, because changing it would change P3/P9 outputs.
+
 ### Codex review of the spec and plan, 2026-10-17
 
 Read-only `codex exec`, 11 findings. Each was checked against the source; all held, and all were
