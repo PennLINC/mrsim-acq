@@ -271,6 +271,13 @@ impl Trace {
         if times.is_empty() {
             return Ok(());
         }
+        if self.times.len() < 2 || self.times.len() != self.poses.len() {
+            return Err(format!("{what}: a timed trace needs at least two samples, one pose per time ({} times, {} poses)",
+                               self.times.len(), self.poses.len()));
+        }
+        if let Some(bad) = times.iter().find(|t| !t.is_finite()) {
+            return Err(format!("{what}: the run samples the trace at {bad} s, which is not a time"));
+        }
         let (lo, hi) = times.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &t| (a.min(t), b.max(t)));
         let (first, last) = (self.times[0], self.times[self.times.len() - 1]);
         if lo < first || hi > last {
@@ -351,13 +358,20 @@ pub fn load_motion_trace(path: &std::path::Path, sampling: Option<Sampling>) -> 
             (None, Some(sm)) => sm.start_s + i as f64 / sm.frequency_hz,
             (None, None) => unreachable!("refused above"),
         };
+        if !t.is_finite() {
+            return Err(format!("{what} row {i}: the sampling clock gives time {t} s, which is not finite"));
+        }
         if let Some(&prev) = times.last() {
             if t <= prev {
                 return Err(format!("{what} row {i}: time {t} s does not increase (the row before is at {prev} s)"));
             }
         }
+        let rot_deg = [v[3] * deg, v[4] * deg, v[5] * deg];
+        if let Some(r) = rot_deg.iter().find(|r| !r.is_finite()) {
+            return Err(format!("{what} row {i}: a rotation of {r} degrees is not finite"));
+        }
         times.push(t);
-        poses.push(Pose { trans_mm: [v[0], v[1], v[2]], rot_deg: [v[3] * deg, v[4] * deg, v[5] * deg] });
+        poses.push(Pose { trans_mm: [v[0], v[1], v[2]], rot_deg });
     }
     if times.len() < 2 {
         return Err(format!("{what}: a timed trace needs at least two samples, it has {}", times.len()));
@@ -1100,7 +1114,13 @@ mod tests {
         }
         let e = load_motion_trace(&path, Some(Sampling { frequency_hz: 1.0, start_s: f64::INFINITY })).unwrap_err();
         assert!(e.contains("StartTime"), "{e}");
+        // implementation review: a rate so small the clock overflows, a rotation that overflows degrees
+        let e = load_motion_trace(&path, Some(Sampling { frequency_hz: 1e-320, start_s: 0.0 })).unwrap_err();
+        assert!(e.contains("not finite"), "{e}");
         let _ = std::fs::remove_file(&path);
+        let big = trace_file("bigrot", &format!("{h}0\t0\t0\t0\t1e308\t0\t0\n1\t0\t0\t0\t0\t0\t0\n"));
+        assert!(load_motion_trace(&big, None).unwrap_err().contains("rotation"));
+        let _ = std::fs::remove_file(&big);
     }
 
     #[test]
@@ -1118,6 +1138,10 @@ mod tests {
         assert!(tr.pose_at(0.004).trans_mm[0] > 0.0);
         assert!(tr.check_covers(&[0.0, 0.02, 0.08], "run").is_ok());
         assert!(tr.check_covers(&[], "run").is_ok());
+        // implementation review: a query that is not a time, and a trace too short to cover anything
+        assert!(tr.check_covers(&[0.01, f64::NAN], "run").unwrap_err().contains("not a time"));
+        let empty = Trace { times: Vec::new(), poses: Vec::new() };
+        assert!(empty.check_covers(&[0.0], "run").unwrap_err().contains("at least two samples"));
         for bad in [[-0.01, 0.05], [0.0, 0.09]] {
             let e = tr.check_covers(&bad, "overlay motion.trajectory x.tsv").unwrap_err();
             assert!(e.contains("overlay motion.trajectory x.tsv") && e.contains("spans 0 s to 0.08 s") && e.contains("never extrapolated"), "{e}");
