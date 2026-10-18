@@ -243,10 +243,21 @@ pub struct Sampling {
     pub start_s: f64,
 }
 
+/// A timed trace's pose this close to the identity in every parameter (mm, degrees) is the
+/// identity. Nothing physical moves that little; such poses come from the clock's rounding (a shot
+/// at 58.80000000000001 s just past a sample at 58.8 s), and [`trilinear`] cuts a voxel whose sample
+/// point falls even that far outside the grid, so an end slice would go dark.
+pub const TRACE_POSE_EPSILON: f64 = 1e-9;
+
 impl Trace {
-    /// The trace's pose at `t`.
+    /// The trace's pose at `t`, the identity within [`TRACE_POSE_EPSILON`].
     pub fn pose_at(&self, t: f64) -> Pose {
-        sample_trajectory(&self.times, &self.poses, t)
+        let p = sample_trajectory(&self.times, &self.poses, t);
+        if p.trans_mm.iter().chain(&p.rot_deg).all(|x| x.abs() <= TRACE_POSE_EPSILON) {
+            Pose::IDENTITY
+        } else {
+            p
+        }
     }
 
     /// The longest interval between two samples (s).
@@ -1100,6 +1111,11 @@ mod tests {
         for (t, p) in tr.times.iter().zip(&tr.poses) {
             assert_eq!(tr.pose_at(*t), *p);
         }
+        // the clock's rounding just past a still sample is no motion: the identity, not 1e-13 mm
+        let just_after = tr.pose_at(1e-14);
+        assert_eq!(just_after, Pose::IDENTITY);
+        assert_ne!(sample_trajectory(&tr.times, &tr.poses, 1e-14), Pose::IDENTITY, "the raw interpolant is not");
+        assert!(tr.pose_at(0.004).trans_mm[0] > 0.0);
         assert!(tr.check_covers(&[0.0, 0.02, 0.08], "run").is_ok());
         assert!(tr.check_covers(&[], "run").is_ok());
         for bad in [[-0.01, 0.05], [0.0, 0.09]] {
