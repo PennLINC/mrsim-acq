@@ -125,3 +125,12 @@ until it moves the pin. When it does:
 - `python/trxscan/kspace.py`'s ISMRMRD export flags lines within `acs_lines/2` of the centre as
   calibration lines; under this model they are imaging lines only, and the reference scan is not
   exported.
+
+## 6. Rebase onto P10 (2026-10-19)
+
+Both branches were rebased onto `main` after P10 merged (mrsim-acq 7468e79, aslscan 79d79ac), with no
+conflicts. On the rebased build the part 3 measurements reproduce: PE lag-1 +0.129 / +0.030, tSD exponent
+0.499 / 0.498, in-brain tSD at x1 9.31 / 1.44, against 41.1 / 6.10 on `main`. The aslscan PR carries the
+figures. All four feature sets pass here; aslscan's `tools/regress_identity.sh 79d79ac 7468e79` is
+identical on every case (the P8 spiral case, whose phantom is not in the worktree, was run by hand on the
+same two binaries). GRASE at R = 2 now also simulates the reference scan: `kashyap_lores` 28 s -> 41 s.
