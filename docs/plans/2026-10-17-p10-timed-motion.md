@@ -696,3 +696,9 @@ Three findings, all valid, all fixed:
 - **Coverage compared times exactly.** Four volumes at TR 1.1 s put the last reference at 3.3000000000000003 s against a trace ending at 3.3 s, and the run was refused. `Trace::check_covers` now allows `1e-9 x max(1, |t|)` s at each end; the sampler holds the endpoint there.
 - **TRXScan's shots table at 90 degrees of pitch.** `write_motion_shots` could write angles that did not reproduce the pose (a trajectory at (20, 45, 0) degrees with a (0, 45, 0) jump). It now checks the reconstruction (1e-9) and refuses. The aslscan 2D table (P9's writer) has the same latent edge and is left as it was.
 - **The first-shot-offset test could not fail.** It now records the poses `_core.signal_moving` receives and checks them against `3 v + 0.2` s.
+
+### After the tag: defaults, 2026-10-19
+
+Two changes on `p10-timed-motion`, after `p10-complete`, at the user's request:
+- **Per-shot is the default for a timed trace.** aslscan's `within_volume_sampling`, TRXScan's `--motion-sampling` and Python's `Motion.sampling` now default to shot sampling when the trace is timed, and to volume sampling (as before) when it is not. An explicit value still wins. Runs without a timed trace are unchanged; the timed-volume acceptance and test cases now name `"volume"`.
+- **The whole-stack refusal is lifted.** It was finding 1's fix above. TRXScan's slab-centre fix (the re-simulation now rotates about the full stack's centre) removed the mismatch, so per-shot sampling runs on chunked and slab Python runs; a test checks a `chunk=4` run against the whole-stack run. The dropout refusal (finding 2) stays.
