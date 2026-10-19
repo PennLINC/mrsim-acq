@@ -134,3 +134,24 @@ conflicts. On the rebased build the part 3 measurements reproduce: PE lag-1 +0.1
 figures. All four feature sets pass here; aslscan's `tools/regress_identity.sh 79d79ac 7468e79` is
 identical on every case (the P8 spiral case, whose phantom is not in the worktree, was run by hand on the
 same two binaries). GRASE at R = 2 now also simulates the reference scan: `kashyap_lores` 28 s -> 41 s.
+
+## 7. Codex review of the PRs (2026-10-19)
+
+Read-only `codex exec` over both diffs: six medium findings, no high or low. Each was checked against
+the source.
+
+| # | Finding | Verdict | Change |
+|---|---|---|---|
+| 1 | The solver's pivot floor (`1e-18` on the squared magnitude) is absolute, so with relative regularization a weak reference (a small signal scale, a faint deltam) zeroes the kernel | Valid | Both sides of the normal equations are divided by the mean diagonal before the solve, so the system is O(1) and the Tikhonov term is `GRAPPA_LAMBDA` itself. Test: the kernel at `1e-16` of the signal scale equals the full-scale one (it fails on the old solve) |
+| 2 | The 2D reference carries the calibration volume's physiological tissue and label factors | Accurate, intended | A scanner's reference scan is acquired under physiology too, and a per-slice scale does not change a scale-free kernel. The aslscan comment that said "without physiology" is corrected |
+| 3 | P6 (multi-echo, Hadamard, Look-Locker) took mrsim-acq's default, the first volume after motion and within-volume dropout, so a full dropout there would ruin that slice's kernel for the whole series (per-volume fitting had confined it to one volume), and an m0scan first won over a later control or label | Valid | P6 `build` captures the calibration raw volume (`calibration_volume` over the raw rows) before motion, refuses an empty one, and passes it per echo: `simulate_acquisition_echoes` takes a per-echo `GrappaCalibration`, 2D goes through `acquire_2d` and 3D through `simulate_acquisition_3d_kz` |
+| 4 | The 3D gradient-echo reference was `volume(0)`: moved, with its shot gains | Valid | `simulate_acquisition_3d_ge` takes a `reference: Option<&GeVolume>`. aslscan builds it with `ge3d::reference_inputs`: the calibration raw volume unmoved, no shot images, gains of one, physiology kept as in 2D. Test: it is the still series' volume bit for bit |
+| 5 | The fit treated lines that partial Fourier left out of the reference as measured zeros, and the apply synthesized a line next to the partial-Fourier edge from a missing source | Valid (pre-existing for the fit; the apply's reach grew with the reference band out of the volumes) | `fit` takes the reference's acquired lines and fits only triples it read entirely; `apply` takes the volume's acquired lines and leaves a line zero unless both its sources were acquired. Test: junk in the left-out lines does not change the kernel; a line with a missing source stays zero. The golden record's three `*-everything` cases (the only ones with partial Fourier and GRAPPA) change, in both builds |
+| 6 | The library's empty-reference assertion runs after noise, so a pure-noise reference passes | Rejected as framed | A slice outside the object legitimately holds noise only, and a kernel fitted to it is what a scanner fits. The real defect beside it: with no noise (aslscan's default) such a slice panicked. An empty reference now gives a zero kernel (tested); aslscan refuses an empty calibration volume in every path (2D, GRASE, P6, 3D GE) |
+
+After these changes, on the zoo protocols: `morys` (7/8 partial Fourier) PE lag-1 +0.166, tSD exponent
+0.4995, in-brain tSD at x1 9.14 (was +0.129, 0.499, 9.31 in section 6: the line beside the
+partial-Fourier edge now stays zero); `kashyap_lores` unchanged (+0.030, 0.498, 1.44). aslscan's
+`tools/regress_identity.sh 79d79ac 7468e79` is identical on all 72 cases, the P8 spiral case included
+(its phantom linked into the worktree), so the P6 and 3D GE paths' new entry points change nothing
+without acceleration. All four mrsim-acq feature sets and both aslscan feature sets pass.

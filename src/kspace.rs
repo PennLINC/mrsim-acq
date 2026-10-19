@@ -1255,9 +1255,15 @@ fn build_coil_kspaces(inp: &SliceInput, acq: &Acquisition) -> Vec<Vec<C>> {
 /// drives, its noise on the stream `inp.slice_seed` names (the caller salts it).
 pub(crate) fn grappa_reference_kernel(inp: &SliceInput, acq: &Acquisition) -> GrappaKernel {
     let reference = SliceInput { eddy_drive: None, prep_drive: None, ..*inp };
-    let coils = build_coil_kspaces(&reference, &Acquisition { accel: 1, n_spikes: 0, ..acq.clone() });
+    let acq_ref = Acquisition { accel: 1, n_spikes: 0, ..acq.clone() };
+    let coils = build_coil_kspaces(&reference, &acq_ref);
     let [nx, ny] = inp.acq_matrix;
-    GrappaKernel::fit(&coils, nx, ny, acq.accel, acq.acs_lines)
+    GrappaKernel::fit(&coils, nx, ny, acq.accel, acq.acs_lines, &acquired_lines(ny, &acq_ref))
+}
+
+/// Which PE lines `acq` reads (`ny` flags): [`sampling_mask`]'s rows.
+pub(crate) fn acquired_lines(ny: usize, acq: &Acquisition) -> Vec<bool> {
+    sampling_mask(1, ny, acq)
 }
 
 /// [`simulate_slice_full`] with the GRAPPA kernel given (`None`: fitted on a reference scan of
@@ -1308,7 +1314,7 @@ fn reconstruct_coils_full(mut coil_kspace: Vec<Vec<C>>, acq: &Acquisition, acq_m
     if accel > 1 {
         let k = kernel.expect("an accelerated slice needs its GRAPPA kernel (fitted on a reference scan)");
         assert_eq!(k.accel, accel, "the GRAPPA kernel was fitted for another acceleration");
-        k.apply(&mut coil_kspace, nx, ny);
+        k.apply(&mut coil_kspace, nx, ny, &acquired_lines(ny, acq));
     }
 
     // Reconstruction window: after GRAPPA, before the inverse transform, so it acts on
@@ -1534,8 +1540,12 @@ fn grappa_feature(coil: &[Vec<C>], nx: usize, s0: usize, s1: usize, kx: usize) -
 impl GrappaKernel {
     /// Fit the kernel of acceleration `accel` on the reference band (`acs_lines` about `ny/2`) of
     /// one slice's fully-sampled coil k-spaces (`kx + nx*ky`), by least squares regularized by
-    /// [`GRAPPA_LAMBDA`].
-    pub(crate) fn fit(coil: &[Vec<C>], nx: usize, ny: usize, accel: usize, acs_lines: usize) -> GrappaKernel {
+    /// [`GRAPPA_LAMBDA`]. `lines[ky]` says which PE lines the reference scan read (partial Fourier
+    /// leaves some out): only source/target triples it read all of are fitted. A reference with
+    /// no signal in them (a slice outside the object, without noise) gives a zero kernel, which
+    /// synthesizes zeros.
+    pub(crate) fn fit(coil: &[Vec<C>], nx: usize, ny: usize, accel: usize, acs_lines: usize, lines: &[bool]) -> GrappaKernel {
+        assert_eq!(lines.len(), ny, "one acquired-line flag per PE line");
         let nc = coil.len();
         let ys = ny / 2;
         let nfeat = 2 * GRAPPA_DKX.len() * nc;
@@ -1548,7 +1558,7 @@ impl GrappaKernel {
             let mut ahb = vec![vec![C::ZERO; nfeat]; nc];
             for b in acs_lo..acs_hi {
                 let (s0, s1, tgt_ky) = (b, b + accel, b + d);
-                if s1 > acs_hi || tgt_ky > acs_hi {
+                if s1 > acs_hi || tgt_ky > acs_hi || !(lines[s0] && lines[s1] && lines[tgt_ky]) {
                     continue;
                 }
                 for kx in 0..nx {
@@ -1565,19 +1575,35 @@ impl GrappaKernel {
                 }
             }
             let mean_diag = (0..nfeat).map(|i| aha[i][i].re).sum::<f64>() / nfeat as f64;
-            assert!(mean_diag > 0.0, "the GRAPPA reference scan holds no signal: the kernel cannot be fitted");
+            if mean_diag <= 0.0 {
+                weights.push(vec![vec![C::ZERO; nfeat]; nc]);
+                continue;
+            }
+            // both sides over the mean diagonal, so the system is O(1) whatever the signal scale
+            // (the solver's pivot floor is absolute) and the Tikhonov term is GRAPPA_LAMBDA itself
+            let s = 1.0 / mean_diag;
             for (i, row) in aha.iter_mut().enumerate() {
-                row[i].re += GRAPPA_LAMBDA * mean_diag; // Tikhonov
+                for x in row.iter_mut() {
+                    *x = x.scale(s);
+                }
+                row[i].re += GRAPPA_LAMBDA; // Tikhonov
+            }
+            for b in ahb.iter_mut() {
+                for x in b.iter_mut() {
+                    *x = x.scale(s);
+                }
             }
             weights.push((0..nc).map(|co| solve_hermitian(aha.clone(), ahb[co].clone())).collect());
         }
         GrappaKernel { accel, weights }
     }
 
-    /// Synthesize every missing PE line of one slice's undersampled coil k-spaces in place (the
-    /// lines within `d` of the first or `R - d` of the last, whose sources fall off the matrix,
-    /// stay zero). The sources are acquired lines only, so the offsets can be filled in any order.
-    pub(crate) fn apply(&self, coil: &mut [Vec<C>], nx: usize, ny: usize) {
+    /// Synthesize every missing PE line of one slice's undersampled coil k-spaces in place. A line
+    /// whose two sources were not both acquired (`acquired[ky]`: off the matrix, or left out by
+    /// partial Fourier) stays zero. The sources are acquired lines only, so the offsets can be
+    /// filled in any order.
+    pub(crate) fn apply(&self, coil: &mut [Vec<C>], nx: usize, ny: usize, acquired: &[bool]) {
+        assert_eq!(acquired.len(), ny, "one acquired-line flag per PE line");
         let ys = ny / 2;
         let (accel, nc) = (self.accel, coil.len());
         for (di, weights) in self.weights.iter().enumerate() {
@@ -1588,6 +1614,9 @@ impl GrappaKernel {
                     continue;
                 }
                 let (s0, s1) = (ky - d, ky - d + accel);
+                if !(acquired[s0] && acquired[s1]) {
+                    continue;
+                }
                 for kx in 0..nx {
                     let f = grappa_feature(coil, nx, s0, s1, kx);
                     for co in 0..nc {
@@ -1681,7 +1710,7 @@ pub fn simulate_acquisition_oversampled(
     noise_sigma: Option<&[f32]>,
 ) -> (Vec<f32>, Vec<f32>) {
     acquire_volumes(sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, acq, eddy_drive, prep_drive, phase,
-                    seed, seed, noise_sigma)
+                    seed, seed, noise_sigma, None)
 }
 
 /// The 2D acquisition's inputs, by name (TRXScan re-sync): what [`simulate_acquisition_oversampled`]
@@ -1799,12 +1828,14 @@ fn acquire_volumes(
     excitation_seed: u64,
     receiver_seed: u64,
     noise_sigma: Option<&[f32]>,
+    grappa_calibration: Option<GrappaCalibration>,
 ) -> (Vec<f32>, Vec<f32>) {
     let inp = AcquisitionInput {
         sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, eddy_drive, prep_drive, phase, seed: receiver_seed,
         noise_sigma,
     };
-    let out = acquire_volumes_complex(&inp, acq, &AcquisitionOptions::default(), excitation_seed, receiver_seed);
+    let opts = AcquisitionOptions { grappa_calibration, ..Default::default() };
+    let out = acquire_volumes_complex(&inp, acq, &opts, excitation_seed, receiver_seed);
     let n = out.re.len();
     let (mut mag, mut ph) = (vec![0.0f32; n], vec![0.0f32; n]);
     for i in 0..n {
@@ -2114,6 +2145,9 @@ pub fn echo_salt(e: usize) -> u64 {
 /// `images_per_echo[e]` holds echo `e`'s compartment images (callers that apply no echo-time decay
 /// themselves pass the same images for every echo). Returns `(magnitude, phase)` per echo, each in
 /// the layout of `simulate_acquisition_oversampled`.
+///
+/// `grappa_calibration` is, per echo, the reference scan of an in-plane GRAPPA acceleration
+/// ([`GrappaCalibration`], used as given); `None` = each echo's first volume on its receiver seed.
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_acquisition_echoes(
     sim_dims: [usize; 3],
@@ -2130,12 +2164,13 @@ pub fn simulate_acquisition_echoes(
     phase: &PhaseModel,
     seed: u64,
     noise_sigma: Option<&[f32]>,
+    grappa_calibration: Option<&[GrappaCalibration]>,
 ) -> Vec<(Vec<f32>, Vec<f32>)> {
     for (e, w) in echo_times_ms.windows(2).enumerate() {
         assert!(w[0] < w[1], "echo times must increase strictly: echo {e} at {} ms, echo {} at {} ms", w[0], e + 1, w[1]);
     }
     echoes_with_salt(sim_dims, acq_dims, n_volumes, images_per_echo, t2, fmap, t_inhom, acq, echo_times_ms,
-                     eddy_drive, prep_drive, phase, seed, noise_sigma, echo_salt, |_| 0)
+                     eddy_drive, prep_drive, phase, seed, noise_sigma, grappa_calibration, echo_salt, |_| 0)
 }
 
 /// [`simulate_acquisition_echoes`] with the per-echo salts of the receiver and excitation seeds as
@@ -2156,12 +2191,16 @@ fn echoes_with_salt(
     phase: &PhaseModel,
     seed: u64,
     noise_sigma: Option<&[f32]>,
+    grappa_calibration: Option<&[GrappaCalibration]>,
     receiver_salt: fn(usize) -> u64,
     excitation_salt: fn(usize) -> u64,
 ) -> Vec<(Vec<f32>, Vec<f32>)> {
     assert!(!echo_times_ms.is_empty(), "simulate_acquisition_echoes needs at least one echo");
     assert_eq!(images_per_echo.len(), echo_times_ms.len(),
                "images_per_echo has {} entries for {} echoes", images_per_echo.len(), echo_times_ms.len());
+    if let Some(c) = grappa_calibration {
+        assert_eq!(c.len(), echo_times_ms.len(), "one GRAPPA calibration per echo");
+    }
     echo_times_ms
         .iter()
         .zip(images_per_echo)
@@ -2169,7 +2208,8 @@ fn echoes_with_salt(
         .map(|(e, (&te, images))| {
             let acq_e = Acquisition { t_echo: te, ..acq.clone() };
             acquire_volumes(sim_dims, acq_dims, n_volumes, images, t2, fmap, t_inhom, &acq_e, eddy_drive, prep_drive,
-                            phase, seed ^ excitation_salt(e), seed ^ receiver_salt(e), noise_sigma)
+                            phase, seed ^ excitation_salt(e), seed ^ receiver_salt(e), noise_sigma,
+                            grappa_calibration.map(|c| c[e]))
         })
         .collect()
 }
@@ -3805,9 +3845,9 @@ mod echo_tests {
         match rsalt {
             // the public entry unless a test overrides a salt
             None if xsalt(1) == 0 => simulate_acquisition_echoes(s, a, NV, &per, &t2(), fm, None, acq, tes, &eddy, &prep,
-                                                                 &PhaseModel::hbcd_like(), seed, sigma),
+                                                                 &PhaseModel::hbcd_like(), seed, sigma, None),
             r => echoes_with_salt(s, a, NV, &per, &t2(), fm, None, acq, tes, &eddy, &prep, &PhaseModel::hbcd_like(),
-                                  seed, sigma, r.unwrap_or(echo_salt), xsalt),
+                                  seed, sigma, None, r.unwrap_or(echo_salt), xsalt),
         }
     }
 
@@ -3920,7 +3960,7 @@ mod echo_tests {
         let (eddy, prep) = drives();
         let run = |xsalt: fn(usize) -> u64| {
             echoes_with_salt(s, a, NV, &[&one, &one], &[T2Volume::Uniform(80.0)], &fm, None, &acq, &[30.0, 55.0],
-                             &eddy, &prep, &PhaseModel::hbcd_like(), 21, None, echo_salt, xsalt)
+                             &eddy, &prep, &PhaseModel::hbcd_like(), 21, None, None, echo_salt, xsalt)
         };
         let worst = |out: &[(Vec<f32>, Vec<f32>)]| {
             let (c0, c1) = (complex(&out[0].0, &out[0].1), complex(&out[1].0, &out[1].1));
@@ -4275,7 +4315,8 @@ mod complex_tests {
                         acq_matrix: [nx, ny], z, nz, eddy_drive: None, prep_drive: None, slice_seed: cal_seed,
                     },
                     &Acquisition { accel: 1, n_spikes: 0, ..acq.clone() }, c, acq.n_coils)).collect();
-                let kernel = GrappaKernel::fit(&cal_k, nx, ny, acq.accel, acq.acs_lines);
+                let kernel = GrappaKernel::fit(&cal_k, nx, ny, acq.accel, acq.acs_lines,
+                                               &acquired_lines(ny, &Acquisition { accel: 1, n_spikes: 0, ..acq.clone() }));
                 let out: Vec<(f32, f32)> = simulate_slice_with(
                     &SliceInput {
                         compartments: &refs, t2: &t2s, t_inhom: None, fmap: &fs, phase0: Some(&phi), sim: [snx, sny],
@@ -4650,5 +4691,75 @@ mod grappa_series_tests {
         let (lo, hi) = stats.iter().fold((f64::MAX, 0.0f64), |(a, b), s| (a.min(s.1), b.max(s.1)));
         assert!(hi / lo < 1.05, "temporal variance over noise variance should be constant: {stats:?}");
         assert!(stats.iter().all(|s| s.2.abs() < 0.1), "lag-1 PE correlation of the residual: {stats:?}");
+    }
+
+    /// Slice 0's fully sampled coil k-spaces of `object(scale)` under `acq` without acceleration.
+    fn reference_coils(scale: f32, acq: &Acquisition) -> Vec<Vec<C>> {
+        let s = N * O;
+        let obj = object(scale);
+        let refs = [&obj[..s * s]];
+        let (fmap, phi) = (vec![0.0f32; s * s], vec![0.0f64; s * s]);
+        let t2s = [T2Slice::Uniform(80.0)];
+        build_coil_kspaces(
+            &SliceInput {
+                compartments: &refs, t2: &t2s, t_inhom: None, fmap: &fmap, phase0: Some(&phi), sim: [s, s],
+                acq_matrix: [N, N], z: 0, nz: NZ, eddy_drive: None, prep_drive: None, slice_seed: 11,
+            },
+            &Acquisition { accel: 1, ..acq.clone() },
+        )
+    }
+
+    fn max_abs(w: &[Vec<Vec<C>>]) -> f64 {
+        w.iter().flatten().flatten().map(|c| c.abs()).fold(0.0, f64::max)
+    }
+
+    /// Codex review: the kernel does not depend on the signal scale, down to scales where the
+    /// solver's absolute pivot floor would otherwise zero it, and a reference with no signal (a
+    /// slice outside the object, no noise) gives a zero kernel instead of a panic.
+    #[test]
+    fn the_kernel_is_scale_free_and_an_empty_reference_gives_zero() {
+        let all = vec![true; N];
+        let fit = |a: &Acquisition, scale: f32| GrappaKernel::fit(&reference_coils(scale, a), N, N, 2, 8, &all);
+        let big = fit(&acq(0.0), 1.0);
+        let tiny = fit(&Acquisition { signal_scale: SCALE * 1e-16, ..acq(0.0) }, 1.0);
+        let peak = max_abs(&big.weights);
+        assert!(peak > 0.1, "a real kernel: peak weight {peak}");
+        let diff = big.weights.iter().flatten().flatten().zip(tiny.weights.iter().flatten().flatten())
+            .map(|(a, b)| a.add(b.scale(-1.0)).abs()).fold(0.0, f64::max);
+        assert!(diff < 1e-6 * peak, "the kernel changed with the signal scale: {diff:.2e} of {peak:.2e}");
+        let empty = fit(&acq(0.0), 0.0);
+        assert_eq!(max_abs(&empty.weights), 0.0, "an empty reference gives a zero kernel");
+    }
+
+    /// Codex review: a reference scan's PE lines partial Fourier left out are not fitted as
+    /// measured zeros (what they hold does not change the kernel), and a line whose sources were
+    /// not both acquired is left zero instead of synthesized from a missing one.
+    #[test]
+    fn partial_fourier_lines_are_neither_fitted_nor_used_as_sources() {
+        let a = acq(0.0);
+        let coils = reference_coils(1.0, &a);
+        // the reference band is N/2 +- 4; partial Fourier leaves out N/2 + 2 and up
+        let lines: Vec<bool> = (0..N).map(|ky| ky < N / 2 + 2).collect();
+        let zeroed: Vec<Vec<C>> = coils.iter().map(|k| {
+            k.iter().enumerate().map(|(i, c)| if lines[i / N] { *c } else { C::ZERO }).collect()
+        }).collect();
+        let junk: Vec<Vec<C>> = coils.iter().map(|k| {
+            k.iter().enumerate().map(|(i, c)| if lines[i / N] { *c } else { C { re: 1e9, im: -3e8 } }).collect()
+        }).collect();
+        let kz = GrappaKernel::fit(&zeroed, N, N, 2, 8, &lines);
+        let kj = GrappaKernel::fit(&junk, N, N, 2, 8, &lines);
+        assert!(max_abs(&kz.weights) > 0.1, "the triples inside the support still fit a kernel");
+        let same = kz.weights.iter().flatten().flatten().zip(kj.weights.iter().flatten().flatten())
+            .all(|(a, b)| a.re.to_bits() == b.re.to_bits() && a.im.to_bits() == b.im.to_bits());
+        assert!(same, "the left-out lines changed the kernel");
+        // apply: every even line acquired except N/2 + 2 (left out); line N/2 + 1 needs it
+        let acquired: Vec<bool> = (0..N).map(|ky| ky % 2 == 0 && ky != N / 2 + 2).collect();
+        let mut vol: Vec<Vec<C>> = coils.iter().map(|k| {
+            k.iter().enumerate().map(|(i, c)| if acquired[i / N] { *c } else { C::ZERO }).collect()
+        }).collect();
+        kz.apply(&mut vol, N, N, &acquired);
+        let line = |ky: usize| vol.iter().map(|k| (0..N).map(|kx| k[kx + N * ky].abs()).fold(0.0, f64::max)).fold(0.0, f64::max);
+        assert!(line(N / 2 - 1) > 0.0, "a line with both sources acquired is synthesized");
+        assert_eq!(line(N / 2 + 1), 0.0, "a line with a missing source stays zero");
     }
 }

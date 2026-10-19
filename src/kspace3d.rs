@@ -313,10 +313,11 @@ fn grappa_kernels_3d(coil_k: &(dyn Fn(usize) -> Vec<C> + Sync), mask: &[bool], z
     let coil_parts: Vec<Vec<Vec<C>>> = (0..acq.n_coils.max(1))
         .map(|q| partitions_to_slices(&mut coil_k(q), mask, zk, dims, 0, q, seed ^ SEED_SALT_GRAPPA_CAL, acq_cal, sigma))
         .collect();
+    let lines = crate::kspace::acquired_lines(ny, acq_cal);
     (0..nz)
         .map(|z| {
             let coils: Vec<Vec<C>> = coil_parts.iter().map(|cp| cp[z].clone()).collect();
-            GrappaKernel::fit(&coils, nx, ny, acq.accel, acq.acs_lines)
+            GrappaKernel::fit(&coils, nx, ny, acq.accel, acq.acs_lines, &lines)
         })
         .collect()
 }
@@ -731,7 +732,7 @@ impl GePlan<'_> {
 pub(crate) fn simulate_acquisition_3d_ge_complex(
     sim_dims: [usize; 3], acq_dims: [usize; 3], n_volumes: usize, t2: &[T2Volume], fmap: &[f32],
     t_inhom: Option<&[T2Volume]>, acq: &Acquisition, train: &ExcitationTrain, readout: &Ge3dReadout,
-    volume: &(dyn Fn(usize) -> GeVolume + Sync), phase: &PhaseModel, seed: u64,
+    volume: &(dyn Fn(usize) -> GeVolume + Sync), phase: &PhaseModel, seed: u64, reference: Option<&GeVolume>,
 ) -> Vec<Vec<Vec<(f64, f64)>>> {
     let [snx, sny, nz] = sim_dims;
     let [nx, ny, nzo] = acq_dims;
@@ -768,9 +769,10 @@ pub(crate) fn simulate_acquisition_3d_ge_complex(
     let sigma = (acq.noise_variance / (nx * ny) as f64).sqrt();
     let n_echoes = train.echo_times_ms.len();
     // GRAPPA: per echo, one kernel per slice for the whole series, fitted on the reference scan:
-    // the first volume's images and weights, without its shot images, on the series' echo seeds
+    // `reference` (default: the first volume's images and weights), without shot images, on the
+    // series' echo seeds
     let kernels: Vec<Vec<GrappaKernel>> = if acq.accel > 1 && n_volumes > 0 {
-        let cal = GeVolume { shot_images: None, ..volume(0) };
+        let cal = GeVolume { shot_images: None, ..reference.cloned().unwrap_or_else(|| volume(0)) };
         let acq_cal = reference_acquisition(acq);
         let cal_pl = GePlan {
             acq: &acq_cal, table: ge3d_lines(train, readout, ny, nz).unwrap_or_else(|e| panic!("{e}")),
@@ -827,17 +829,18 @@ pub(crate) fn simulate_acquisition_3d_ge_complex(
 /// series, each volume's images and per-excitation weights built on demand by `volume(g)` (called
 /// once per volume, from the worker that simulates it), so memory scales with the volumes in
 /// flight. The noise and spike streams are keyed on `(volume, partition)` and salted per echo.
-/// Under an in-plane GRAPPA acceleration, `volume(0)` is built once more first: the reference
-/// scan the kernels are fitted to, once per series and echo ([`GrappaCalibration`]'s default).
+/// Under an in-plane GRAPPA acceleration, the kernels are fitted once per series and echo on a
+/// reference scan of `reference` (its shot images ignored), read without the acceleration and the
+/// spikes; `None` builds `volume(0)` once more first for it ([`GrappaCalibration`]'s default).
 /// Returns per echo magnitude and phase, `f32`, layout `vox * n_volumes + g`.
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_acquisition_3d_ge(
     sim_dims: [usize; 3], acq_dims: [usize; 3], n_volumes: usize, t2: &[T2Volume], fmap: &[f32],
     t_inhom: Option<&[T2Volume]>, acq: &Acquisition, train: &ExcitationTrain, readout: &Ge3dReadout,
-    volume: &(dyn Fn(usize) -> GeVolume + Sync), phase: &PhaseModel, seed: u64,
+    volume: &(dyn Fn(usize) -> GeVolume + Sync), phase: &PhaseModel, seed: u64, reference: Option<&GeVolume>,
 ) -> Vec<(Vec<f32>, Vec<f32>)> {
     let vols = simulate_acquisition_3d_ge_complex(sim_dims, acq_dims, n_volumes, t2, fmap, t_inhom, acq, train, readout,
-                                                  volume, phase, seed);
+                                                  volume, phase, seed, reference);
     let nvox = acq_dims.iter().product::<usize>();
     (0..train.echo_times_ms.len()).map(|e| {
         let (mut mag, mut ph) = (vec![0.0f32; nvox * n_volumes], vec![0.0f32; nvox * n_volumes]);
@@ -2614,7 +2617,7 @@ mod tests {
                 let ti = [T2Volume::Uniform(45.0)];
                 let vol = |_g: usize| ge_volume(std::slice::from_ref(&img), nz, 1, |_, _, _| 0.7);
                 let got = simulate_acquisition_3d_ge_complex([snx, sny, nz], [nx, ny, nz], 1, &t2, &fmap, Some(&ti), &acq,
-                                                             &tr, &ro, &vol, &phase, 5);
+                                                             &tr, &ro, &vol, &phase, 5, None);
                 for (e, &te) in tes.iter().enumerate() {
                     let want = ge_reference(&img, 80.0, 45.0, &fmap, &acq, te, &ro, [nx, ny, nz], o, &|_| 0.7);
                     let d = maxdiff(&got[0][e], &want);
@@ -2647,7 +2650,7 @@ mod tests {
         let w = |p: usize| 1.0 + 0.5 * (p as f64 * 1.3).cos();
         let vol = |_g: usize| ge_volume(std::slice::from_ref(&img), nz, 1, |p, _, _| w(p));
         let got = simulate_acquisition_3d_ge_complex([snx, sny, nz], [nx, ny, nz], 1, &[T2Volume::Uniform(80.0)], &fmap,
-                                                     Some(&[T2Volume::Uniform(45.0)]), &acq, &tr, &ro, &vol, &PhaseModel::none(), 5);
+                                                     Some(&[T2Volume::Uniform(45.0)]), &acq, &tr, &ro, &vol, &PhaseModel::none(), 5, None);
         let want = ge_reference(&img, 80.0, 45.0, &fmap, &acq, 12.0, &ro, [nx, ny, nz], o, &w);
         assert!(maxdiff(&got[0][0], &want) <= 1e-9 * peak(&want));
         let flat = ge_reference(&img, 80.0, 45.0, &fmap, &acq, 12.0, &ro, [nx, ny, nz], o, &|_| 1.0);
@@ -2668,7 +2671,7 @@ mod tests {
         let run = |tes: Vec<f64>, acq: &Acquisition| {
             let vol = |g: usize| ge_volume(&[one_vol(g)], nz, 2, |p, sy, _| 0.5 + 0.1 * p as f64 + 0.05 * sy as f64);
             simulate_acquisition_3d_ge([snx, sny, nz], [nx, ny, nz], nv, &t2, &fmap, None, acq, &ge_train3(2, tes), &ro,
-                                       &vol, &PhaseModel::none(), 77)
+                                       &vol, &PhaseModel::none(), 77, None)
         };
         let noisy = Acquisition { noise_variance: 0.5, n_spikes: 2, ..ge_acq(2) };
         let two = run(vec![12.0, 30.0], &noisy);
@@ -2717,7 +2720,7 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let vol = |g: usize| { calls.fetch_add(1, Ordering::SeqCst); pre[g].clone() };
         let run = || simulate_acquisition_3d_ge([snx, sny, nz], [nx, ny, nz], nv, &t2, &fmap, None, &acq,
-                                                &ge_train3(1, vec![12.0]), &ro, &vol, &PhaseModel::none(), 3);
+                                                &ge_train3(1, vec![12.0]), &ro, &vol, &PhaseModel::none(), 3, None);
         let a = run();
         assert_eq!(calls.load(Ordering::SeqCst), nv);
         #[cfg(feature = "par")]
@@ -2739,7 +2742,7 @@ mod tests {
         }).collect();
         let t2b = [T2Volume::Uniform(80.0), T2Volume::Uniform(120.0), T2Volume::Uniform(60.0)];
         let c = simulate_acquisition_3d_ge([snx, sny, nz], [nx, ny, nz], nv, &t2b, &fmap, None, &acq,
-                                           &ge_train3(1, vec![12.0]), &ro, &|g| pre2[g].clone(), &PhaseModel::none(), 3);
+                                           &ge_train3(1, vec![12.0]), &ro, &|g| pre2[g].clone(), &PhaseModel::none(), 3, None);
         assert_eq!((bits(&a[0].0), bits(&a[0].1)), (bits(&c[0].0), bits(&c[0].1)));
     }
 
@@ -2757,7 +2760,7 @@ mod tests {
         let fail = |acq: Acquisition, v: GeVolume, msg: &str| {
             let r = std::panic::catch_unwind(|| {
                 simulate_acquisition_3d_ge_complex([s, s, nz], [n, n, nz], 1, &t2, &fmap, None, &acq, &tr, &ro, &|_| v.clone(),
-                                                   &PhaseModel::none(), 1)
+                                                   &PhaseModel::none(), 1, None)
             });
             let e = r.expect_err(msg);
             let text = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap();
