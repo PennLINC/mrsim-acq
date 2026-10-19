@@ -275,19 +275,44 @@ impl SpiralRecon {
     /// Every coil's image, Roemer-combined with the known sensitivities as
     /// `kspace::reconstruct_coils` combines them.
     pub(crate) fn reconstruct(&self, coil_samples: &[Vec<C>], acq: &Acquisition) -> Vec<C> {
-        let n = self.n;
         let ncoils = acq.n_coils.max(1);
         assert_eq!(coil_samples.len(), ncoils, "one sample set per coil");
+        self.reconstruct_rings(coil_samples, ncoils, &vec![1.0; ncoils])
+    }
+
+    /// [`SpiralRecon::reconstruct`] for coils in rings of `ring` along z (P8): coil `q` is element
+    /// `q % ring` of its ring, its sensitivity the in-plane profile times `zsens[q]`, its ring's
+    /// factor at this slice (`kspace3d::coil_row_sensitivity`).
+    pub(crate) fn reconstruct_rings(&self, coil_samples: &[Vec<C>], ring: usize, zsens: &[f64]) -> Vec<C> {
+        let n = self.n;
+        assert_eq!(coil_samples.len(), zsens.len(), "one z factor per coil");
+        assert!(ring >= 1 && coil_samples.len().is_multiple_of(ring), "the coils do not divide into rings of {ring}");
+        let rows = coil_samples.len() / ring;
         let mut wsum = vec![C::ZERO; n * n];
         let mut ssum = vec![0.0f64; n * n];
-        for (coil, d) in coil_samples.iter().enumerate() {
-            let img = self.image(d);
+        for a in 0..ring {
+            // An element's coils share its in-plane profile and differ by their z factors, and the
+            // least squares is linear: their samples are weighted by those factors and summed
+            // first, one least squares per element instead of one per coil.
+            let img = if rows == 1 && zsens[a] == 1.0 {
+                self.image(&coil_samples[a])
+            } else {
+                let mut d = vec![C::ZERO; coil_samples[a].len()];
+                for r in 0..rows {
+                    let q = r * ring + a;
+                    for (o, c) in d.iter_mut().zip(&coil_samples[q]) {
+                        *o = o.add(c.scale(zsens[q]));
+                    }
+                }
+                self.image(&d)
+            };
+            let z2: f64 = (0..rows).map(|r| zsens[r * ring + a] * zsens[r * ring + a]).sum();
             for y in 0..n {
                 for x in 0..n {
-                    let s = coil_sensitivity(coil, ncoils, x as f64, y as f64, n, n);
+                    let s = coil_sensitivity(a, ring, x as f64, y as f64, n, n);
                     let i = x + n * y;
                     wsum[i] = wsum[i].add(img[i].scale(s));
-                    ssum[i] += s * s;
+                    ssum[i] += s * s * z2;
                 }
             }
         }

@@ -1414,7 +1414,7 @@ fn inverse_2d(kspace: &[C], nx: usize, ny: usize, xs: usize, ys: usize) -> Vec<C
 
 /// Solve the Hermitian normal-equations system `H x = b` (complex, N×N) by Gaussian elimination
 /// with partial pivoting. `H = AᴴA` is positive-definite after Tikhonov regularization.
-fn solve_hermitian(mut h: Vec<Vec<C>>, mut b: Vec<C>) -> Vec<C> {
+pub(crate) fn solve_hermitian(mut h: Vec<Vec<C>>, mut b: Vec<C>) -> Vec<C> {
     let n = b.len();
     let recip = |d: C| {
         let m2 = d.re * d.re + d.im * d.im;

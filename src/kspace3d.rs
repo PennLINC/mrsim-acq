@@ -23,6 +23,8 @@
 //! per compartment, a cost the 3D path accepts).
 
 use std::collections::HashMap;
+#[cfg(feature = "kspace")]
+use std::sync::Arc;
 use std::f64::consts::TAU;
 
 use crate::epg::epg_cpmg;
@@ -422,19 +424,33 @@ pub(crate) fn kspace_3d_observed(
 /// The reconstructed complex 3D image of every volume, `f64`, layout `(vox, g)` with
 /// `vox = x + nx*(y + ny*z)`: [`simulate_acquisition_3d`] before its `f32` cast.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn simulate_acquisition_3d_complex(
     sim_dims: [usize; 3], acq_dims: [usize; 3], n_volumes: usize, images: &[Vec<f32>], t2: &[T2Volume],
     t1: Option<&[T2Volume]>, fmap: &[f32], t_inhom: Option<&[T2Volume]>, acq: &Acquisition, train: &EchoTrain,
     readout: &Readout3d, line_weights: Option<&LineWeights>, shot_images: Option<&[Vec<ShotSet>]>, phase: &PhaseModel,
     seed: u64,
 ) -> Vec<Vec<(f64, f64)>> {
+    simulate_acquisition_3d_complex_kz(sim_dims, acq_dims, n_volumes, images, t2, t1, fmap, t_inhom, acq, train, readout,
+                                       line_weights, shot_images, phase, seed, None)
+}
+
+/// [`simulate_acquisition_3d_complex`] with the kz options of a stack of spirals (P8).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn simulate_acquisition_3d_complex_kz(
+    sim_dims: [usize; 3], acq_dims: [usize; 3], n_volumes: usize, images: &[Vec<f32>], t2: &[T2Volume],
+    t1: Option<&[T2Volume]>, fmap: &[f32], t_inhom: Option<&[T2Volume]>, acq: &Acquisition, train: &EchoTrain,
+    readout: &Readout3d, line_weights: Option<&LineWeights>, shot_images: Option<&[Vec<ShotSet>]>, phase: &PhaseModel,
+    seed: u64, kz_opts: Option<&KzOptions>,
+) -> Vec<Vec<(f64, f64)>> {
     if let Readout3d::Spiral { .. } = readout {
         #[cfg(feature = "kspace")]
         return spiral_volumes(sim_dims, acq_dims, n_volumes, images, t2, t1, fmap, t_inhom, acq, train, readout,
-                              line_weights, shot_images, phase, seed);
+                              line_weights, shot_images, phase, seed, kz_opts);
         #[cfg(not(feature = "kspace"))]
         panic!("spiral readouts need the `kspace` feature (the time-segmented NUFFT forward)");
     }
+    assert!(kz_opts.is_none(), "coil rings along z and kz undersampling are the stack of spirals' (P8), not GRASE's");
     let pl = plan(sim_dims, acq_dims, n_volumes, images, t2, t1, fmap, t_inhom, acq, train, readout, line_weights,
                   shot_images, phase);
     let (nz, nx, ny) = (pl.nz, pl.nx, pl.ny);
@@ -472,8 +488,23 @@ pub fn simulate_acquisition_3d(
     readout: &Readout3d, line_weights: Option<&LineWeights>, shot_images: Option<&[Vec<ShotSet>]>, phase: &PhaseModel,
     seed: u64,
 ) -> (Vec<f32>, Vec<f32>) {
-    let vols = simulate_acquisition_3d_complex(sim_dims, acq_dims, n_volumes, images, t2, t1, fmap, t_inhom, acq, train,
-                                               readout, line_weights, shot_images, phase, seed);
+    simulate_acquisition_3d_kz(sim_dims, acq_dims, n_volumes, images, t2, t1, fmap, t_inhom, acq, train, readout,
+                               line_weights, shot_images, phase, seed, None)
+}
+
+/// [`simulate_acquisition_3d`] for a stack of spirals undersampled along kz (P8): the readout's
+/// [`crate::readout::KzSampling`] says which partitions the train reads (`train.etl` counts those),
+/// and `kz_opts` gives the coil rings along z and, for an acceleration, the calibration acquisition
+/// ([`KzOptions`]). The partitions partial Fourier leaves out are zero-filled.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_acquisition_3d_kz(
+    sim_dims: [usize; 3], acq_dims: [usize; 3], n_volumes: usize, images: &[Vec<f32>], t2: &[T2Volume],
+    t1: Option<&[T2Volume]>, fmap: &[f32], t_inhom: Option<&[T2Volume]>, acq: &Acquisition, train: &EchoTrain,
+    readout: &Readout3d, line_weights: Option<&LineWeights>, shot_images: Option<&[Vec<ShotSet>]>, phase: &PhaseModel,
+    seed: u64, kz_opts: Option<&KzOptions>,
+) -> (Vec<f32>, Vec<f32>) {
+    let vols = simulate_acquisition_3d_complex_kz(sim_dims, acq_dims, n_volumes, images, t2, t1, fmap, t_inhom, acq, train,
+                                                  readout, line_weights, shot_images, phase, seed, kz_opts);
     let nvox = acq_dims.iter().product::<usize>();
     let (mut mag, mut ph) = (vec![0.0f32; nvox * n_volumes], vec![0.0f32; nvox * n_volumes]);
     for (g, v) in vols.iter().enumerate() {
@@ -803,23 +834,36 @@ struct SpiralPlan<'a> {
     /// Samples per partition (all interleaves) and per interleaf.
     nsamp: usize,
     ns: usize,
-    class_fwd: Vec<Option<crate::spiral::SegmentedForward>>,
-    voxel_fwd: Vec<Option<crate::spiral::SegmentedForward>>,
-    recon: crate::grid_recon::SpiralRecon,
+    class_fwd: Arc<Vec<Option<crate::spiral::SegmentedForward>>>,
+    voxel_fwd: Arc<Vec<Option<crate::spiral::SegmentedForward>>>,
+    recon: Arc<crate::grid_recon::SpiralRecon>,
+    /// The coil array (P8): `rows` rings along z of `ring` coils each, coil `q` being element
+    /// `q % ring` of ring `q / ring`.
+    rows: usize,
+    ring: usize,
 }
 
 #[cfg(feature = "kspace")]
 impl SpiralPlan<'_> {
-    /// Every compartment's 3D samples from one set of images (`img(c, vox)`), coil `q`, weighted by
-    /// the echo amplitude and in-echo decay but not by the line weights: `out[c][p * nsamp + j]`.
-    fn compartments<F: Fn(usize, usize) -> f32>(&self, img: F, q: usize, ncoils: usize) -> Vec<Vec<C>> {
+    /// Every compartment's 3D samples from one set of images (`img(c, vox)`), for element `a` of the
+    /// coil rings `rows` (the in-plane forward is the element's, shared by its rings), weighted by
+    /// the echo amplitude and in-echo decay but not by the line weights: `out[r][c][p * nsamp + j]`
+    /// for ring `rows[r]`.
+    fn compartments<F: Fn(usize, usize) -> f32>(&self, img: F, a: usize, rows: &[usize]) -> Vec<Vec<Vec<C>>> {
         use crate::spiral::segment_inputs;
         let (snx, sny, nz, n) = (self.snx, self.sny, self.nz, self.n);
         let nplane = snx * sny;
         let zero_shot = ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] };
         let phis: Vec<Vec<f64>> = (0..nz).map(|z| phase_slice(self.phase, &zero_shot, snx, sny, self.o, z, nz)).collect();
-        let mut out = vec![vec![C::ZERO; nz * self.nsamp]; self.ncomp];
-        for (c, oc) in out.iter_mut().enumerate() {
+        // per ring, the z-DFT kernel times its z profile (the kernel itself for a single ring)
+        let zkq: Vec<Vec<C>> = rows.iter().map(|&row| if self.rows > 1 {
+            (0..nz * nz).map(|i| self.zk[i].scale(coil_row_sensitivity(row, self.rows, (i % nz) as f64, nz))).collect()
+        } else {
+            self.zk.clone()
+        }).collect();
+        let (q, ncoils) = (a, self.ring);
+        let mut out = vec![vec![vec![C::ZERO; nz * self.nsamp]; self.ncomp]; rows.len()];
+        for c in 0..self.ncomp {
             let planes: Vec<Vec<f32>> = (0..nz).map(|z| (0..nplane).map(|i| img(c, z * nplane + i)).collect()).collect();
             let one = |z: usize, la: Option<&[f64]>, voxel: bool| -> Vec<C> {
                 let refs = [planes[z].as_slice()];
@@ -834,17 +878,17 @@ impl SpiralPlan<'_> {
                 let fwd = if voxel { &self.voxel_fwd[z] } else { &self.class_fwd[z] };
                 fwd.as_ref().expect("a plan for every slice of the mode").apply(&x, &r)
             };
-            let zsum = |k2: &[Vec<C>], p: usize, j: usize| {
+            let zsum = |zk: &[C], k2: &[Vec<C>], p: usize, j: usize| {
                 let mut acc = C::ZERO;
                 for (z, k2z) in k2.iter().enumerate() {
-                    acc = acc.add(k2z[j].mul(self.zk[p * nz + z]));
+                    acc = acc.add(k2z[j].mul(zk[p * nz + z]));
                 }
                 acc
             };
             match &self.modes[c] {
                 Mode::Class { ln_a, t2_ms, t2p_ms } => {
                     let k2: Vec<Vec<C>> = (0..nz).map(|z| one(z, None, false)).collect();
-                    for p in 0..nz {
+                    for p in (0..nz).filter(|&p| self.table.acquired[p]) {
                         let e = self.table.echo[p];
                         for j in 0..self.nsamp {
                             let w = if self.acq.do_relaxation {
@@ -852,14 +896,16 @@ impl SpiralPlan<'_> {
                             } else {
                                 1.0
                             };
-                            oc[p * self.nsamp + j] = zsum(&k2, p, j).scale(w);
+                            for (o, zk) in out.iter_mut().zip(&zkq) {
+                                o[c][p * self.nsamp + j] = zsum(zk, &k2, p, j).scale(w);
+                            }
                         }
                     }
                 }
                 Mode::Voxel => {
                     let maps = self.ln_a_maps[c].as_ref().expect("voxel compartments carry their maps");
                     for e in 1..=self.table.echo.iter().copied().max().unwrap_or(0) {
-                        let ps: Vec<usize> = (0..nz).filter(|&p| self.table.echo[p] == e).collect();
+                        let ps: Vec<usize> = (0..nz).filter(|&p| self.table.acquired[p] && self.table.echo[p] == e).collect();
                         if ps.is_empty() {
                             continue;
                         }
@@ -867,7 +913,9 @@ impl SpiralPlan<'_> {
                             (0..nz).map(|z| one(z, Some(&maps[e - 1][z * nplane..(z + 1) * nplane]), true)).collect();
                         for &p in &ps {
                             for j in 0..self.nsamp {
-                                oc[p * self.nsamp + j] = zsum(&k2, p, j);
+                                for (o, zk) in out.iter_mut().zip(&zkq) {
+                                    o[c][p * self.nsamp + j] = zsum(zk, &k2, p, j);
+                                }
                             }
                         }
                     }
@@ -880,23 +928,49 @@ impl SpiralPlan<'_> {
     /// The acquired 3D samples of volume `g`, coil `q`, before noise: the compartment sum with the
     /// line weights, each sample from the images its shot saw. Layout `p * nsamp + j`.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn samples(&self, images: &[Vec<f32>], n_volumes: usize, g: usize, q: usize, ncoils: usize,
                lw: Option<&LineWeights>, sets: &[ShotSet]) -> Vec<C> {
-        let base = self.compartments(|c, v| images[c][v * n_volumes + g], q, ncoils);
-        let moved: Vec<Vec<Vec<C>>> = sets.iter().map(|s| self.compartments(|c, v| s.images[c][v], q, ncoils)).collect();
-        let mut k = vec![C::ZERO; self.nz * self.nsamp];
-        for p in 0..self.nz {
-            for j in 0..self.nsamp {
-                let shot = self.table.shot(p, j / self.ns);
-                let src = sets.iter().position(|s| s.shots.contains(&shot)).map_or(&base, |i| &moved[i]);
-                let i = p * self.nsamp + j;
-                for (c, kc) in src.iter().enumerate() {
-                    let w = lw.map_or(1.0, |lw| lw.at(g, shot, c));
-                    k[i] = k[i].add(kc[i].scale(w));
+        debug_assert_eq!(ncoils, self.ring * self.rows);
+        self.samples_rings(images, n_volumes, g, q % self.ring, &[q / self.ring], lw, sets).remove(0)
+    }
+
+    /// [`SpiralPlan::samples`] of the coils that are element `a` of the rings `rows`, in that
+    /// order: one in-plane forward serves them all.
+    #[allow(clippy::too_many_arguments)]
+    fn samples_rings(&self, images: &[Vec<f32>], n_volumes: usize, g: usize, a: usize, rows: &[usize],
+                     lw: Option<&LineWeights>, sets: &[ShotSet]) -> Vec<Vec<C>> {
+        let base = self.compartments(|c, v| images[c][v * n_volumes + g], a, rows);
+        let moved: Vec<Vec<Vec<Vec<C>>>> = sets.iter().map(|s| self.compartments(|c, v| s.images[c][v], a, rows)).collect();
+        let mut out = vec![vec![C::ZERO; self.nz * self.nsamp]; rows.len()];
+        for (r, k) in out.iter_mut().enumerate() {
+            for p in (0..self.nz).filter(|&p| self.table.acquired[p]) {
+                for j in 0..self.nsamp {
+                    let shot = self.table.shot(p, j / self.ns);
+                    let src = sets.iter().position(|s| s.shots.contains(&shot)).map_or(&base[r], |i| &moved[i][r]);
+                    let i = p * self.nsamp + j;
+                    for (c, kc) in src.iter().enumerate() {
+                        let w = lw.map_or(1.0, |lw| lw.at(g, shot, c));
+                        k[i] = k[i].add(kc[i].scale(w));
+                    }
                 }
             }
         }
-        k
+        out
+    }
+
+    /// Every coil's acquired samples of volume `g` before noise, `out[q]` with coil `q` element
+    /// `q % ring` of ring `q / ring`.
+    fn samples_all(&self, images: &[Vec<f32>], n_volumes: usize, g: usize, lw: Option<&LineWeights>, sets: &[ShotSet])
+                   -> Vec<Vec<C>> {
+        let rows: Vec<usize> = (0..self.rows).collect();
+        let mut out: Vec<Vec<C>> = vec![Vec::new(); self.ring * self.rows];
+        for a in 0..self.ring {
+            for (r, k) in self.samples_rings(images, n_volumes, g, a, &rows, lw, sets).into_iter().enumerate() {
+                out[r * self.ring + a] = k;
+            }
+        }
+        out
     }
 }
 
@@ -907,9 +981,11 @@ fn spiral_plan<'a>(
     sim_dims: [usize; 3], acq_dims: [usize; 3], n_volumes: usize, images: &[Vec<f32>], t2: &'a [T2Volume<'a>],
     t1: Option<&'a [T2Volume<'a>]>, fmap: &'a [f32], t_inhom: Option<&'a [T2Volume<'a>]>, acq: &'a Acquisition,
     train: &EchoTrain, readout: &Readout3d, line_weights: Option<&LineWeights>, shot_images: Option<&[Vec<ShotSet>]>,
-    phase: &'a PhaseModel,
+    phase: &'a PhaseModel, rows: usize,
 ) -> SpiralPlan<'a> {
     use crate::tseg::RateRect;
+    let ncoils = acq.n_coils.max(1);
+    assert!(rows >= 1 && ncoils.is_multiple_of(rows), "{ncoils} coils do not divide into {rows} rings along z");
     let [snx, sny, nz] = sim_dims;
     let [nx, ny, nzo] = acq_dims;
     assert_eq!(nz, nzo, "partition count must match; z is never oversampled");
@@ -927,7 +1003,8 @@ fn spiral_plan<'a>(
     assert!(acq.eddy_strength == 0.0 && acq.eddy_quad == 0.0 && acq.eddy_phase == 0.0,
             "the eddy model is not available in 3D (an echo-dependent eddy evolution breaks the z factorization)");
     assert!(acq.accel <= 1, "GRAPPA has no spiral meaning in this model");
-    assert!(acq.partial_fourier >= 1.0, "partial Fourier has no spiral meaning in this model");
+    assert!(acq.partial_fourier >= 1.0,
+            "in-plane partial Fourier has no spiral meaning in this model (along kz it is the readout's KzSampling)");
     assert!(acq.ghost_offset == 0.0, "Nyquist ghosting has no spiral meaning in this model");
     assert!(acq.n_spikes == 0, "spikes have no spiral meaning in this model");
     let table = crate::readout::spiral_lines(train, readout, nx, ny, nz).unwrap_or_else(|e| panic!("{e}"));
@@ -955,13 +1032,316 @@ fn spiral_plan<'a>(
         crate::spiral::SegmentedForward::new(&table.traj.k, &tau_idx, &table.traj.tau_ms, t_ms, [snx, sny], [nx, ny], rect)
             .unwrap_or_else(|e| panic!("{e}"))
     };
-    let class_fwd = rects.iter().map(|(f, _)| any_class.then(|| mk(RateRect { d: [0.0, 0.0], f: *f }))).collect();
-    let voxel_fwd = rects.iter().map(|(f, d)| d.map(|d| mk(RateRect { d, f: *f }))).collect();
-    let recon = crate::grid_recon::SpiralRecon::new(&table.traj.k, nx, acq.window);
+    let class_fwd = Arc::new(rects.iter().map(|(f, _)| any_class.then(|| mk(RateRect { d: [0.0, 0.0], f: *f }))).collect());
+    let voxel_fwd = Arc::new(rects.iter().map(|(f, d)| d.map(|d| mk(RateRect { d, f: *f }))).collect());
+    let recon = Arc::new(crate::grid_recon::SpiralRecon::new(&table.traj.k, nx, acq.window));
     SpiralPlan {
         snx, sny, nz, n: nx, o, ncomp, acq, table, modes, ln_a_maps, t2, t_inhom, fmap, phase, zk: zkernel(nz), nsamp, ns,
-        class_fwd, voxel_fwd, recon,
+        class_fwd, voxel_fwd, recon, rows, ring: ncoils / rows,
     }
+}
+
+/// The z factor of the sensitivity of a coil in ring `row` of `rows` at slice `z` of `nz` (P8):
+/// 1 for a single ring, as before; otherwise a Gaussian about the ring's position, the rings evenly
+/// spaced over the slab, on the floor the in-plane profile has ([`coil_sensitivity`]). A coil's
+/// sensitivity is its in-plane profile times this, so the rings differ only along z: the diversity
+/// an acceleration along kz needs, and that a single ring does not have.
+#[cfg_attr(not(feature = "kspace"), allow(dead_code))]
+pub(crate) fn coil_row_sensitivity(row: usize, rows: usize, z: f64, nz: usize) -> f64 {
+    if rows <= 1 {
+        return 1.0;
+    }
+    let centre = nz as f64 * (row as f64 + 0.5) / rows as f64 - 0.5;
+    let sigma = COIL_ROW_SIGMA * nz as f64 / rows as f64;
+    (-(z - centre).powi(2) / (2.0 * sigma * sigma)).exp() + 0.15
+}
+
+/// The width of a coil ring's z profile, in ring spacings.
+pub const COIL_ROW_SIGMA: f64 = 0.6;
+/// The source partitions of the kz interpolation kernel: the two acquired partitions on each side
+/// of the one synthesized (Vidorreta et al. 2017, a "4 x 1" kernel: no in-plane extent).
+pub const KZ_KERNEL_SOURCES: usize = 4;
+/// The Tikhonov term of the kernel fit, relative to the mean diagonal of its normal matrix.
+pub const KZ_KERNEL_LAMBDA: f64 = 1e-8;
+/// The salt of the calibration acquisition's noise stream ("KZCAL").
+pub const SEED_SALT_KZCAL: u64 = 0x4B5A_4341_4C00;
+
+/// What a stack of spirals undersampled along kz needs beyond its readout (P8).
+///
+/// `coil_rows`: the coils form this many rings along z ([`Acquisition::n_coils`] must divide into
+/// them, and an acceleration needs at least as many rings as its factor).
+///
+/// The calibration acquisition, as Vidorreta et al. (2017) run it in their preparation repetitions:
+/// the same train without the acceleration (so longer, with its own echo amplitudes), reading
+/// `calibration_images` (per compartment, one volume on the simulation grid) with the series'
+/// noise level on the stream of `calibration_seed`. The kernel is fitted to it once and applied to
+/// every volume, so the reconstruction stays linear in each volume's samples. Not read when the
+/// readout's acceleration is 1.
+///
+/// `partial_fourier_recon`: what fills the partitions partial Fourier left out
+/// ([`KzPartialFourierRecon`]).
+#[derive(Debug, Clone, Copy)]
+pub struct KzOptions<'a> {
+    pub coil_rows: usize,
+    pub calibration_images: &'a [Vec<f32>],
+    pub calibration_seed: u64,
+    pub partial_fourier_recon: KzPartialFourierRecon,
+}
+
+/// How the partitions partial Fourier left out are reconstructed (P8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KzPartialFourierRecon {
+    /// They stay zero. Linear in the data.
+    #[default]
+    ZeroFill,
+    /// Projection onto convex sets (Haacke et al. 1991), per coil, along z: the image's phase is
+    /// taken from the low-resolution image of the band's symmetric centre (Hann-windowed), and
+    /// [`POCS_ITERATIONS`] times the image is given that phase at its current magnitude and its
+    /// acquired partitions are restored. **Not linear in the data:** the reconstruction of a sum is
+    /// not the sum of the reconstructions, so a difference of volumes must be taken after it.
+    Pocs,
+}
+
+/// The iterations of [`KzPartialFourierRecon::Pocs`] (fixed, recorded).
+pub const POCS_ITERATIONS: usize = 10;
+
+/// [`KzPartialFourierRecon::Pocs`] on one coil's hybrid data `h[p][i]` (partition `p`, in-plane
+/// voxel `i`; the partitions below `lo` are not acquired and are ignored): the coil's image per
+/// slice, `out[z][i]`, in the centred z-DFT convention of `zk` normalized by `1/nz`.
+#[cfg_attr(not(feature = "kspace"), allow(dead_code))]
+fn pocs_along_z(h: &[Vec<C>], lo: usize, zk: &[C], nz: usize) -> Vec<Vec<C>> {
+    let nplane = h[0].len();
+    let c = nz / 2;
+    // the symmetric centre: as far below the centre as the band reaches, and no further above
+    let m = (c - lo).min(nz - 1 - c);
+    let hann = |p: usize| -> f64 {
+        let d = (p as f64 - c as f64).abs();
+        if d > m as f64 { 0.0 } else { 0.5 * (1.0 + (std::f64::consts::PI * d / (m as f64 + 1.0)).cos()) }
+    };
+    let inv = |k: &[C], z: usize| -> C {
+        let mut acc = C::ZERO;
+        for (p, kv) in k.iter().enumerate() {
+            let kc = zk[p * nz + z];
+            acc = acc.add(kv.mul(C { re: kc.re, im: -kc.im }));
+        }
+        acc.scale(1.0 / nz as f64)
+    };
+    let fwd = |x: &[C], p: usize| -> C {
+        let mut acc = C::ZERO;
+        for (z, xv) in x.iter().enumerate() {
+            acc = acc.add(xv.mul(zk[p * nz + z]));
+        }
+        acc
+    };
+    let mut out = vec![vec![C::ZERO; nplane]; nz];
+    let (mut k, mut x, mut low) = (vec![C::ZERO; nz], vec![C::ZERO; nz], vec![C::ZERO; nz]);
+    let mut unit = vec![C::ZERO; nz];
+    for i in 0..nplane {
+        for p in 0..nz {
+            k[p] = if p >= lo { h[p][i] } else { C::ZERO };
+            low[p] = k[p].scale(hann(p));
+        }
+        // the phase of the low-resolution image, as a unit phasor (1 where it has no signal)
+        for (z, u) in unit.iter_mut().enumerate() {
+            let v = inv(&low, z);
+            let a = v.abs();
+            *u = if a > 0.0 { v.scale(1.0 / a) } else { C { re: 1.0, im: 0.0 } };
+        }
+        for _ in 0..POCS_ITERATIONS {
+            for (z, xv) in x.iter_mut().enumerate() {
+                *xv = unit[z].scale(inv(&k, z).abs());
+            }
+            for (p, kv) in k.iter_mut().enumerate().take(lo) {
+                *kv = fwd(&x, p);
+            }
+        }
+        for (z, o) in out.iter_mut().enumerate() {
+            o[i] = inv(&k, z);
+        }
+    }
+    out
+}
+
+/// The kz interpolation of an accelerated stack of spirals (P8): per missing partition of the
+/// partial-Fourier band, each coil's samples as a combination of every coil's samples at the (up
+/// to) [`KZ_KERNEL_SOURCES`] nearest acquired partitions, sample by sample (the kernel has no
+/// in-plane extent, so it acts on the spiral samples as it would on any in-plane transform of
+/// them). One weight set per offset within the acceleration period and per set of sources present
+/// (the band's edges have fewer), fitted on the calibration samples by regularized least squares.
+#[cfg(feature = "kspace")]
+struct KzGrappa {
+    accel: usize,
+    nc: usize,
+    /// `(offset, source pattern)` to the weights `[target coil][source slot][source coil]`, the
+    /// slots being the pattern's set bits in ascending order.
+    weights: HashMap<(usize, u8), Vec<C>>,
+}
+
+#[cfg(feature = "kspace")]
+impl KzGrappa {
+    /// The source partitions' offsets from a missing partition `d` above its acquired neighbour.
+    fn offsets(accel: usize, d: usize) -> [i64; KZ_KERNEL_SOURCES] {
+        let (r, d) = (accel as i64, d as i64);
+        [-d - r, -d, r - d, 2 * r - d]
+    }
+
+    /// The missing partitions of the band, each with its offset and the pattern of its sources.
+    fn targets(table: &crate::readout::Spiral3dTable, accel: usize) -> Vec<(usize, usize, u8)> {
+        let nz = table.nz;
+        let c = (nz / 2) as i64;
+        (table.band_start..nz)
+            .filter(|&p| !table.acquired[p])
+            .map(|p| {
+                let d = (p as i64 - c).rem_euclid(accel as i64) as usize;
+                let mut pat = 0u8;
+                for (s, off) in KzGrappa::offsets(accel, d).iter().enumerate() {
+                    let src = p as i64 + off;
+                    if src >= 0 && (src as usize) < nz && table.acquired[src as usize] {
+                        pat |= 1 << s;
+                    }
+                }
+                (p, d, pat)
+            })
+            .collect()
+    }
+
+    /// Fit the weights the accelerated `table` needs on the calibration samples `cal[q][p * nsamp +
+    /// j]`, which fill the band `band_start..nz`.
+    fn fit(table: &crate::readout::Spiral3dTable, accel: usize, cal: &[Vec<C>], nsamp: usize) -> KzGrappa {
+        let (nz, nc, lo) = (table.nz, cal.len(), table.band_start);
+        let mut weights = HashMap::new();
+        for (p, d, pat) in KzGrappa::targets(table, accel) {
+            assert!(pat != 0, "partition {p} of the partial-Fourier band has no acquired partition within the kernel's \
+                               reach: {nz} partitions are too few for a kz acceleration of {accel}");
+            if weights.contains_key(&(d, pat)) {
+                continue;
+            }
+            let offs: Vec<i64> = KzGrappa::offsets(accel, d).iter().enumerate().filter(|(s, _)| pat & (1 << s) != 0)
+                .map(|(_, &o)| o).collect();
+            let nfeat = offs.len() * nc;
+            let mut aha = vec![vec![C::ZERO; nfeat]; nfeat];
+            let mut ahb = vec![vec![C::ZERO; nfeat]; nc];
+            let mut f = vec![C::ZERO; nfeat];
+            let mut rows = 0usize;
+            // every partition of the band whose sources lie in the band is an equation per sample:
+            // the calibration is fully sampled there, so the fit is not tied to the target's parity
+            for t in lo..nz {
+                let srcs: Vec<usize> = offs.iter().map(|&o| t as i64 + o).filter(|&p| p >= lo as i64 && p < nz as i64)
+                    .map(|p| p as usize).collect();
+                if srcs.len() != offs.len() {
+                    continue;
+                }
+                for j in 0..nsamp {
+                    for (s, &p) in srcs.iter().enumerate() {
+                        for (q, cq) in cal.iter().enumerate() {
+                            f[s * nc + q] = cq[p * nsamp + j];
+                        }
+                    }
+                    for i in 0..nfeat {
+                        let fic = C { re: f[i].re, im: -f[i].im };
+                        for (jj, a) in aha[i].iter_mut().enumerate() {
+                            *a = a.add(fic.mul(f[jj]));
+                        }
+                        for (q, b) in ahb.iter_mut().enumerate() {
+                            b[i] = b[i].add(fic.mul(cal[q][t * nsamp + j]));
+                        }
+                    }
+                    rows += 1;
+                }
+            }
+            assert!(rows > 0, "the calibration band ({} partitions) holds no partition with the kernel's sources at offsets \
+                               {offs:?}: too few partitions for a kz acceleration of {accel}", nz - lo);
+            let trace: f64 = (0..nfeat).map(|i| aha[i][i].re).sum();
+            assert!(trace > 0.0, "the kz calibration acquisition is empty: its images give no signal");
+            // normalized to a unit mean diagonal, so the fit (and the solver's pivot floor) does not
+            // depend on the signal scale; the weights are unchanged by it
+            let s = nfeat as f64 / trace;
+            for row in aha.iter_mut() {
+                for a in row.iter_mut() {
+                    *a = a.scale(s);
+                }
+            }
+            for b in ahb.iter_mut().flat_map(|b| b.iter_mut()) {
+                *b = b.scale(s);
+            }
+            for (i, row) in aha.iter_mut().enumerate() {
+                row[i].re += KZ_KERNEL_LAMBDA;
+            }
+            let w: Vec<C> = ahb.into_iter().flat_map(|b| crate::kspace::solve_hermitian(aha.clone(), b)).collect();
+            weights.insert((d, pat), w);
+        }
+        KzGrappa { accel, nc, weights }
+    }
+
+    /// Synthesize the band's missing partitions of every coil in place (`k[q][p * nsamp + j]`).
+    fn fill(&self, table: &crate::readout::Spiral3dTable, k: &mut [Vec<C>], nsamp: usize) {
+        let nc = self.nc;
+        for (p, d, pat) in KzGrappa::targets(table, self.accel) {
+            let Some(w) = self.weights.get(&(d, pat)) else { continue };
+            let srcs: Vec<usize> = KzGrappa::offsets(self.accel, d).iter().enumerate().filter(|(s, _)| pat & (1 << s) != 0)
+                .map(|(_, &o)| (p as i64 + o) as usize).collect();
+            let nfeat = srcs.len() * nc;
+            for j in 0..nsamp {
+                for qt in 0..nc {
+                    let mut v = C::ZERO;
+                    for (s, &sp) in srcs.iter().enumerate() {
+                        for qs in 0..nc {
+                            v = v.add(w[qt * nfeat + s * nc + qs].mul(k[qs][sp * nsamp + j]));
+                        }
+                    }
+                    k[qt][p * nsamp + j] = v;
+                }
+            }
+        }
+    }
+}
+
+/// The noise of the acquired partitions of one coil's samples (`k[p * nsamp + j]`), on the
+/// `(volume, partition)` streams of `seed` (part B, "Seeds").
+#[cfg(feature = "kspace")]
+fn spiral_noise(k: &mut [C], acquired: &[bool], nsamp: usize, g: usize, q: usize, seed: u64, sigma: f64) {
+    for (p, _) in acquired.iter().enumerate().filter(|(_, &a)| a) {
+        let pseed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(p as u64).wrapping_mul(0x9E37) ^ seed ^ SEED_SALT_3D;
+        let mut rng = Rng((pseed ^ (q as u64).wrapping_mul(0x9E37_79B9)) | 1);
+        for c in k[p * nsamp..(p + 1) * nsamp].iter_mut() {
+            c.re += rng.gauss() * sigma;
+            c.im += rng.gauss() * sigma;
+        }
+    }
+}
+
+/// The kz kernel of an accelerated spiral series: the calibration acquisition (the plan's train
+/// without the acceleration, on `opts`' images, with noise) and the fit to it.
+#[cfg(feature = "kspace")]
+#[allow(clippy::too_many_arguments)]
+fn kz_calibrate(pl: &SpiralPlan, kz: crate::readout::KzSampling, opts: &KzOptions, t1: Option<&[T2Volume]>, train: &EchoTrain,
+                readout: &Readout3d, sigma: f64) -> KzGrappa {
+    let Readout3d::Spiral { interleaves, readout_ms, dwell_ms, radial_oversampling, .. } = *readout else {
+        unreachable!("the spiral path")
+    };
+    let nvox = pl.snx * pl.sny * pl.nz;
+    assert!(opts.calibration_images.len() == pl.ncomp && opts.calibration_images.iter().all(|i| i.len() == nvox),
+            "the kz calibration images are not one simulation-grid volume per compartment");
+    let cal_kz = kz.calibration();
+    let cal_ro = Readout3d::Spiral { interleaves, readout_ms, dwell_ms, radial_oversampling, kz: cal_kz };
+    let n_cal = cal_kz.n_acquired(pl.nz).unwrap_or_else(|e| panic!("{e}"));
+    assert!(n_cal.is_multiple_of(train.kz_segments),
+            "the kz calibration train reads {n_cal} partitions, which do not divide into {} kz segments", train.kz_segments);
+    let cal_train = EchoTrain { etl: n_cal / train.kz_segments, ..train.clone() };
+    let table = crate::readout::spiral_lines(&cal_train, &cal_ro, pl.n, pl.n, pl.nz).unwrap_or_else(|e| panic!("{e}"));
+    let (modes, ln_a_maps) = resolve_modes(pl.t2, t1, pl.t_inhom, pl.acq, &cal_train, nvox);
+    let cal = SpiralPlan {
+        snx: pl.snx, sny: pl.sny, nz: pl.nz, n: pl.n, o: pl.o, ncomp: pl.ncomp, acq: pl.acq, table, modes, ln_a_maps,
+        t2: pl.t2, t_inhom: pl.t_inhom, fmap: pl.fmap, phase: pl.phase, zk: pl.zk.clone(), nsamp: pl.nsamp, ns: pl.ns,
+        class_fwd: pl.class_fwd.clone(), voxel_fwd: pl.voxel_fwd.clone(), recon: pl.recon.clone(), rows: pl.rows, ring: pl.ring,
+    };
+    let mut samples = cal.samples_all(opts.calibration_images, 1, 0, None, &[]);
+    if sigma > 0.0 {
+        for (q, k) in samples.iter_mut().enumerate() {
+            spiral_noise(k, &cal.table.acquired, cal.nsamp, 0, q, opts.calibration_seed ^ SEED_SALT_KZCAL, sigma);
+        }
+    }
+    KzGrappa::fit(&pl.table, kz.accel, &samples, pl.nsamp)
 }
 
 /// The certified segmentations a spiral series will use, per slice and mode, or the error naming
@@ -1004,28 +1384,63 @@ fn spiral_volumes(
     sim_dims: [usize; 3], acq_dims: [usize; 3], n_volumes: usize, images: &[Vec<f32>], t2: &[T2Volume],
     t1: Option<&[T2Volume]>, fmap: &[f32], t_inhom: Option<&[T2Volume]>, acq: &Acquisition, train: &EchoTrain,
     readout: &Readout3d, line_weights: Option<&LineWeights>, shot_images: Option<&[Vec<ShotSet>]>, phase: &PhaseModel,
-    seed: u64,
+    seed: u64, kz_opts: Option<&KzOptions>,
 ) -> Vec<Vec<(f64, f64)>> {
+    let Readout3d::Spiral { kz, .. } = *readout else { unreachable!("the spiral path") };
+    let rows = kz_opts.map_or(1, |o| o.coil_rows);
     let pl = spiral_plan(sim_dims, acq_dims, n_volumes, images, t2, t1, fmap, t_inhom, acq, train, readout, line_weights,
-                         shot_images, phase);
+                         shot_images, phase, rows);
     let (nz, n, nsamp) = (pl.nz, pl.n, pl.nsamp);
     let ncoils = acq.n_coils.max(1);
     let sigma = (acq.noise_variance / (n * n) as f64).sqrt();
+    // P8: the partitions the acceleration left out of the band are synthesized by a kernel fitted
+    // once, on a calibration acquisition; the ones partial Fourier left out stay zero
+    let grappa = (kz.accel > 1).then(|| {
+        let opts = kz_opts.expect("a stack of spirals accelerated along kz needs its KzOptions (coil rings, calibration)");
+        assert!(rows >= kz.accel, "a kz acceleration of {} needs at least as many coil rings along z, not {rows}", kz.accel);
+        kz_calibrate(&pl, kz, opts, t1, train, readout, sigma)
+    });
+    let zsens: Vec<Vec<f64>> = (0..ncoils)
+        .map(|q| (0..nz).map(|z| coil_row_sensitivity(q / pl.ring, rows, z as f64, nz)).collect())
+        .collect();
+    // with nothing left out there is nothing for POCS to complete: the linear path
+    let pocs = kz.partial_fourier < 1.0 && pl.table.band_start > 0
+        && kz_opts.is_some_and(|o| o.partial_fourier_recon == KzPartialFourierRecon::Pocs);
     let per_vol = |g: usize| -> Vec<(f64, f64)> {
         let sets = shot_images.map_or(&[][..], |si| &si[g][..]);
-        let mut coil_parts: Vec<Vec<Vec<C>>> = Vec::with_capacity(ncoils);
-        for q in 0..ncoils {
-            let mut k = pl.samples(images, n_volumes, g, q, ncoils, line_weights, sets);
-            if acq.noise_variance > 0.0 {
-                for p in 0..nz {
-                    let pseed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(p as u64).wrapping_mul(0x9E37) ^ seed ^ SEED_SALT_3D;
-                    let mut rng = Rng((pseed ^ (q as u64).wrapping_mul(0x9E37_79B9)) | 1);
-                    for c in k[p * nsamp..(p + 1) * nsamp].iter_mut() {
-                        c.re += rng.gauss() * sigma;
-                        c.im += rng.gauss() * sigma;
+        let mut coil_k = pl.samples_all(images, n_volumes, g, line_weights, sets);
+        if acq.noise_variance > 0.0 {
+            for (q, k) in coil_k.iter_mut().enumerate() {
+                spiral_noise(k, &pl.table.acquired, nsamp, g, q, seed, sigma);
+            }
+        }
+        if let Some(gr) = &grappa {
+            gr.fill(&pl.table, &mut coil_k, nsamp);
+        }
+        if pocs {
+            // POCS acts on each coil's image along z, so every coil's partitions of the band are
+            // reconstructed in-plane first (the least squares commutes with the z-DFT), then
+            // completed along z, then combined
+            let lo = pl.table.band_start;
+            let (mut wsum, mut ssum) = (vec![C::ZERO; n * n * nz], vec![0.0f64; n * n * nz]);
+            for (q, k) in coil_k.iter().enumerate() {
+                let h: Vec<Vec<C>> = (0..nz)
+                    .map(|p| if p >= lo { pl.recon.image(&k[p * nsamp..(p + 1) * nsamp]) } else { vec![C::ZERO; n * n] })
+                    .collect();
+                let img = pocs_along_z(&h, lo, &pl.zk, nz);
+                for (z, sl) in img.iter().enumerate() {
+                    for (i, v) in sl.iter().enumerate() {
+                        let s = crate::kspace::coil_sensitivity(q % pl.ring, pl.ring, (i % n) as f64, (i / n) as f64, n, n)
+                            * zsens[q][z];
+                        wsum[i + n * n * z] = wsum[i + n * n * z].add(v.scale(s));
+                        ssum[i + n * n * z] += s * s;
                     }
                 }
             }
+            return wsum.iter().zip(&ssum).map(|(w, &s)| { let s = s.max(1e-12); (w.re / s, w.im / s) }).collect();
+        }
+        let mut coil_parts: Vec<Vec<Vec<C>>> = Vec::with_capacity(ncoils);
+        for k in &coil_k {
             // inverse z-DFT, normalized by 1/nz: per slice z, its spiral samples
             let mut slices = vec![vec![C::ZERO; nsamp]; nz];
             for (z, sl) in slices.iter_mut().enumerate() {
@@ -1045,7 +1460,8 @@ fn spiral_volumes(
         let mut out = vec![(0.0, 0.0); n * n * nz];
         for z in 0..nz {
             let coils: Vec<Vec<C>> = coil_parts.iter().map(|cp| cp[z].clone()).collect();
-            let img = pl.recon.reconstruct(&coils, acq);
+            let zs: Vec<f64> = zsens.iter().map(|s| s[z]).collect();
+            let img = pl.recon.reconstruct_rings(&coils, pl.ring, &zs);
             for (i, c) in img.iter().enumerate() {
                 out[i + n * n * z] = (c.re, c.im);
             }
@@ -1066,7 +1482,7 @@ fn spiral_volumes(
 mod tests {
     use super::*;
     use crate::kspace::simulate_acquisition_oversampled;
-    use crate::readout::KzOrder;
+    use crate::readout::{KzOrder, KzSampling};
 
     /// A smooth blob per compartment, varying across volumes and slices, on a `snx x sny x nz`
     /// grid, in the entry points' `vox * n_volumes + g` layout.
@@ -1450,7 +1866,7 @@ mod tests {
 
     #[cfg(feature = "kspace")]
     fn spiral_ro() -> Readout3d {
-        Readout3d::Spiral { interleaves: 2, readout_ms: 4.0, dwell_ms: 0.01, radial_oversampling: 1.2 }
+        Readout3d::Spiral { interleaves: 2, readout_ms: 4.0, dwell_ms: 0.01, radial_oversampling: 1.2, kz: KzSampling::FULL }
     }
 
     #[cfg(feature = "kspace")]
@@ -1609,9 +2025,9 @@ mod tests {
         let t2 = vec![T2Volume::Uniform(80.0), T2Volume::Uniform(110.0)];
         let acq = Acquisition { do_relaxation: true, do_distortions: true, signal_scale: 100.0, ..Acquisition::default() };
         let tr = train(nz, 2, KzOrder::Centric, 12.0, 180.0);
-        let ro = Readout3d::Spiral { interleaves: 3, readout_ms: 4.0, dwell_ms: 0.01, radial_oversampling: 1.2 };
+        let ro = Readout3d::Spiral { interleaves: 3, readout_ms: 4.0, dwell_ms: 0.01, radial_oversampling: 1.2, kz: KzSampling::FULL };
         let phase = PhaseModel::none();
-        let pl = spiral_plan([s, s, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq, &tr, &ro, None, None, &phase);
+        let pl = spiral_plan([s, s, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq, &tr, &ro, None, None, &phase, 1);
         assert_eq!(pl.table.n_shots, 6);
         let base = pl.samples(&images, 1, 0, 0, 1, None, &[]);
         let shot_of = |i: usize| pl.table.shot(i / pl.nsamp, (i % pl.nsamp) / pl.ns);
@@ -1661,6 +2077,281 @@ mod tests {
         // Cartesian 3D: per-sample SD sqrt(var / n^2), an unnormalized n^2 sum, 1/sqrt(nz) from the z-DFT
         let cart = (acq.noise_variance / (n * n) as f64).sqrt() * n as f64 / (nz as f64).sqrt();
         println!("spiral 3D noise SD {sd:.4}, Cartesian 3D {cart:.4}, ratio {:.4}", sd / cart);
+    }
+
+    // ---- P8: kz partial Fourier and acceleration ----
+
+    #[cfg(feature = "kspace")]
+    fn kz_ro(partial_fourier: f64, accel: usize) -> Readout3d {
+        Readout3d::Spiral { interleaves: 2, readout_ms: 4.0, dwell_ms: 0.01, radial_oversampling: 1.2,
+                            kz: KzSampling { partial_fourier, accel } }
+    }
+
+    /// The train of `kz` on `nz` partitions, one kz segment, centric.
+    #[cfg(feature = "kspace")]
+    fn kz_train(nz: usize, kz: KzSampling, b: f64) -> EchoTrain {
+        EchoTrain { etl: kz.n_acquired(nz).unwrap(), ..train(nz, 1, KzOrder::Centric, 12.0, b) }
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn kz_partial_fourier_zero_fills_the_partitions_left_out() {
+        // relaxation off: every echo weighs 1, so the partial-Fourier volume is the full one with
+        // its low partitions removed, whatever the in-plane reconstruction (linear, per partition)
+        let (n, nz, o, ncomp) = (16usize, 8usize, 2usize, 2usize);
+        let s = n * o;
+        let images = blobs(s, s, nz, 1, ncomp);
+        let fmap = spiral_fmap(s, s, nz);
+        let t2 = vec![T2Volume::Uniform(80.0); ncomp];
+        let acq = Acquisition { do_relaxation: false, do_distortions: true, signal_scale: 100.0, ..Acquisition::default() };
+        let phase = PhaseModel::none();
+        let run = |kz: KzSampling| {
+            simulate_acquisition_3d_complex([s, s, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq,
+                                            &kz_train(nz, kz, 180.0), &kz_ro(kz.partial_fourier, kz.accel), None, None, &phase, 3)
+                .remove(0)
+        };
+        let full = run(KzSampling::FULL);
+        let kz = KzSampling { partial_fourier: 0.75, accel: 1 };
+        let lo = kz.band_start(nz).unwrap();
+        assert_eq!(lo, 2);
+        let pf = run(kz);
+        let zk = zkernel(nz);
+        let mut want = vec![(0.0, 0.0); n * n * nz];
+        for i in 0..n * n {
+            for p in lo..nz {
+                let mut kp = C::ZERO;
+                for z in 0..nz {
+                    let v = full[i + n * n * z];
+                    kp = kp.add(C { re: v.0, im: v.1 }.mul(zk[p * nz + z]));
+                }
+                for z in 0..nz {
+                    let kc = zk[p * nz + z];
+                    let v = kp.mul(C { re: kc.re, im: -kc.im }).scale(1.0 / nz as f64);
+                    want[i + n * n * z].0 += v.re;
+                    want[i + n * n * z].1 += v.im;
+                }
+            }
+        }
+        let (d, pk) = (maxdiff(&pf, &want), peak(&want));
+        assert!(d <= 1e-9 * pk, "{d:e} of {pk:e}");
+        assert!(maxdiff(&pf, &full) > 1e-3 * pk, "partial Fourier changed nothing");
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn coil_rings_along_z_combine_to_the_single_ring_image() {
+        // fully sampled and with every echo weighing the same (relaxation off: a decay along the
+        // train blurs through the rings' profiles), each ring's images are the single ring's times
+        // its z factor, which the
+        // combine divides out exactly (z is never oversampled)
+        let (n, nz, o, ncomp) = (16usize, 6usize, 2usize, 2usize);
+        let s = n * o;
+        let images = blobs(s, s, nz, 1, ncomp);
+        let fmap = spiral_fmap(s, s, nz);
+        let t2 = vec![T2Volume::Uniform(80.0), T2Volume::Uniform(110.0)];
+        let phase = PhaseModel::none();
+        let tr = train(nz, 1, KzOrder::Centric, 12.0, 180.0);
+        let run = |n_coils: usize, rows: usize| {
+            let acq = Acquisition { do_relaxation: false, do_distortions: true, n_coils, signal_scale: 100.0, ..Acquisition::default() };
+            let opts = KzOptions { coil_rows: rows, calibration_images: &[], calibration_seed: 0, partial_fourier_recon: KzPartialFourierRecon::ZeroFill };
+            simulate_acquisition_3d_complex_kz([s, s, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq, &tr,
+                                               &spiral_ro(), None, None, &phase, 3, Some(&opts)).remove(0)
+        };
+        let (one, three) = (run(2, 1), run(6, 3));
+        let (d, pk) = (maxdiff(&one, &three), peak(&one));
+        assert!(d <= 1e-9 * pk, "{d:e} of {pk:e}");
+        assert!(coil_row_sensitivity(0, 3, 0.0, nz) > 2.0 * coil_row_sensitivity(2, 3, 0.0, nz), "the rings differ along z");
+        assert_eq!(coil_row_sensitivity(0, 1, 2.0, nz), 1.0);
+    }
+
+    /// The accelerated series and its reference, the same band without the acceleration, on the same
+    /// coil rings (under partial Fourier the reference is zero-filled too): images
+    /// (`ncomp` compartments, `nv` volumes), reconstructed volumes of both.
+    #[cfg(feature = "kspace")]
+    #[allow(clippy::type_complexity)]
+    fn kz_accel_pair(kz: KzSampling, rows: usize, ring: usize, noise: f64, cal_seed: u64, scale: f32, signal_scale: f64)
+                     -> (Vec<Vec<(f64, f64)>>, Vec<Vec<(f64, f64)>>) {
+        let (n, nz, o, ncomp, nv) = (16usize, 12usize, 2usize, 2usize, 2usize);
+        let s = n * o;
+        let mut images = blobs(s, s, nz, nv, ncomp);
+        // not the calibration's object, and rough along z (the blobs alone hold only kz = 0, +-1):
+        // the second compartment enters at another weight, every slice at its own
+        for (c, v) in images.iter_mut().enumerate().flat_map(|(c, im)| im.iter_mut().map(move |v| (c, v))) {
+            *v *= scale * (1.0 - 0.7 * c as f32);
+        }
+        let nplane = s * s;
+        for im in images.iter_mut() {
+            for (i, v) in im.iter_mut().enumerate() {
+                let z = i / nv / nplane;
+                *v *= [1.0f32, 0.3, 1.4, 0.8, 0.1, 1.2, 0.6, 1.5, 0.2, 0.9, 1.3, 0.5][z % 12];
+            }
+        }
+        // the calibration reads its own images, whatever the series holds
+        let cal: Vec<Vec<f32>> = blobs(s, s, nz, 1, ncomp);
+        let fmap = spiral_fmap(s, s, nz);
+        let t2 = vec![T2Volume::Uniform(80.0), T2Volume::Uniform(110.0)];
+        let acq = Acquisition { do_relaxation: false, do_distortions: true, n_coils: rows * ring, noise_variance: noise,
+                                signal_scale, ..Acquisition::default() };
+        let phase = PhaseModel::none();
+        let opts = KzOptions { coil_rows: rows, calibration_images: &cal, calibration_seed: cal_seed, partial_fourier_recon: KzPartialFourierRecon::ZeroFill };
+        let run = |kz: KzSampling| {
+            simulate_acquisition_3d_complex_kz([s, s, nz], [n, n, nz], nv, &images, &t2, None, &fmap, None, &acq,
+                                               &kz_train(nz, kz, 180.0), &kz_ro(kz.partial_fourier, kz.accel), None, None,
+                                               &phase, 3, Some(&opts))
+        };
+        (run(kz), run(kz.calibration()))
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn kz_acceleration_recovers_the_unaccelerated_volume() {
+        // relaxation off, no noise, an object rough along z: the kernel's only error is what four
+        // sources and the coil rings cannot represent, largest where the band's edge leaves a
+        // partition sources on one side only. Measured on these 12 partitions (0.9%, 0.8%, 3.2% and
+        // 2.0% of peak), then bounded.
+        for (kz, rows, ring, bound) in [
+            (KzSampling { partial_fourier: 1.0, accel: 2 }, 4usize, 1usize, 2e-2),
+            (KzSampling { partial_fourier: 1.0, accel: 2 }, 4, 2, 2e-2),
+            (KzSampling { partial_fourier: 0.75, accel: 2 }, 4, 1, 5e-2),
+            (KzSampling { partial_fourier: 1.0, accel: 3 }, 6, 1, 4e-2),
+        ] {
+            let (acc, full) = kz_accel_pair(kz, rows, ring, 0.0, 1, 1.0, 100.0);
+            for g in 0..2 {
+                let (d, pk) = (maxdiff(&acc[g], &full[g]), peak(&full[g]));
+                println!("kz {kz:?} rows {rows} ring {ring} volume {g}: {:.3e} of peak", d / pk);
+                assert!(d <= bound * pk, "kz {kz:?} rows {rows} ring {ring} volume {g}: {d:e} of {pk:e}");
+            }
+        }
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn kz_acceleration_is_linear_in_the_series_and_seeded_by_its_calibration() {
+        let kz = KzSampling { partial_fourier: 0.75, accel: 2 };
+        // the kernel comes from the calibration alone: a doubled series doubles the volumes
+        let (a, _) = kz_accel_pair(kz, 4, 1, 0.0, 1, 1.0, 100.0);
+        let (b, _) = kz_accel_pair(kz, 4, 1, 0.0, 1, 2.0, 100.0);
+        let doubled: Vec<(f64, f64)> = a[0].iter().map(|v| (2.0 * v.0, 2.0 * v.1)).collect();
+        let (d, pk) = (maxdiff(&b[0], &doubled), peak(&doubled));
+        assert!(d <= 1e-5 * pk, "{d:e} of {pk:e}");
+        // nor does the kernel depend on the signal scale (the fit is normalized: a tiny scale must
+        // not fall under the solver's pivot floor and leave the partitions unfilled)
+        let (t, _) = kz_accel_pair(kz, 4, 1, 0.0, 1, 1.0, 1e-12);
+        let tiny: Vec<(f64, f64)> = t[0].iter().map(|v| (1e14 * v.0, 1e14 * v.1)).collect();
+        let d = maxdiff(&tiny, &a[0]);
+        assert!(d <= 1e-6 * peak(&a[0]), "{d:e} of {:e}", peak(&a[0]));
+        // with noise, the calibration's stream is the calibration seed's
+        let (x, _) = kz_accel_pair(kz, 4, 1, 1e-4, 1, 1.0, 100.0);
+        let (y, _) = kz_accel_pair(kz, 4, 1, 1e-4, 1, 1.0, 100.0);
+        let (z, _) = kz_accel_pair(kz, 4, 1, 1e-4, 2, 1.0, 100.0);
+        assert_eq!(x, y);
+        assert_ne!(x, z);
+    }
+
+    /// A real, positive object rough along z (12 partitions), no off-resonance, relaxation off, on
+    /// `rows` coil rings: the volume at `kz` reconstructed by `recon`, images scaled by `scale`
+    /// and, with `add`, summed with a second object.
+    #[cfg(feature = "kspace")]
+    fn kz_pf_volume(kz: KzSampling, recon: KzPartialFourierRecon, rows: usize, scale: f32, add: Option<bool>) -> Vec<(f64, f64)> {
+        let (n, nz, o) = (16usize, 12usize, 2usize);
+        let s = n * o;
+        let nplane = s * s;
+        let rough = [1.0f32, 0.3, 1.4, 0.8, 0.1, 1.2, 0.6, 1.5, 0.2, 0.9, 1.3, 0.5];
+        let first: Vec<f32> = blobs(s, s, nz, 1, 1).remove(0).iter().enumerate().map(|(i, v)| v * rough[i / nplane]).collect();
+        let second: Vec<f32> = blobs(s, s, nz, 1, 2).remove(1).iter().enumerate().map(|(i, v)| 0.2 * v * rough[11 - i / nplane]).collect();
+        let img: Vec<f32> = match add {
+            None => first.iter().map(|v| scale * v).collect(),
+            Some(false) => second,
+            Some(true) => first.iter().zip(&second).map(|(a, b)| a + b).collect(),
+        };
+        let cal = vec![first];
+        let fmap = vec![0.0f32; nplane * nz];
+        let t2 = [T2Volume::Uniform(80.0)];
+        let acq = Acquisition { do_relaxation: false, do_distortions: false, n_coils: rows, signal_scale: 100.0,
+                                ..Acquisition::default() };
+        let opts = KzOptions { coil_rows: rows, calibration_images: &cal, calibration_seed: 1, partial_fourier_recon: recon };
+        simulate_acquisition_3d_complex_kz([s, s, nz], [n, n, nz], 1, &[img], &t2, None, &fmap, None, &acq, &kz_train(nz, kz, 180.0),
+                                           &kz_ro(kz.partial_fourier, kz.accel), None, None, &PhaseModel::none(), 3, Some(&opts))
+            .remove(0)
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn pocs_along_kz_recovers_what_zero_filling_loses_and_is_not_linear() {
+        use KzPartialFourierRecon::{Pocs, ZeroFill};
+        let pf = KzSampling { partial_fourier: 0.75, accel: 1 };
+        let full = kz_pf_volume(KzSampling::FULL, ZeroFill, 1, 1.0, None);
+        let (zf, pocs) = (kz_pf_volume(pf, ZeroFill, 1, 1.0, None), kz_pf_volume(pf, Pocs, 1, 1.0, None));
+        let pk = peak(&full);
+        let (e_zf, e_pocs) = (maxdiff(&zf, &full) / pk, maxdiff(&pocs, &full) / pk);
+        println!("kz 6/8 on a real object, against full sampling: zero filling {e_zf:.3e}, POCS {e_pocs:.3e} of peak");
+        // measured: 0.20 and 0.022 of peak
+        assert!(e_zf > 0.1 && e_pocs < 0.3 * e_zf, "zero filling {e_zf:e}, POCS {e_pocs:e}");
+        // with nothing left out, POCS is the linear path
+        assert_eq!(kz_pf_volume(KzSampling::FULL, Pocs, 1, 1.0, None), full);
+        // a positive scale passes through (the phase estimate does not change) ...
+        let doubled: Vec<(f64, f64)> = pocs.iter().map(|v| (2.0 * v.0, 2.0 * v.1)).collect();
+        let d = maxdiff(&kz_pf_volume(pf, Pocs, 1, 2.0, None), &doubled);
+        assert!(d <= 1e-9 * peak(&doubled), "{d:e}");
+        // ... but a sum does not: the reconstruction of a sum is not the sum of the reconstructions,
+        // where zero filling's is
+        let sum = |r| {
+            let (a, b, ab) = (kz_pf_volume(pf, r, 1, 1.0, None), kz_pf_volume(pf, r, 1, 1.0, Some(false)),
+                              kz_pf_volume(pf, r, 1, 1.0, Some(true)));
+            let parts: Vec<(f64, f64)> = a.iter().zip(&b).map(|(x, y)| (x.0 + y.0, x.1 + y.1)).collect();
+            maxdiff(&ab, &parts) / peak(&ab)
+        };
+        let (lin, non) = (sum(ZeroFill), sum(Pocs));
+        println!("additivity residual: zero filling {lin:.3e}, POCS {non:.3e} of peak");
+        // (the summed images are f32, so the linear residual is their rounding; measured 1e-8 and 2.3e-3)
+        assert!(lin <= 1e-6 && non > 1e-4, "zero filling {lin:e}, POCS {non:e}");
+        // with an acceleration and coil rings the kernel fills the band first, then POCS
+        let acc = KzSampling { partial_fourier: 0.75, accel: 2 };
+        let ref4 = kz_pf_volume(KzSampling::FULL, ZeroFill, 4, 1.0, None);
+        let (zf4, pocs4) = (kz_pf_volume(acc, ZeroFill, 4, 1.0, None), kz_pf_volume(acc, Pocs, 4, 1.0, None));
+        let (e_zf4, e_pocs4) = (maxdiff(&zf4, &ref4) / peak(&ref4), maxdiff(&pocs4, &ref4) / peak(&ref4));
+        println!("kz 6/8 and R = 2 on four rings, against full sampling: zero filling {e_zf4:.3e}, POCS {e_pocs4:.3e} of peak");
+        assert!(e_pocs4 < e_zf4, "zero filling {e_zf4:e}, POCS {e_pocs4:e}");
+    }
+
+    #[cfg(feature = "kspace")]
+    #[test]
+    fn kz_refusals() {
+        let (n, nz, o) = (16usize, 8usize, 2usize);
+        let s = n * o;
+        let images = blobs(s, s, nz, 1, 1);
+        let fmap = vec![0.0f32; s * s * nz];
+        let t2 = [T2Volume::Uniform(80.0)];
+        let phase = PhaseModel::none();
+        let kz = KzSampling { partial_fourier: 1.0, accel: 2 };
+        let cal = blobs(s, s, nz, 1, 1);
+        let dark = vec![vec![0.0f32; s * s * nz]];
+        let cases: [(usize, Option<KzOptions>, &str); 5] = [
+            (4, None, "needs its KzOptions"),
+            (4, Some(KzOptions { coil_rows: 1, calibration_images: &cal, calibration_seed: 0, partial_fourier_recon: KzPartialFourierRecon::ZeroFill }), "at least as many coil rings"),
+            (4, Some(KzOptions { coil_rows: 3, calibration_images: &cal, calibration_seed: 0, partial_fourier_recon: KzPartialFourierRecon::ZeroFill }), "do not divide into 3 rings"),
+            (4, Some(KzOptions { coil_rows: 2, calibration_images: &[], calibration_seed: 0, partial_fourier_recon: KzPartialFourierRecon::ZeroFill }), "calibration images"),
+            (4, Some(KzOptions { coil_rows: 2, calibration_images: &dark, calibration_seed: 0, partial_fourier_recon: KzPartialFourierRecon::ZeroFill }), "calibration acquisition is empty"),
+        ];
+        for (n_coils, opts, msg) in cases {
+            let acq = Acquisition { do_relaxation: false, n_coils, ..Acquisition::default() };
+            let r = std::panic::catch_unwind(|| {
+                simulate_acquisition_3d_complex_kz([s, s, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq,
+                                                   &kz_train(nz, kz, 180.0), &kz_ro(1.0, 2), None, None, &phase, 1, opts.as_ref())
+            });
+            let e = r.expect_err(msg);
+            let text = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap();
+            assert!(text.contains(msg), "{msg}: {text}");
+        }
+        // GRASE has no kz options
+        let acq = Acquisition { do_relaxation: false, ..Acquisition::default() };
+        let opts = KzOptions { coil_rows: 1, calibration_images: &[], calibration_seed: 0, partial_fourier_recon: KzPartialFourierRecon::ZeroFill };
+        let grase = Readout3d::Grase { ky_segments: 1, t_line_ms: 0.5, reverse_phase: false };
+        let r = std::panic::catch_unwind(|| {
+            simulate_acquisition_3d_complex_kz([s, s, nz], [n, n, nz], 1, &images, &t2, None, &fmap, None, &acq,
+                                               &train(nz, 1, KzOrder::Centric, 12.0, 180.0), &grase, None, None, &phase, 1, Some(&opts))
+        });
+        assert!(r.is_err());
     }
 
     #[cfg(feature = "kspace")]

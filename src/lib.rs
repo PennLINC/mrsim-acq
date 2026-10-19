@@ -36,6 +36,8 @@ pub mod epg;
 pub mod noise;
 /// Rigid poses, multiband slice schedules, within-volume dropout.
 pub mod motion;
+/// Spin history of slice-selective excitations under through-plane motion (P9).
+pub mod spin_history;
 /// Per-slice k-space forward model and reconstruction.
 pub mod kspace;
 /// The 3D echo-train acquisition (P5): kz encoding by echo, per-partition reconstruction.
