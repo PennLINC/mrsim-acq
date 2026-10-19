@@ -245,8 +245,8 @@ pub struct Sampling {
 
 /// A timed trace's pose this close to the identity in every parameter (mm, degrees) is the
 /// identity. Nothing physical moves that little; such poses come from the clock's rounding (a shot
-/// at 58.80000000000001 s just past a sample at 58.8 s), and [`trilinear`] cuts a voxel whose sample
-/// point falls even that far outside the grid, so an end slice would go dark.
+/// at 58.80000000000001 s just past a sample at 58.8 s). Snapping them keeps a still part of a trace
+/// an exact copy of the volume rather than a resample that differs from it by rounding.
 pub const TRACE_POSE_EPSILON: f64 = 1e-9;
 
 impl Trace {
@@ -383,14 +383,19 @@ pub fn load_motion_trace(path: &std::path::Path, sampling: Option<Sampling>) -> 
 }
 
 /// Trilinear sample of `vol` (layout `x + nx*(y + ny*z)`) at continuous voxel coordinate `p`;
-/// zero outside the grid. Public because consumers' own warps (TRXScan's `gnl`) use it.
+/// voxel `i` covers `[i - 0.5, i + 0.5]`, so a point between an edge voxel's centre and its outer
+/// face takes that voxel's value (the coordinate is clamped to the centres), and a point beyond the
+/// face is zero. Public because consumers' own warps (TRXScan's `gnl`) use it.
 #[inline]
 pub fn trilinear(vol: &[f32], dims: [usize; 3], p: Vec3) -> f32 {
     let [nx, ny, nz] = dims;
-    let (x, y, z) = (p[0], p[1], p[2]);
-    if x < 0.0 || y < 0.0 || z < 0.0 || x > (nx - 1) as f64 || y > (ny - 1) as f64 || z > (nz - 1) as f64 {
+    let outside = |c: f64, n: usize| c < -0.5 || c > n as f64 - 0.5;
+    if outside(p[0], nx) || outside(p[1], ny) || outside(p[2], nz) {
         return 0.0;
     }
+    let x = p[0].clamp(0.0, (nx - 1) as f64);
+    let y = p[1].clamp(0.0, (ny - 1) as f64);
+    let z = p[2].clamp(0.0, (nz - 1) as f64);
     let (x0, y0, z0) = (x.floor() as usize, y.floor() as usize, z.floor() as usize);
     let (x1, y1, z1) = ((x0 + 1).min(nx - 1), (y0 + 1).min(ny - 1), (z0 + 1).min(nz - 1));
     let (fx, fy, fz) = (x - x0 as f64, y - y0 as f64, z - z0 as f64);
@@ -505,8 +510,8 @@ pub fn slice_schedule_from_times(offsets: &[f64]) -> Vec<Vec<usize>> {
 }
 
 /// The given slices of `src` resampled by the world-space rigid transform `m` (the head moves by
-/// `p' = m·p`): each output voxel is backward-mapped through `m⁻¹` and trilinearly sampled, zero
-/// outside the grid. The result holds the slices in the order given, each `x + nx*y`. The identity
+/// `p' = m·p`): each output voxel is backward-mapped through `m⁻¹` and sampled by [`trilinear`]
+/// (zero beyond the edge voxels' outer faces). The result holds the slices in the order given, each `x + nx*y`. The identity
 /// copies them exactly. `m` folds the rotation centre into its translation, so for the same pose this
 /// agrees with [`resample_by_pose`] to rounding, not bit for bit.
 pub fn resample_slices_by_matrix(src: &[f32], dims: [usize; 3], v2w: [[f64; 4]; 4], m: [[f64; 4]; 4],
@@ -769,6 +774,26 @@ pub fn apply_multiband_motion_slab(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trilinear_extends_edge_voxels_half_a_voxel_and_zeroes_beyond() {
+        let dims = [2, 3, 4];
+        let vol: Vec<f32> = (0..24).map(|i| 1.0 + i as f32).collect();
+        let at = |x: usize, y: usize, z: usize| vol[x + 2 * (y + 3 * z)];
+        // just outside the end slices' centres, up to their outer faces: the edge voxel's value
+        for dz in [1e-13, 1e-3, 0.25, 0.5] {
+            assert_eq!(trilinear(&vol, dims, [1.0, 2.0, -dz]), at(1, 2, 0), "z = -{dz}");
+            assert_eq!(trilinear(&vol, dims, [0.0, 1.0, 3.0 + dz]), at(0, 1, 3), "z = 3 + {dz}");
+        }
+        // clamping one axis still interpolates the others
+        let mid = trilinear(&vol, dims, [-0.3, 1.5, 3.4]);
+        assert!((mid - (at(0, 1, 3) + at(0, 2, 3)) / 2.0).abs() < 1e-6, "{mid}");
+        // beyond the outer face on any axis: zero
+        for p in [[-0.51, 1.0, 1.0], [1.51, 1.0, 1.0], [0.0, -0.51, 1.0], [0.0, 2.51, 1.0],
+                  [0.0, 1.0, -0.51], [0.0, 1.0, 3.51]] {
+            assert_eq!(trilinear(&vol, dims, p), 0.0, "{p:?}");
+        }
+    }
 
     #[test]
     fn identity_pose_is_the_identity_matrix() {
