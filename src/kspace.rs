@@ -1910,7 +1910,7 @@ fn acquire_volumes_complex(
     let mut tes: Vec<f64> = opts.t_echo_per_volume.map_or_else(|| vec![acq.t_echo], |t| t.to_vec());
     tes.sort_by(f64::total_cmp);
     tes.dedup_by(|a, b| a.to_bits() == b.to_bits());
-    let kernels: Vec<(u64, Vec<GrappaKernel>)> = if acq.accel.max(1) > 1 {
+    let kernels: Vec<(u64, Vec<GrappaKernel>)> = if acq.accel.max(1) > 1 && n_volumes > 0 {
         let owned;
         let (cal_images, cal_seed): (&[Vec<f32>], u64) = match opts.grappa_calibration {
             Some(c) => (c.images, c.seed),
@@ -4691,6 +4691,13 @@ mod grappa_series_tests {
         let (lo, hi) = stats.iter().fold((f64::MAX, 0.0f64), |(a, b), s| (a.min(s.1), b.max(s.1)));
         assert!(hi / lo < 1.05, "temporal variance over noise variance should be constant: {stats:?}");
         assert!(stats.iter().all(|s| s.2.abs() < 0.1), "lag-1 PE correlation of the residual: {stats:?}");
+    }
+
+    /// Codex review: an accelerated call with no volumes returns empty output, as before the
+    /// reference scan (the default calibration has no first volume to read).
+    #[test]
+    fn an_empty_accelerated_series_is_empty() {
+        assert!(run(&[Vec::new()], 0, &acq(1.0), None).is_empty());
     }
 
     /// Slice 0's fully sampled coil k-spaces of `object(scale)` under `acq` without acceleration.

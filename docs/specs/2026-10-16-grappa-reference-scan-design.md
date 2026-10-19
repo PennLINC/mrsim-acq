@@ -155,3 +155,14 @@ partial-Fourier edge now stays zero); `kashyap_lores` unchanged (+0.030, 0.498, 
 `tools/regress_identity.sh 79d79ac 7468e79` is identical on all 72 cases, the P8 spiral case included
 (its phantom linked into the worktree), so the P6 and 3D GE paths' new entry points change nothing
 without acceleration. All four mrsim-acq feature sets and both aslscan feature sets pass.
+
+## 8. Ordinary Codex review (final pass, 2026-10-19)
+
+Two findings, each checked against the source:
+- **Medium, rejected: "the diff removes the trilinear half-voxel edge handling".** `main` gained the
+  issue #3 fix (PennLINC/mrsim-acq#8) while the review ran, and the review diffed the branch against the
+  new `main` directly. This branch never touches `motion.rs`; the PR's merge keeps the fix.
+- **Low, valid, fixed: an accelerated call with no volumes panicked.** The default calibration read
+  volume 0 of an empty series (`step_by(0)`). Both entry points (`acquire_volumes_complex`,
+  `simulate_acquisition_3d_complex_cal`) now fit kernels only when `n_volumes > 0`, as the 3D GE path
+  already did; a test checks that the empty accelerated series is empty.

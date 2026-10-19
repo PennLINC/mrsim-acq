@@ -502,7 +502,7 @@ pub(crate) fn simulate_acquisition_3d_complex_cal(
     // GRAPPA: one kernel per slice for the whole series, fitted on the reference scan (the
     // calibration object read by the series' train without the acceleration, without line
     // weights or shot images)
-    let kernels = if acq.accel > 1 {
+    let kernels = if acq.accel > 1 && n_volumes > 0 {
         let owned;
         let (cal_images, cal_seed): (&[Vec<f32>], u64) = match grappa_cal {
             Some(c) => (c.images, c.seed),
