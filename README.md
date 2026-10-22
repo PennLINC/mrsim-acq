@@ -157,7 +157,7 @@ let acq = Acquisition {
 **Simulate all volumes of a series in one call.** The random noise for each volume is determined
 by the seed and the volume's position within the call. Simulating volumes one call at a time
 would give every volume identical noise. If a second call is unavoidable, such as for a separate
-M0 or reference scan, pass it a different seed.
+M0 or reference scan, pass it a different seed. Any two different seeds give independent noise.
 
 For a complete example, see `src/series.rs` in aslscan. It builds the compartment images, calls
 the entry point, and writes the result. To browse the API documentation locally, run:

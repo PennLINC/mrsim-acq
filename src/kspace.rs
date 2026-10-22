@@ -56,6 +56,21 @@ impl C {
     }
 }
 
+/// The run seed as it enters the derived noise and spike streams (per slice, per partition, per
+/// voxel): a SplitMix64 finalizer, so seeds that differ in a few low bits give unrelated streams.
+/// The derived seeds combine the run seed by XOR and the noise streams set their lowest bit
+/// (`| 1`), which would otherwise erase the run seed's lowest bit and give seeds `2k` and
+/// `2k + 1` identical noise. Seed 0 maps to 0, so it reproduces the legacy output.
+pub fn stream_seed(seed: u64) -> u64 {
+    if seed == 0 {
+        return 0;
+    }
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// Deterministic Gaussian source (SplitMix64 + Box–Muller), std-only so k-space stays dep-free.
 pub struct Rng(pub u64);
 impl Rng {
@@ -1653,7 +1668,7 @@ pub const SEED_SALT_GRAPPA_CAL: u64 = 0x4752_5043_414C;
 
 /// The seed of slice `z`'s reference-scan noise ([`GrappaCalibration`]).
 pub(crate) fn grappa_cal_slice_seed(z: usize, seed: u64) -> u64 {
-    (z as u64).wrapping_mul(0x9E37) ^ seed ^ SEED_SALT_GRAPPA_CAL
+    (z as u64).wrapping_mul(0x9E37) ^ stream_seed(seed) ^ SEED_SALT_GRAPPA_CAL
 }
 
 /// One volume of `images` (per compartment, layout `vox * n_volumes + g`) as per-compartment
@@ -2006,7 +2021,7 @@ fn acquire_volumes_complex(
                 .wrapping_mul(0x100_0001)
                 .wrapping_add(z as u64)
                 .wrapping_mul(0x9E37)
-                ^ receiver_seed;
+                ^ stream_seed(receiver_seed);
             let want = captured.contains(&zl);
             let cap = if want { opts.capture } else { SliceCapture::default() };
             let out = simulate_slice_with(
@@ -2039,7 +2054,7 @@ fn acquire_volumes_complex(
                             // deterministic per (volume, FULL-FOV voxel); parallel-safe (per_vol is over g)
                             let vox_g = x + nx * (y + ny * z);
                             let mut rng = Rng(
-                                receiver_seed ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                                stream_seed(receiver_seed) ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
                                     ^ (vox_g as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) | 1,
                             );
                             re += (rng.gauss() * sd) as f32;
@@ -4300,7 +4315,7 @@ mod complex_tests {
                 let (pm, pd) = PREP[g].unwrap();
                 let shot = phase.prep.as_ref().unwrap().shot(pm, pd, g, z, 5);
                 let phi = phase_slice(&phase, &shot, snx, sny, o, z, nz);
-                let slice_seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37) ^ 5;
+                let slice_seed = (g as u64).wrapping_mul(0x100_0001).wrapping_add(z as u64).wrapping_mul(0x9E37) ^ stream_seed(5);
                 let t2s = [T2Slice::Uniform(80.0), T2Slice::Uniform(60.0)];
                 // GRAPPA: the slice's kernel is fitted once, on the reference scan: volume 0's
                 // images read unaccelerated, no drives, no spikes, the calibration noise stream
@@ -4308,7 +4323,7 @@ mod complex_tests {
                     .map(|img| (0..snx * sny).map(|i| img[(i + snx * sny * z) * ngrad]).collect()).collect();
                 let cal_refs: Vec<&[f32]> = cal.iter().map(|v| v.as_slice()).collect();
                 let phi0 = phase_slice(&phase, &ShotPhase { q_eff: [0.0; 3], dx: [0.0; 3], rot: [0.0; 3] }, snx, sny, o, z, nz);
-                let cal_seed = (z as u64).wrapping_mul(0x9E37) ^ 5 ^ SEED_SALT_GRAPPA_CAL;
+                let cal_seed = (z as u64).wrapping_mul(0x9E37) ^ stream_seed(5) ^ SEED_SALT_GRAPPA_CAL;
                 let cal_k: Vec<Vec<C>> = (0..acq.n_coils).map(|c| build_coil_kspace(
                     &SliceInput {
                         compartments: &cal_refs, t2: &t2s, t_inhom: None, fmap: &fs, phase0: Some(&phi0), sim: [snx, sny],
@@ -4332,7 +4347,7 @@ mod complex_tests {
                         let vox = x + nx * (y + ny * z);
                         let sd = ns[vox] as f64;
                         if sd > 0.0 {
-                            let mut rng = Rng(5 ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                            let mut rng = Rng(stream_seed(5) ^ (g as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
                                               ^ (vox as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9) | 1);
                             re += (rng.gauss() * sd) as f32;
                             im += (rng.gauss() * sd) as f32;
