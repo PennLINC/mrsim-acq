@@ -31,7 +31,7 @@ use crate::epg::epg_cpmg;
 use crate::kspace::{
     build_coil_kspace_timed, phase_slice, reconstruct_coils, sampling_mask, volume_images, Acquisition, EchoFormation,
     GrappaCalibration, GrappaKernel, LineTiming, SEED_SALT_GRAPPA_CAL,
-    Rng, SliceInput, T2Slice, T2Volume, C,
+    Rng, SliceInput, T2Slice, T2Volume, C, stream_seed,
 };
 use crate::phase::{PhaseModel, ShotPhase};
 use crate::kspace::echo_salt;
@@ -486,6 +486,8 @@ pub(crate) fn simulate_acquisition_3d_complex_cal(
     readout: &Readout3d, line_weights: Option<&LineWeights>, shot_images: Option<&[Vec<ShotSet>]>, phase: &PhaseModel,
     seed: u64, kz_opts: Option<&KzOptions>, grappa_cal: Option<GrappaCalibration>,
 ) -> Vec<Vec<(f64, f64)>> {
+    // every noise and spike stream below derives from these (see `stream_seed`)
+    let seed = stream_seed(seed);
     if let Readout3d::Spiral { .. } = readout {
         #[cfg(feature = "kspace")]
         return spiral_volumes(sim_dims, acq_dims, n_volumes, images, t2, t1, fmap, t_inhom, acq, train, readout,
@@ -505,7 +507,7 @@ pub(crate) fn simulate_acquisition_3d_complex_cal(
     let kernels = if acq.accel > 1 && n_volumes > 0 {
         let owned;
         let (cal_images, cal_seed): (&[Vec<f32>], u64) = match grappa_cal {
-            Some(c) => (c.images, c.seed),
+            Some(c) => (c.images, stream_seed(c.seed)),
             None => {
                 owned = volume_images(images, n_volumes, 0);
                 (&owned, seed)
@@ -734,6 +736,8 @@ pub(crate) fn simulate_acquisition_3d_ge_complex(
     t_inhom: Option<&[T2Volume]>, acq: &Acquisition, train: &ExcitationTrain, readout: &Ge3dReadout,
     volume: &(dyn Fn(usize) -> GeVolume + Sync), phase: &PhaseModel, seed: u64, reference: Option<&GeVolume>,
 ) -> Vec<Vec<Vec<(f64, f64)>>> {
+    // every noise and spike stream below derives from this (see `stream_seed`)
+    let seed = stream_seed(seed);
     let [snx, sny, nz] = sim_dims;
     let [nx, ny, nzo] = acq_dims;
     assert_eq!(nz, nzo, "partition count must match; z is never oversampled");
@@ -1427,7 +1431,7 @@ fn kz_calibrate(pl: &SpiralPlan, kz: crate::readout::KzSampling, opts: &KzOption
     let mut samples = cal.samples_all(opts.calibration_images, 1, 0, None, &[]);
     if sigma > 0.0 {
         for (q, k) in samples.iter_mut().enumerate() {
-            spiral_noise(k, &cal.table.acquired, cal.nsamp, 0, q, opts.calibration_seed ^ SEED_SALT_KZCAL, sigma);
+            spiral_noise(k, &cal.table.acquired, cal.nsamp, 0, q, stream_seed(opts.calibration_seed) ^ SEED_SALT_KZCAL, sigma);
         }
     }
     KzGrappa::fit(&pl.table, kz.accel, &samples, pl.nsamp)
@@ -1839,6 +1843,50 @@ mod tests {
         let want = 1.0 / (nz as f64).sqrt();
         println!("3D/2D noise SD: {ratio:.4} (want {want:.4}); 2D SD {sd2:.4}");
         assert!((ratio / want - 1.0).abs() < 0.03, "{ratio} vs {want}");
+    }
+
+    #[test]
+    fn adjacent_seeds_give_independent_noise() {
+        // The derived seeds combine the run seed by XOR and the noise streams set their lowest
+        // bit, so without `stream_seed` the seeds 2k and 2k + 1 gave identical noise.
+        let (nx, ny, nz) = (32usize, 32usize, 8usize);
+        let nvox = nx * ny * nz;
+        let images = vec![vec![0.0f32; nvox]];
+        let fmap = vec![0.0f32; nvox];
+        let sd_map = vec![1.0f32; nvox];
+        let t2 = [T2Volume::Uniform(80.0)];
+        let acq = Acquisition { noise_variance: 1.0, do_relaxation: false, ..Acquisition::default() };
+        let quiet = Acquisition { noise_variance: 0.0, ..acq.clone() };
+        let tr = train(nz, 1, KzOrder::Centric, 20.0, 180.0);
+        let ro = Readout3d::Grase { ky_segments: 1, t_line_ms: 0.5, reverse_phase: false };
+        let real = |(m, p): (Vec<f32>, Vec<f32>)| -> Vec<f64> {
+            m.iter().zip(&p).map(|(&m, &p)| m as f64 * (p as f64).cos()).collect()
+        };
+        let kspace_2d = |seed| real(simulate_acquisition_oversampled([nx, ny, nz], [nx, ny, nz], 1, &images, &t2, &fmap,
+                                                                     None, &acq, &[None], &[None], &PhaseModel::none(),
+                                                                     seed, None));
+        let image_2d = |seed| real(simulate_acquisition_oversampled([nx, ny, nz], [nx, ny, nz], 1, &images, &t2, &fmap,
+                                                                    None, &quiet, &[None], &[None], &PhaseModel::none(),
+                                                                    seed, Some(&sd_map)));
+        let kspace_3d = |seed| -> Vec<f64> {
+            simulate_acquisition_3d_complex([nx, ny, nz], [nx, ny, nz], 1, &images, &t2, None, &fmap, None, &acq, &tr, &ro,
+                                            None, None, &PhaseModel::none(), seed).remove(0).iter().map(|c| c.0).collect()
+        };
+        let corr = |a: &[f64], b: &[f64]| -> f64 {
+            let n = a.len() as f64;
+            let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
+            let cov: f64 = a.iter().zip(b).map(|(x, y)| (x - ma) * (y - mb)).sum();
+            let va: f64 = a.iter().map(|x| (x - ma) * (x - ma)).sum();
+            let vb: f64 = b.iter().map(|y| (y - mb) * (y - mb)).sum();
+            cov / (va * vb).sqrt()
+        };
+        for (a, b) in [(0u64, 1u64), (2, 3), (4, 5), (42, 43)] {
+            for (name, ra, rb) in [("2D k-space", kspace_2d(a), kspace_2d(b)), ("2D noise map", image_2d(a), image_2d(b)),
+                                   ("3D k-space", kspace_3d(a), kspace_3d(b))] {
+                let c = corr(&ra, &rb);
+                assert!(c.abs() < 0.05, "{name} noise of seeds {a} and {b} correlates at {c:.3}");
+            }
+        }
     }
 
     #[test]
